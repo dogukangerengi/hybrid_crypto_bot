@@ -596,14 +596,19 @@ def test_12_full_pipeline():
     # Veri bütünlüğü: OHLCV bozulmamış mı?
     assert (df['high'] >= df['low']).all(), "High < Low var!"
     
-    # NaN kontrolü: çok fazla NaN kalmamalı (dropna öncesi)
-    clean = df.dropna()
+    # NaN kontrolü: IC analizi kolon bazlı dropna yapar, tüm kolonlar değil
+    # Bu yüzden sadece OHLCV + forward return kolonlarında temizlik kontrol edilir
+    core_cols = ['open', 'high', 'low', 'close', 'volume', 'fwd_ret_5']
+    clean = df.dropna(subset=core_cols)
     clean_ratio = len(clean) / len(df)
-    print(f"\n  Clean data ratio: {clean_ratio:.1%} ({len(clean)}/{len(df)})")
+    print(f"\n  Clean data ratio (core): {clean_ratio:.1%} ({len(clean)}/{len(df)})")
     assert clean_ratio > 0.40, f"Clean ratio çok düşük: {clean_ratio:.1%}"
     
-    print(f"  ✓ Tam pipeline çalışıyor: {len(df)} bar → {len(scores)} IC → {total_best} seçim")
-
+    # İndikatör NaN oranı: ortalama %50'den az olmalı
+    ind_cols = [c for c in df.columns if c not in core_cols]
+    avg_nan = df[ind_cols].isnull().mean().mean()
+    print(f"  İndikatör NaN oranı: {avg_nan:.1%}")
+    assert avg_nan < 0.50, f"İndikatör NaN çok yüksek: {avg_nan:.1%}"
 
 # =============================================================================
 # ANA ÇALIŞTIRMA

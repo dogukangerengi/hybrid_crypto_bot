@@ -1,24 +1,25 @@
 # =============================================================================
-# VERİ MODÜLÜ (DATA MODULE)
+# VERİ MODÜLÜ (DATA MODULE) — Bitget Futures
 # =============================================================================
-# Bitget Futures veri çekme ve ön işleme.
+# Bitget USDT-M Perpetual Futures veri çekme ve ön işleme.
 #
 # Kullanım:
-# from data import BitgetFetcher, DataPreprocessor
-#
-# fetcher = BitgetFetcher()
-# df = fetcher.fetch_ohlcv("BTC/USDT:USDT", "1h", limit=200)
-#
-# pp = DataPreprocessor()
-# df_clean = pp.full_pipeline(df)
+#   from data import BitgetFetcher, DataPreprocessor
+#   # veya geriye uyumluluk için:
+#   from data import DataFetcher  # → BitgetFetcher alias'ı
 # =============================================================================
 
 from .fetcher import BitgetFetcher
 from .preprocessor import DataPreprocessor
 
+# Geriye uyumluluk alias'ı — eski modüller DataFetcher bekliyor
+# main.py, telegram_bot.py, app.py hepsi DataFetcher import eder
+DataFetcher = BitgetFetcher
+
 __all__ = [
-    'BitgetFetcher',
-    'DataPreprocessor',
+    'BitgetFetcher',       # Yeni isim (Bitget Futures)
+    'DataFetcher',         # Eski isim (alias, geriye uyumlu)
+    'DataPreprocessor',    # Veri ön işleme
 ]
 
-__version__ = '2.0.0'
+__version__ = '2.1.0'     # v2.1: alias eklendi
