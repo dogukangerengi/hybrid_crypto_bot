@@ -666,76 +666,56 @@ class CoinScanner:
         logger.info("=" * 75)
     
     # =========================================================================
-    # KOLAY ERİŞİM FONKSİYONLARI
+    # YARDIMCI FONKSİYONLAR (HELPER METHODS)
     # =========================================================================
     
     def get_symbols(
         self,
         top_n: Optional[int] = None,
+        limit: Optional[int] = None,  # Eski kod uyumluluğu için
         force_refresh: bool = False
     ) -> List[str]:
         """
-        Top coin sembol listesi döndürür (IC analiz modülü için).
-        
-        main.py bu fonksiyonu çağırarak hangi coin'leri tarayacağını öğrenir:
-        >>> symbols = scanner.get_symbols()
-        >>> for symbol in symbols:
-        ...     ic_analyze(symbol)
-        
-        Returns:
-        -------
-        List[str]
-            Semboller (örn: ['BTC/USDT:USDT', 'ETH/USDT:USDT', ...])
+        Son taramadaki coinlerin tam sembollerini döndürür.
+        Örn: ['BTC/USDT:USDT', 'ETH/USDT:USDT']
         """
-        return [c.symbol for c in self.scan(top_n=top_n, force_refresh=force_refresh)]
+        # limit veya top_n hangisi geldiyse onu kullan
+        final_limit = top_n if top_n is not None else limit
+        
+        return [c.symbol for c in self.scan(top_n=final_limit, force_refresh=force_refresh)]
     
     def get_coins(
         self,
         top_n: Optional[int] = None,
+        limit: Optional[int] = None, # Eski kod uyumluluğu için
         force_refresh: bool = False
     ) -> List[str]:
         """
-        Kısa coin isimleri döndürür (Telegram mesajı için).
-        
-        Returns:
-        -------
-        List[str]
-            Kısa isimler (örn: ['BTC', 'ETH', 'SOL', ...])
+        Son taramadaki coinlerin kısa kodlarını döndürür.
+        Örn: ['BTC', 'ETH']
         """
-        return [c.coin for c in self.scan(top_n=top_n, force_refresh=force_refresh)]
-    
-    # =========================================================================
-    # RAPOR (DataFrame)
-    # =========================================================================
+        final_limit = top_n if top_n is not None else limit
+        
+        return [c.coin for c in self.scan(top_n=final_limit, force_refresh=force_refresh)]
     
     def get_report(
         self,
         top_n: Optional[int] = None,
+        limit: Optional[int] = None, # Eski kod uyumluluğu için
         include_failed: bool = False
     ) -> pd.DataFrame:
         """
-        Tarama sonuçlarını pandas DataFrame olarak döndürür.
-        
-        Debug, Streamlit dashboard ve Telegram raporu için.
-        
-        Parameters:
-        ----------
-        top_n : int, optional
-            Gösterilecek coin sayısı
-        include_failed : bool
-            True → filtreden elenenleri de göster (debug için)
-            
-        Returns:
-        -------
-        pd.DataFrame
-            Tarama sonuç tablosu (skor'a göre sıralı)
+        Son tarama sonuçlarını Pandas DataFrame olarak döndürür.
         """
-        # Taramayı çalıştır (cache varsa kullanır)
-        _ = self.scan(top_n=top_n or 100)
+        final_limit = top_n if top_n is not None else limit
         
-        # Cache'deki tüm sonuçları kullan
+        # Taramayı çalıştır
+        _ = self.scan(top_n=final_limit or 100)
+        
+        # Cache'deki sonuçları al
         all_results = self._last_scan or []
         
+        # DataFrame oluştur
         data = []
         for r in all_results:
             if not include_failed and not r.passed_filters:
@@ -758,8 +738,12 @@ class CoinScanner:
         
         if not df.empty:
             df = df.sort_values('Skor', ascending=False).reset_index(drop=True)
-            df.index += 1                      # 1'den başlat
+            df.index += 1
             df.index.name = '#'
+            
+            # Eğer limit verilmişse DataFrame'i de kes
+            if final_limit:
+                df = df.head(final_limit)
         
         return df
 

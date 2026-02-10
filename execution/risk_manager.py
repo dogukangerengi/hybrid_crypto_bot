@@ -614,6 +614,13 @@ class RiskManager:
         
         return True, "OK"
     
+    def update_balance(self, new_balance: float):
+        """
+        Dış kaynaklardan (PaperTrader veya API) gelen güncel bakiyeyi işler.
+        Pozisyon büyüklüğü hesaplamalarının güncel sermaye ile yapılmasını sağlar.
+        """
+        self.balance = float(new_balance)
+    
     def check_risk_reward(self, sl_distance: float, tp_distance: float) -> Tuple[bool, str]:
         """
         Risk/Reward oranını kontrol eder.

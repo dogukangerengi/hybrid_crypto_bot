@@ -497,49 +497,42 @@ Yanıtını SADECE aşağıdaki JSON formatında ver, başka hiçbir şey yazma:
     # RESPONSE PARSER
     # =========================================================================
     
-    def _parse_response(self, raw: str) -> Dict[str, Any]:
+    def _parse_response(self, response_text: str) -> dict:
         """
-        Gemini'nin JSON yanıtını parse eder.
-        
-        Gemini bazen markdown code block içinde JSON döndürür:
-        ```json
-        {"decision": "SHORT", ...}
-        ```
-        
-        Bu fonksiyon hem düz JSON'ı hem code block'u handle eder.
-        
-        Returns:
-        -------
-        Dict
-            {'decision': 'LONG'|'SHORT'|'WAIT', 'confidence': 0-100,
-             'reasoning': str, 'atr_multiplier': float}
+        Gemini yanıtını temizler ve JSON'a çevirir.
+        Hata durumunda 'WAIT' döndürür (None döndürmez).
         """
-        text = raw.strip()
-        
-        # Markdown code block temizle
-        if '```json' in text:
-            text = text.split('```json')[1].split('```')[0].strip()
-        elif '```' in text:
-            text = text.split('```')[1].split('```')[0].strip()
-        
+        fallback_response = {
+            "decision": "WAIT",
+            "confidence": 0,
+            "reasoning": "Yanıt parse edilemedi (JSON hatası)."
+        }
+
         try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            # Son çare: text içinde {...} bul
-            start = text.find('{')
-            end = text.rfind('}')
-            if start != -1 and end != -1:
-                try:
-                    parsed = json.loads(text[start:end+1])
-                except json.JSONDecodeError:
-                    logger.error(f"JSON parse başarısız: {text[:200]}")
-                    return self._default_response()
-            else:
-                logger.error(f"JSON bulunamadı: {text[:200]}")
-                return self._default_response()
-        
-        # Doğrulama
-        return self._validate_parsed(parsed)
+            # 1. Boş yanıt kontrolü
+            if not response_text:
+                return fallback_response
+
+            clean_text = response_text.strip()
+
+            # 2. Markdown temizliği (```json ... ```)
+            if "```" in clean_text:
+                clean_text = clean_text.replace("```json", "").replace("```", "").strip()
+
+            # 3. JSON yakalama (Süslü parantezlerin arasını al)
+            start_idx = clean_text.find('{')
+            end_idx = clean_text.rfind('}')
+
+            if start_idx != -1 and end_idx != -1:
+                json_str = clean_text[start_idx : end_idx + 1]
+                return json.loads(json_str)
+            
+            # Süslü parantez yoksa direkt dene
+            return json.loads(clean_text)
+
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"JSON Parse Hatası: {e} -> Güvenli moda geçiliyor.")
+            return fallback_response
     
     def _validate_parsed(self, parsed: Dict) -> Dict:
         """Parse edilen JSON'ın geçerliliğini kontrol eder."""
