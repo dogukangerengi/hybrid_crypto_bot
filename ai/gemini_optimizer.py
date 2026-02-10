@@ -53,11 +53,19 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 class AIDecision(Enum):
-    """AI'ın verebileceği kararlar."""
-    LONG = "LONG"                              # Uzun pozisyon aç
-    SHORT = "SHORT"                            # Kısa pozisyon aç
-    WAIT = "WAIT"                              # Bekle, işlem yapma
-
+    LONG = "LONG"
+    SHORT = "SHORT"
+    WAIT = "WAIT"
+    
+    # ⬇️ BU METODU EKLE ⬇️
+    @classmethod
+    def from_direction(cls, direction: str) -> 'AIDecisionType':
+        d = (direction or "").upper()
+        if d in ("LONG", "BUY", "BULLISH"):
+            return cls.LONG
+        elif d in ("SHORT", "SELL", "BEARISH"):
+            return cls.SHORT
+        return cls.WAIT
 
 class GateAction(Enum):
     """Gate Keeper aksiyonları."""
