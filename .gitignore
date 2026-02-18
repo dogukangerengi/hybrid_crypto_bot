@@ -5,3 +5,8 @@ __pycache__/
 .env 
 logs/
 *.log
+.env
+.DS_Store
+__pycache__/
+venv/
+.env*
