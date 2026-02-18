@@ -361,28 +361,13 @@ class CoinScanner:
     # =========================================================================
     
     def _fetch_all_tickers(self, symbols: List[str]) -> Dict:
-        """
-        Tüm semboller için ticker verisi çeker.
-        
-        CCXT fetch_tickers(): tek çağrıda TÜM market ticker'larını döndürür.
-        500 ayrı API çağrısı yerine 1 çağrı → ~100x daha hızlı.
-        
-        Parameters:
-        ----------
-        symbols : List[str]
-            İstenen semboller
-            
-        Returns:
-        -------
-        Dict
-            {symbol: ticker_data} formatında
-        """
         try:
-            # Bitget fetch_tickers: tek çağrıda tüm market'lar
-            all_tickers = self.fetcher.exchange.fetch_tickers()
+            # Binance'den ticker çek, Bitget formatında döndür
+            # ESKİ: self.fetcher.exchange.fetch_tickers() → Bitget → BOŞ VERİ
+            # YENİ: self.fetcher.fetch_tickers(symbols)   → Binance → DOLU VERİ
+            all_tickers = self.fetcher.fetch_tickers(symbols)
             
-            # Sadece istenen sembolleri döndür (memory efficient)
-            return {s: all_tickers[s] for s in symbols if s in all_tickers}
+            return all_tickers
             
         except Exception as e:
             logger.error(f"Batch ticker hatası: {e}")

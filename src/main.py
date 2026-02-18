@@ -393,11 +393,12 @@ class HybridTradingPipeline:
         return False
 
     def _get_current_prices(self) -> Dict[str, float]:
-        """Açık pozisyonlar için güncel fiyatları al."""
         prices = {}
         for trade_id, trade in self.paper_trader.open_trades.items():
             try:
-                ticker = self.fetcher.exchange.fetch_ticker(trade.full_symbol)
+                # ESKİ: self.fetcher.exchange.fetch_ticker() → Bitget → BOŞ
+                # YENİ: self.fetcher.get_ticker()            → Binance → DOLU
+                ticker = self.fetcher.get_ticker(trade.full_symbol)
                 prices[trade.symbol] = ticker['last']
             except:
                 prices[trade.symbol] = trade.entry_price
@@ -438,7 +439,7 @@ class HybridTradingPipeline:
         # --- DÜZELTME BİTİŞİ ---
             
             # Ticker bilgisi
-            ticker = self.fetcher.exchange.fetch_ticker(full_symbol)
+            ticker = self.fetcher.get_ticker(full_symbol)
             result.price = ticker.get('last', 0)
             result.change_24h = ticker.get('percentage', 0) or 0
             result.volume_24h = ticker.get('quoteVolume', 0) or 0
