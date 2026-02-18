@@ -1,0 +1,68 @@
+# =============================================================================
+# HİBRİT KRİPTO TRADING BOT - BAĞIMLILIKLAR
+# =============================================================================
+# Kurulum: pip install -r requirements.txt
+# Ortam: M4 Macbook Air + Python 3.12 + VSCode
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# VERİ İŞLEME VE ANALİZ
+# -----------------------------------------------------------------------------
+pandas>=2.2.0              # Zaman serisi veri yapıları ve manipülasyonu
+numpy>=1.26.0              # Sayısal hesaplamalar ve matris operasyonları
+scipy>=1.12.0              # İstatistiksel testler (Spearman IC, p-value, FDR)
+
+# -----------------------------------------------------------------------------
+# TEKNİK ANALİZ İNDİKATÖRLERİ
+# -----------------------------------------------------------------------------
+pandas-ta>=0.3.14b         # 130+ teknik indikatör (TA-Lib alternatifi)
+                           # M4'te TA-Lib kurulumu sorunlu, pandas-ta daha stabil
+
+# -----------------------------------------------------------------------------
+# KRİPTO BORSA API (BİTGET)
+# -----------------------------------------------------------------------------
+ccxt>=4.2.0                # Unified borsa API'si - Bitget dahil 100+ borsa
+                           # Bitget Futures: exchange_id="bitget"
+                           # USDT-M Perpetual: defaultType="swap"
+
+# -----------------------------------------------------------------------------
+# YAPAY ZEKA (GOOGLE GEMİNİ)
+# -----------------------------------------------------------------------------
+google-generativeai>=0.8.0 # Gemini Pro API - grafik analizi + entry optimizasyon
+Pillow>=10.0.0             # Görüntü işleme (chart → Gemini'ye gönderme)
+mplfinance>=0.12.10b0      # Profesyonel candlestick grafik oluşturma
+
+# -----------------------------------------------------------------------------
+# MAKİNE ÖĞRENME VE İSTATİSTİK
+# -----------------------------------------------------------------------------
+scikit-learn>=1.4.0        # Feature selection, cross-validation, metrikler
+statsmodels>=0.14.0        # Zaman serisi analizi, ADF testi, regresyon
+
+# -----------------------------------------------------------------------------
+# BİLDİRİM SİSTEMİ (TELEGRAM)
+# -----------------------------------------------------------------------------
+python-telegram-bot>=21.0  # Telegram Bot API (async destekli)
+                           # /analiz, /durum, /durdur komutları
+
+# -----------------------------------------------------------------------------
+# YAPILANDIRMA VE GÜVENLİK
+# -----------------------------------------------------------------------------
+python-dotenv>=1.0.0       # .env dosyasından API key'leri güvenli okuma
+pyyaml>=6.0.1              # settings.yaml yapılandırma dosyası
+
+# -----------------------------------------------------------------------------
+# LOGLAMA VE ZAMANLAMA
+# -----------------------------------------------------------------------------
+loguru>=0.7.2              # Gelişmiş loglama (renk, rotation, retention)
+schedule>=1.2.1            # Basit periyodik görev çalıştırma
+apscheduler>=3.10.4        # Gelişmiş cron-like zamanlayıcı
+
+# -----------------------------------------------------------------------------
+# GÖRSELLEŞTİRME
+# -----------------------------------------------------------------------------
+matplotlib>=3.8.0          # Temel grafik kütüphanesi (mplfinance bağımlılığı)
+
+# -----------------------------------------------------------------------------
+# GELİŞTİRME ARAÇLARI
+# -----------------------------------------------------------------------------
+pytest>=8.0.0              # Birim testleri

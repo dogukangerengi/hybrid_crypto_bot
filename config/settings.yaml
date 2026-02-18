@@ -1,0 +1,140 @@
+# =============================================================================
+# HİBRİT KRİPTO BOT — SİSTEM AYARLARI (Bitget Futures)
+# =============================================================================
+# Tüm parametreler bu dosyadan okunur.
+# Değişiklikler restart gerektirmez (runtime'da yeniden okunabilir).
+# API KEY'ler burada DEĞİL, .env dosyasındadır.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# GENEL SİSTEM
+# -----------------------------------------------------------------------------
+system:
+  name: "Hybrid Crypto Decision System"
+  version: "2.0.0"
+  environment: "development"                 # development | production
+  timezone: "UTC"
+
+# -----------------------------------------------------------------------------
+# BORSA AYARLARI (Bitget USDT-M Perpetual Futures)
+# -----------------------------------------------------------------------------
+exchange:
+  id: "bitget"                               # CCXT borsa ID
+  market_type: "swap"                        # swap = USDT-M Perpetual
+  sandbox: false                             # true = demo hesap
+
+# -----------------------------------------------------------------------------
+# RİSK YÖNETİMİ
+# -----------------------------------------------------------------------------
+risk:
+  risk_per_trade_pct: 2.0                    # İşlem başına max risk (%)
+  max_open_positions: 2                      # Max açık pozisyon
+  max_margin_per_trade_pct: 25.0             # İşlem başına max margin (%)
+  max_total_margin_pct: 60.0                 # Toplam max margin (%)
+  min_leverage: 2                            # Min kaldıraç
+  max_leverage: 20                           # Max kaldıraç
+  min_risk_reward_ratio: 1.5                 # Min RR oranı
+  daily_max_loss_pct: 6.0                    # Günlük max kayıp (%)
+  kill_switch_drawdown_pct: 15.0             # Kill switch DD (%)
+
+# -----------------------------------------------------------------------------
+# IC KAPI BEKÇİSİ EŞİKLERİ (paper test — agresif, çok sinyal)
+# -----------------------------------------------------------------------------
+# IC Güven < 30  → İŞLEM YAPMA
+# IC Güven 30-45 → Sadece rapor
+# IC Güven > 45  → Tam işlem (AI + trade)
+# ⚠️ Sadece test için — canlıya geçmeden 50/62/62 veya üstüne çek
+gate_keeper:
+  no_trade_threshold: 30.0
+  report_only_threshold: 45.0
+  full_trade_threshold: 45.0
+
+# -----------------------------------------------------------------------------
+# ANALİZ AYARLARI
+# -----------------------------------------------------------------------------
+analysis:
+  # Her timeframe için çekilecek mum sayısı
+  # Daha fazla veri = daha güvenilir IC (büyük örneklem)
+  # Çok fazla = rejim değişikliği riski (non-stationarity)
+  timeframes:
+    "5m":  2000                              # Scalping
+    "15m": 1500                              # Day trading
+    "30m": 1000                              # Trend konfirmasyonu
+    "1h":  1000                              # İntraday trend
+    "2h":  750                               # Swing noktaları
+    "4h":  500                               # Büyük resim
+
+  # IC bazlı TF sıralama ağırlıkları
+  # Composite score = weighted sum of these metrics
+  ic_weights:
+    top_ic: 0.40                             # En yüksek |IC| (%40)
+    avg_ic: 0.25                             # Ortalama |IC| (%25)
+    count: 0.15                              # Anlamlı indikatör sayısı (%15)
+    consistency: 0.20                        # IC tutarlılığı (%20)
+
+  # Forward return periyodu (IC hedef değişkeni)
+  # 5-bar ileri getiri: 1h TF'de 5 saat sonrası
+  target_period: 5
+
+  # Selector parametreleri
+  selector:
+    alpha: 0.05                              # Anlamlılık seviyesi
+    correction_method: "fdr"                 # FDR (Benjamini-Hochberg)
+    max_per_category: 2                      # Kategori başına max indikatör
+    min_ic: 0.02                             # Minimum |IC| eşiği
+
+# -----------------------------------------------------------------------------
+# İSTATİSTİKSEL EŞİKLER
+# -----------------------------------------------------------------------------
+thresholds:
+  p_value: 0.05                              # α = 0.05 (FDR düzeltmeli)
+  min_ic: 0.02                               # |IC| > 0.02 ekonomik anlamlılık
+  min_ic_tstat: 2.0                          # |t| > 2 → yaklaşık p < 0.05
+  min_sharpe: 0.5                            # Risk-adjusted return eşiği
+  max_drawdown: 0.20                         # Max kabul edilebilir DD
+  min_confidence_score: 55.0                 # Minimum güven skoru
+
+# -----------------------------------------------------------------------------
+# TARAYICI AYARLARI (Adım 4)
+# -----------------------------------------------------------------------------
+scanner:
+  min_24h_volume_usdt: 5000000               # Min 24h USDT hacim ($5M)
+  min_24h_trades: 1000                       # Min 24h işlem sayısı
+  max_spread_pct: 0.1                        # Max bid-ask spread (%)
+  top_n_coins: 15                            # Top N coin seç (analiz sayısı)
+  scan_interval_minutes: 60                  # Tarama aralığı
+
+# -----------------------------------------------------------------------------
+# AI AYARLARI (Adım 6 - Gemini)
+# -----------------------------------------------------------------------------
+ai:
+  model: "gemini-2.5-flash"
+  fallback_models:
+    - "gemini-2.0-flash"
+  temperature: 0.3                           # Düşük = daha tutarlı
+  max_retries: 3
+
+# -----------------------------------------------------------------------------
+# TELEGRAM
+# -----------------------------------------------------------------------------
+telegram:
+  enabled: true
+  send_on_startup: true
+  error_notifications: true
+
+# -----------------------------------------------------------------------------
+# ZAMANLAMA
+# -----------------------------------------------------------------------------
+scheduler:
+  interval_minutes: 60                       # Ana analiz döngüsü (dakika)
+  market_hours_only: false                   # Kripto 7/24
+
+# -----------------------------------------------------------------------------
+# LOGLAMA
+# -----------------------------------------------------------------------------
+logging:
+  level: "INFO"
+  format: "{time:YYYY-MM-DD HH:mm:ss} | {level} | {message}"
+  rotation: "10 MB"
+  retention: "7 days"
+  file: "logs/hybrid_bot.log"

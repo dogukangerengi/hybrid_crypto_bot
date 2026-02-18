@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  =============================================================================
+  HYBRID CRYPTO BOT — macOS LaunchAgent
+  =============================================================================
+  Amaç: Bot'u her 90 dakikada bir otomatik çalıştırmak (macOS servis olarak).
+  
+  Kurulum:
+    1. Bu dosyayı kopyala:
+       cp com.hybrid.crypto.bot.plist ~/Library/LaunchAgents/
+    
+    2. Path'leri kendi kullanıcı dizinine göre güncelle (aşağıdaki TODO'ları)
+    
+    3. Yükle:
+       launchctl load ~/Library/LaunchAgents/com.hybrid.crypto.bot.plist
+    
+    4. Durum kontrol:
+       launchctl list | grep hybrid.crypto
+    
+    5. Kaldır:
+       launchctl unload ~/Library/LaunchAgents/com.hybrid.crypto.bot.plist
+    
+  NOT: DRY RUN modda çalışır (varsayılan). Canlı işlem için
+       ProgramArguments'taki -/-dry-run flag'ını kaldırın.
+  =============================================================================
+-->
+<plist version="1.0">
+<dict>
+    <!-- Servis tanımlayıcısı (benzersiz olmalı) -->
+    <key>Label</key>
+    <string>com.hybrid.crypto.bot</string>
+    
+    <!-- Çalıştırılacak komut ve argümanlar -->
+    <key>ProgramArguments</key>
+    <array>
+        <!-- TODO: Kendi venv yolunuza göre güncelleyin -->
+        <string>/Users/dogukangerengi/hybrid_crypto_bot/venv/bin/python</string>
+        <string>/Users/dogukangerengi/hybrid_crypto_bot/src/main.py</string>
+        <!-- DRY RUN modu (paper trade) — canlıya geçmek için kaldırın -->
+        <string>--dry-run</string>
+        <!-- Top 15 coin analiz et -->
+        <string>--top</string>
+        <string>15</string>
+    </array>
+    
+    <!-- Çalışma aralığı: Her 90 dakikada bir -->
+    <key>StartInterval</key>
+    <integer>5400</integer>
+    
+    <!-- Çalışma dizini -->
+    <key>WorkingDirectory</key>
+    <!-- TODO: Kendi proje yolunuza göre güncelleyin -->
+    <string>/Users/dogukangerengi/hybrid_crypto_bot/src</string>
+    
+    <!-- Standart çıktı log dosyası -->
+    <key>StandardOutPath</key>
+    <string>/Users/dogukangerengi/hybrid_crypto_bot/logs/stdout.log</string>
+    
+    <!-- Hata log dosyası -->
+    <key>StandardErrorPath</key>
+    <string>/Users/dogukangerengi/hybrid_crypto_bot/logs/stderr.log</string>
+    
+    <!-- Ortam değişkenleri (venv ve modül path'leri) -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- Python path'leri: venv + homebrew + sistem -->
+        <key>PATH</key>
+        <string>/Users/dogukangerengi/hybrid_crypto_bot/venv/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        
+        <!-- Python modül arama yolu (src/ dizini) -->
+        <key>PYTHONPATH</key>
+        <string>/Users/dogukangerengi/hybrid_crypto_bot/src</string>
+        
+        <!-- .env dosyası konumu (dotenv ile otomatik yüklenir, yedek olarak) -->
+        <key>DOTENV_PATH</key>
+        <string>/Users/dogukangerengi/hybrid_crypto_bot/.env</string>
+    </dict>
+    
+    <!-- Yükleme sırasında çalıştırma (False = sadece zamanlama ile) -->
+    <key>RunAtLoad</key>
+    <false/>
+    
+    <!-- Başarısız olursa tekrar çalıştırma süresi (saniye) -->
+    <key>ThrottleInterval</key>
+    <integer>300</integer>
+    
+    <!-- Çalışma süresi limiti (saniye) — 15 coin ~5-8 dk -->
+    <key>TimeOut</key>
+    <integer>900</integer>
+</dict>
+</plist>
