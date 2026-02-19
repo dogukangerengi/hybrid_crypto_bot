@@ -152,7 +152,7 @@ class ExchangeConfig:
 class RiskConfig:
     """Risk yönetimi yapılandırması."""
     risk_per_trade_pct: float = 2.0          # İşlem başına max risk yüzdesi
-    max_open_positions: int = 2              # Max açık pozisyon sayısı
+    max_open_positions: int = 3              # Max açık pozisyon sayısı
     max_margin_per_trade_pct: float = 25.0   # İşlem başına max margin yüzdesi
     max_total_margin_pct: float = 60.0       # Toplam max margin yüzdesi
     min_leverage: int = 2                    # Min kaldıraç
@@ -160,6 +160,7 @@ class RiskConfig:
     min_risk_reward_ratio: float = 1.5       # Min RR oranı
     daily_max_loss_pct: float = 6.0          # Günlük max kayıp yüzdesi
     kill_switch_drawdown_pct: float = 15.0   # Kill switch DD yüzdesi
+    max_sl_pct: float = 8.0                  # Max SL mesafesi (%)
     
     def __post_init__(self):
         """settings.yaml'dan risk parametrelerini yükle."""
@@ -172,14 +173,15 @@ class RiskConfig:
         self.min_risk_reward_ratio = get_setting('risk.min_risk_reward_ratio', self.min_risk_reward_ratio)
         self.daily_max_loss_pct = get_setting('risk.daily_max_loss_pct', self.daily_max_loss_pct)
         self.kill_switch_drawdown_pct = get_setting('risk.kill_switch_drawdown_pct', self.kill_switch_drawdown_pct)
+        self.max_sl_pct = get_setting('risk.max_sl_pct', self.max_sl_pct)
 
 
 @dataclass
 class GateKeeperConfig:
     """IC kapı bekçisi eşikleri."""
-    no_trade: float = 40.0                   # IC < 40 → İşlem yapma
-    report_only: float = 55.0                # IC 40-55 → Sadece rapor
-    full_trade: float = 55.0                 # IC > 55 → AI + Trade
+    no_trade: float = 60.0                   # IC < 40 → İşlem yapma
+    report_only: float = 70.0                # IC 40-55 → Sadece rapor
+    full_trade: float = 75.0                 # IC > 55 → AI + Trade
     
     def __post_init__(self):
         self.no_trade = get_setting('gate_keeper.no_trade_threshold', self.no_trade)

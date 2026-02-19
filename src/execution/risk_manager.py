@@ -340,6 +340,22 @@ class RiskManager:
         else:  # SHORT
             sl_price = entry_price + sl_distance   # Üstüne çıkarsa kaybet
         
+        # ── Max SL% Cap ── 
+        # NAORIS gibi düşük fiyatlı coinlerde ATR-bazlı SL %20 olabiliyor
+        # %2 risk formülü pozisyonu küçültse de, SL çok geniş olunca
+        # tek bir spike tüm riski realize eder. Cap ile sınırla.
+        max_sl_pct = getattr(self.risk_cfg, 'max_sl_pct', 8.0)
+        sl_pct_raw = (sl_distance / entry_price) * 100
+        if sl_pct_raw > max_sl_pct:
+            logger.warning(
+                f"   ⚠️ SL mesafesi daraltıldı: {sl_pct_raw:.1f}% → {max_sl_pct}%"
+            )
+            sl_distance = entry_price * max_sl_pct / 100
+            if direction == "LONG":
+                sl_price = entry_price - sl_distance
+            else:
+                sl_price = entry_price + sl_distance
+        
         # SL mesafesi yüzde
         sl_distance_pct = (sl_distance / entry_price) * 100
         

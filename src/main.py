@@ -768,6 +768,15 @@ class HybridTradingPipeline:
             if direction == "WAIT":
                 result.status = "skipped_wait"
                 return result
+            # ── Max Pozisyon Limiti Kontrolü ──
+            open_count = len(self.paper_trader.open_trades) if self.paper_trader else 0
+            max_pos = cfg.risk.max_open_positions      # settings.yaml'dan: 3
+            if open_count >= max_pos:
+                logger.warning(
+                    f"⚠️ {result.coin}: Max pozisyon limiti ({max_pos}) doldu — trade atlanıyor"
+                )
+                result.status = "position_limit"
+                return result
             
             # Paper trade aç
             trade = self.paper_trader.open_trade(
