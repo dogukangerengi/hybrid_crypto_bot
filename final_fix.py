@@ -1,4 +1,77 @@
+#!/usr/bin/env python3
 # =============================================================================
+# KESİN ÇÖZÜM — TÜM VERİ AKIŞI BİTGET'TEN
+# =============================================================================
+# Bu script:
+# 1. fetcher.py'yi sıfırdan yazar (tamamen Bitget, pagination destekli)
+# 2. coin_scanner.py uyumluluğunu doğrular
+# 3. main.py'deki OHLCV/ticker çağrılarını kontrol eder
+# 4. Canlı doğrulama testleri çalıştırır
+#
+# Çalıştır: cd ~/hybrid_crypto_bot && python final_fix.py
+# =============================================================================
+
+import sys
+import shutil
+import time
+from pathlib import Path
+from datetime import datetime
+
+# ─── Renk kodları ───
+G = "\033[92m"    # Yeşil
+R = "\033[91m"    # Kırmızı
+Y = "\033[93m"    # Sarı
+C = "\033[96m"    # Cyan
+B = "\033[1m"     # Bold
+X = "\033[0m"     # Reset
+
+def ok(m):   print(f"  {G}✅ {m}{X}")
+def fail(m): print(f"  {R}❌ {m}{X}")
+def warn(m): print(f"  {Y}⚠️  {m}{X}")
+def info(m): print(f"  {C}ℹ️  {m}{X}")
+
+# ─── src/ dizinini bul ───
+cwd = Path.cwd()
+src = cwd / 'src' if (cwd / 'src').exists() else (cwd if cwd.name == 'src' else None)
+if not src:
+    fail("src/ klasörü bulunamadı! cd ~/hybrid_crypto_bot yapıp tekrar dene.")
+    sys.exit(1)
+
+print(f"\n{B}{'='*60}")
+print(f"  🔧 KESİN ÇÖZÜM — TAMAMEN BİTGET MİMARİSİ")
+print(f"  📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"{'='*60}{X}")
+
+
+# =============================================================================
+# ADIM 1: YEDEK AL
+# =============================================================================
+print(f"\n{B}[1/4] Yedekleniyor...{X}")
+
+backup_dir = cwd / 'backups' / f"pre_final_fix_{datetime.now().strftime('%H%M%S')}"
+backup_dir.mkdir(parents=True, exist_ok=True)
+
+files_to_backup = [
+    src / 'data' / 'fetcher.py',
+    src / 'main.py',
+    src / 'scanner' / 'coin_scanner.py',
+]
+
+for f in files_to_backup:
+    if f.exists():
+        dest = backup_dir / f.relative_to(src)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(f, dest)
+
+ok(f"Yedek alındı → {backup_dir.relative_to(cwd)}/")
+
+
+# =============================================================================
+# ADIM 2: fetcher.py — TAMAMEN BİTGET
+# =============================================================================
+print(f"\n{B}[2/4] fetcher.py yazılıyor (tamamen Bitget)...{X}")
+
+FETCHER_CODE = r'''# =============================================================================
 # BİTGET FUTURES VERİ ÇEKME MODÜLÜ v4.0 — TAM BİTGET
 # =============================================================================
 # Tüm veri Bitget'ten geliyor:
@@ -61,15 +134,12 @@ class BitgetFetcher:
         "15m": 1500,   # ~15 gün    | Trend + momentum analizi
         "30m": 1000,   # ~20 gün    | Swing analizi
         "1h": 750,     # ~31 gün    | Günlük döngü analizi
-        "2h": 1500,        # ~125 gün (~4 ay)
         "4h": 500,     # ~83 gün    | Haftalık trend
         "1d": 365,     # ~1 yıl     | Uzun vadeli rejim
     }
     
     # Varsayılan aktif timeframe'ler
-    DEFAULT_ACTIVE_TIMEFRAMES = [
-        "15m", "30m", "1h", "2h", "4h"            # settings.yaml ile senkron
-    ]
+    DEFAULT_ACTIVE_TIMEFRAMES = ["15m", "1h", "4h"]
 
     # =========================================================================
     # BAŞLATMA (CONSTRUCTOR)
@@ -543,3 +613,173 @@ if __name__ == "__main__":
         print(f"  {tf}: {len(df)} bar")
     
     print(f"\n🎉 Tüm testler başarılı — Bitget tam çalışıyor!")
+'''
+
+fetcher_path = src / 'data' / 'fetcher.py'
+fetcher_path.write_text(FETCHER_CODE, encoding='utf-8')
+ok("fetcher.py v4.0 yazıldı (tamamen Bitget, pagination destekli)")
+
+
+# =============================================================================
+# ADIM 3: coin_scanner.py ve main.py KONTROL
+# =============================================================================
+print(f"\n{B}[3/4] Diğer dosyalar kontrol ediliyor...{X}")
+
+# ─── coin_scanner.py ───
+scanner_path = src / 'scanner' / 'coin_scanner.py'
+if scanner_path.exists():
+    sc = scanner_path.read_text(encoding='utf-8')
+    
+    # coin_scanner'da 3 olası pattern var:
+    # A) self.fetcher.exchange.fetch_tickers() → Doğru (direkt Bitget)
+    # B) self.fetcher.fetch_tickers(symbols)   → Doğru (wrapper metod)
+    # C) self.fetcher.fetch_tickers()          → Doğru (parametresiz)
+    
+    if 'self.fetcher.exchange.fetch_tickers()' in sc:
+        ok("coin_scanner.py: exchange.fetch_tickers() → Bitget direkt ✓")
+    elif 'self.fetcher.fetch_tickers(' in sc:
+        ok("coin_scanner.py: fetcher.fetch_tickers() → wrapper metod ✓")
+    else:
+        warn("coin_scanner.py: Ticker çağrısı tespit edilemedi")
+        info("  Manuel kontrol: grep -n 'fetch_ticker' src/scanner/coin_scanner.py")
+
+# ─── main.py ───
+main_path = src / 'main.py'
+if main_path.exists():
+    mc = main_path.read_text(encoding='utf-8')
+    changes = 0
+    
+    # 1. volume_24h → quoteVolume (Bitget raw ticker'da quoteVolume var)
+    if "ticker.get('volume_24h'" in mc:
+        mc = mc.replace(
+            "ticker.get('volume_24h', 0)",
+            "ticker.get('quoteVolume', 0)"
+        )
+        changes += 1
+        ok("main.py: volume_24h → quoteVolume düzeltildi")
+    elif "ticker.get('quoteVolume'" in mc:
+        ok("main.py: quoteVolume zaten doğru ✓")
+    
+    # 2. Ticker çağrısı kontrol
+    #    self.fetcher.exchange.fetch_ticker() → Doğru (Bitget direkt)
+    #    self.fetcher.get_ticker()            → Doğru (wrapper)
+    if 'self.fetcher.exchange.fetch_ticker(' in mc:
+        ok("main.py: exchange.fetch_ticker() → Bitget direkt ✓")
+    if 'self.fetcher.get_ticker(' in mc:
+        ok("main.py: get_ticker() wrapper kullanılıyor ✓")
+    
+    # 3. OHLCV çağrısı kontrol
+    if 'self.fetcher.fetch_ohlcv(' in mc:
+        ok("main.py: fetch_ohlcv() kullanılıyor → artık Bitget'e gidecek ✓")
+    
+    # 4. _analyze_coin sembol formatı kontrol
+    if 'full_symbol = f"{clean_coin}/USDT:USDT"' in mc:
+        ok("main.py: _analyze_coin sembol formatı doğru ✓")
+    
+    if changes > 0:
+        main_path.write_text(mc, encoding='utf-8')
+        ok(f"main.py: {changes} değişiklik uygulandı")
+    else:
+        ok("main.py: Değişiklik gerekmedi")
+
+# ─── data/__init__.py ───
+init_path = src / 'data' / '__init__.py'
+if init_path.exists():
+    ic = init_path.read_text(encoding='utf-8')
+    if 'DataFetcher = BitgetFetcher' not in ic:
+        # Alias ekle (geriye uyumluluk)
+        ic = ic.replace(
+            "from .fetcher import BitgetFetcher",
+            "from .fetcher import BitgetFetcher\n\n# Geriye uyumluluk alias'ı\nDataFetcher = BitgetFetcher"
+        )
+        init_path.write_text(ic, encoding='utf-8')
+        ok("data/__init__.py: DataFetcher alias eklendi")
+    else:
+        ok("data/__init__.py: Alias mevcut ✓")
+
+
+# =============================================================================
+# ADIM 4: CANLI DOĞRULAMA
+# =============================================================================
+print(f"\n{B}[4/4] Canlı doğrulama testleri...{X}")
+
+# Modül cache'ini temizle
+for mod in list(sys.modules.keys()):
+    if any(x in mod for x in ['data', 'fetcher', 'config', 'scanner']):
+        del sys.modules[mod]
+
+sys.path.insert(0, str(src))
+
+try:
+    from data.fetcher import BitgetFetcher
+    f = BitgetFetcher()
+    
+    # Test 1: Coin listesi
+    symbols = f.get_all_usdt_futures()
+    assert len(symbols) > 100, f"Sadece {len(symbols)} çift!"
+    ok(f"[1/6] Coin listesi: {len(symbols)} çift")
+    
+    # Test 2: Toplu ticker
+    tickers = f.fetch_tickers(['BTC/USDT:USDT', 'ETH/USDT:USDT'])
+    btc = tickers.get('BTC/USDT:USDT', {})
+    assert btc.get('last', 0) > 1000, "BTC fiyat yok!"
+    ok(f"[2/6] Toplu ticker: BTC ${btc['last']:,.2f}")
+    
+    # Test 3: Tek ticker
+    t = f.get_ticker('BTC/USDT:USDT')
+    assert t['last'] > 1000
+    ok(f"[3/6] Tek ticker: BTC ${t['last']:,.2f}")
+    
+    # Test 4: OHLCV tek istek (≤200)
+    df = f.fetch_ohlcv('BTC/USDT:USDT', '1h', limit=100)
+    assert len(df) >= 50, f"OHLCV yetersiz: {len(df)}"
+    ok(f"[4/6] OHLCV (100 bar): {len(df)} bar çekildi")
+    
+    # Test 5: OHLCV pagination (>200)
+    df_big = f.fetch_ohlcv('SOL/USDT:USDT', '1h', limit=400)
+    assert len(df_big) >= 200, f"Pagination başarısız: {len(df_big)}"
+    ok(f"[5/6] OHLCV pagination (400 bar): {len(df_big)} bar çekildi")
+    
+    # Test 6: fetch_ohlcv BTC ile doğrula (pipeline'daki asıl çağrı)
+    df_verify = f.fetch_ohlcv('BTC/USDT:USDT', timeframe='4h', limit=500)
+    assert len(df_verify) >= 100, f"4h verisi yetersiz: {len(df_verify)}"
+    ok(f"[6/6] BTC 4h (500 bar): {len(df_verify)} bar çekildi")
+
+except Exception as e:
+    fail(f"Doğrulama hatası: {e}")
+    import traceback
+    traceback.print_exc()
+    print(f"\n{R}Düzeltme başarısız! Yedek geri yükleniyor...{X}")
+    # Yedekten geri yükle
+    for f in files_to_backup:
+        backup_f = backup_dir / f.relative_to(src)
+        if backup_f.exists():
+            shutil.copy2(backup_f, f)
+    print(f"Yedek geri yüklendi → {backup_dir}")
+    sys.exit(1)
+
+
+# =============================================================================
+# SONUÇ
+# =============================================================================
+print(f"\n{B}{'='*60}")
+print(f"  ✅ KESİN ÇÖZÜM TAMAMLANDI!")
+print(f"{'='*60}{X}")
+print(f"""
+  Mimari (v4.0 — Tam Bitget):
+  ┌─────────────────────────────────────────┐
+  │  Coin Listesi  → Bitget USDT-M Markets  │
+  │  Ticker/Fiyat  → Bitget fetch_tickers   │
+  │  OHLCV Verisi  → Bitget + Pagination    │
+  │  Emir/İşlem    → Bitget Executor        │
+  │  Binance       → KALDIRILDI ❌           │
+  └─────────────────────────────────────────┘
+
+  Yedek: {backup_dir.relative_to(cwd)}/
+
+  Şimdi pipeline'ı test et:
+  {C}cd src && python main.py --dry-run{X}
+
+  Veya sadece fetcher'ı test et:
+  {C}cd src && python data/fetcher.py{X}
+""")

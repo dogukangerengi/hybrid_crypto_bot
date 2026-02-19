@@ -686,6 +686,12 @@ class PaperTrader:
         
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
+
+            # ── Excel otomatik export (Madde 3) ──
+            try:
+                self.export_to_xlsx()                  # Her kayıtta xlsx de güncelle
+            except Exception as xlsx_err:
+                logger.debug(f"Excel export hatası (kritik değil): {xlsx_err}")
         
         logger.debug(f"💾 Trade'ler kaydedildi: {filepath}")
 
@@ -814,6 +820,349 @@ class PaperTrader:
                 writer.writerow(row)
         
         logger.info(f"📄 CSV export: {filepath} ({len(self.closed_trades)} trade)")
+        return filepath
+
+
+    def export_to_xlsx(self, filepath: Optional[Path] = None) -> Path:
+        """
+        Tüm trade'leri profesyonel formatlı Excel dosyasına export eder.
+        
+        2 Sheet oluşturur:
+        - Trades: Her trade satır satır (açık + kapalı)
+        - Summary: Performans metrikleri özeti
+        
+        Her _save_trades() çağrısında otomatik çalışır.
+        Mevcut JSON kaydını bozmaz — ek çıktı olarak .xlsx üretir.
+        
+        İstatistiksel not:
+        Excel çıktısı walk-forward analiz ve parametre optimizasyonu
+        için pandas ile tekrar okunabilir (pd.read_excel).
+        
+        Parameters:
+        ----------
+        filepath : Path, optional
+            Çıktı dosya yolu (varsayılan: log_dir/paper_trades.xlsx)
+            
+        Returns:
+        -------
+        Path
+            Oluşturulan Excel dosyasının yolu
+        """
+        try:
+            from openpyxl import Workbook                         # Excel dosya oluşturma
+            from openpyxl.styles import (
+                Font, PatternFill, Alignment, Border, Side, numbers  # Hücre stilleri
+            )
+            from openpyxl.utils import get_column_letter           # Sütun harf dönüşümü
+        except ImportError:
+            logger.warning("⚠️ openpyxl yüklü değil — pip install openpyxl")
+            return filepath or self.log_dir / "paper_trades.xlsx"
+        
+        filepath = filepath or self.log_dir / "paper_trades.xlsx"  # Varsayılan kayıt yolu
+        
+        wb = Workbook()                                            # Yeni Excel workbook
+        
+        # ─────────────────────────────────────────────────────────
+        # SHEET 1: TRADES (Tüm işlemler satır satır)
+        # ─────────────────────────────────────────────────────────
+        ws_trades = wb.active                                      # İlk sheet
+        ws_trades.title = "Trades"                                 # Sheet adı
+        
+        # ── Sütun tanımları: (başlık, genişlik, sayı formatı) ──
+        columns = [
+            ("Trade ID",       14, None),                          # Benzersiz kimlik
+            ("Tarih (Açılış)", 18, None),                          # Trade açılış zamanı
+            ("Tarih (Kapanış)",18, None),                          # Trade kapanış zamanı
+            ("Coin",           8,  None),                          # Sembol (BTC, ETH vb.)
+            ("Yön",            8,  None),                          # LONG / SHORT
+            ("Giriş ($)",      12, '#,##0.00'),                    # Entry price
+            ("Çıkış ($)",      12, '#,##0.00'),                    # Exit price
+            ("Lot (Coin)",     12, '#,##0.000000'),                # Position size
+            ("Hacim ($)",      12, '#,##0.00'),                    # Position value
+            ("Kaldıraç",       10, '0x'),                          # Leverage
+            ("SL ($)",         12, '#,##0.00'),                    # Stop-loss fiyatı
+            ("TP ($)",         12, '#,##0.00'),                    # Take-profit fiyatı
+            ("R:R",            8,  '0.00'),                        # Risk/Reward oranı
+            ("PnL ($)",        10, '#,##0.00;(#,##0.00);"-"'),     # Kâr/zarar ($)
+            ("PnL (%)",        10, '0.00%'),                       # Kâr/zarar (%)
+            ("Fee ($)",        10, '#,##0.00'),                    # İşlem ücreti
+            ("Net PnL ($)",    12, '#,##0.00;(#,##0.00);"-"'),     # Net kâr/zarar
+            ("IC Güven",       10, '0.0'),                         # IC confidence score
+            ("IC Yön",         8,  None),                          # IC direction
+            ("TF",             6,  None),                          # En iyi timeframe
+            ("Rejim",          14, None),                          # Market regime
+            ("AI Karar",       10, None),                          # AI decision
+            ("Durum",          14, None),                          # Trade status
+            ("Çıkış Nedeni",   14, None),                          # Exit reason
+            ("Süre (dk)",      10, '#,##0'),                       # Duration in minutes
+        ]
+        
+        # ── Stil tanımları ──
+        header_font = Font(                                        # Başlık fontu
+            name='Arial', bold=True, color='FFFFFF', size=10
+        )
+        header_fill = PatternFill(                                 # Başlık arka plan (koyu mavi)
+            start_color='2F5496', end_color='2F5496', fill_type='solid'
+        )
+        header_alignment = Alignment(                              # Başlık hizalama
+            horizontal='center', vertical='center', wrap_text=True
+        )
+        
+        data_font = Font(name='Arial', size=9)                    # Veri fontu
+        
+        # Koşullu renkler (PnL için)
+        green_font = Font(name='Arial', size=9, color='006100')   # Kâr (yeşil)
+        red_font = Font(name='Arial', size=9, color='9C0006')     # Zarar (kırmızı)
+        green_fill = PatternFill(                                  # Kâr arka plan
+            start_color='C6EFCE', end_color='C6EFCE', fill_type='solid'
+        )
+        red_fill = PatternFill(                                    # Zarar arka plan
+            start_color='FFC7CE', end_color='FFC7CE', fill_type='solid'
+        )
+        
+        long_fill = PatternFill(                                   # LONG arka plan (açık yeşil)
+            start_color='E2EFDA', end_color='E2EFDA', fill_type='solid'
+        )
+        short_fill = PatternFill(                                  # SHORT arka plan (açık kırmızı)
+            start_color='FCE4EC', end_color='FCE4EC', fill_type='solid'
+        )
+        
+        thin_border = Border(                                      # İnce kenarlık
+            left=Side(style='thin', color='D9D9D9'),
+            right=Side(style='thin', color='D9D9D9'),
+            top=Side(style='thin', color='D9D9D9'),
+            bottom=Side(style='thin', color='D9D9D9'),
+        )
+        
+        # ── Başlık satırı yaz ──
+        for col_idx, (title, width, _) in enumerate(columns, 1):
+            cell = ws_trades.cell(row=1, column=col_idx, value=title)
+            cell.font = header_font                                # Beyaz kalın font
+            cell.fill = header_fill                                # Koyu mavi arka plan
+            cell.alignment = header_alignment                      # Ortala
+            ws_trades.column_dimensions[get_column_letter(col_idx)].width = width
+        
+        # ── Freeze panes: başlık satırı sabit kalsın ──
+        ws_trades.freeze_panes = 'A2'                              # Scroll'da başlık kaybolmaz
+        
+        # ── Trade verilerini yaz (tüm tradeler: önce açık, sonra kapalı) ──
+        all_trade_list = list(self.open_trades.values()) + self.closed_trades
+        
+        for row_idx, trade in enumerate(all_trade_list, 2):        # 2'den başla (1 = başlık)
+            # Her sütuna karşılık gelen trade alanı
+            row_data = [
+                trade.trade_id[:12] if trade.trade_id else "",     # Trade ID (kısa)
+                trade.opened_at or "",                             # Açılış tarihi
+                trade.closed_at or "",                             # Kapanış tarihi
+                trade.symbol or "",                                # Coin adı
+                trade.direction or "",                             # LONG/SHORT
+                trade.entry_price or 0,                            # Giriş fiyatı
+                trade.exit_price if trade.exit_price else None,    # Çıkış fiyatı
+                trade.position_size or 0,                          # Lot miktarı
+                trade.position_value or 0,                         # Pozisyon hacmi ($)
+                trade.leverage or 1,                               # Kaldıraç
+                trade.stop_loss or 0,                              # Stop-loss
+                trade.take_profit or 0,                            # Take-profit
+                trade.risk_reward or 0,                            # R:R oranı
+                trade.pnl_absolute if trade.pnl_absolute else 0,  # PnL ($)
+                (trade.pnl_percent or 0) / 100 if trade.pnl_percent else 0,  # PnL (%) — Excel formatı
+                trade.fees or 0,                                   # Fee
+                trade.net_pnl if trade.net_pnl else 0,            # Net PnL
+                trade.ic_confidence or 0,                          # IC güven
+                trade.ic_direction or "",                          # IC yön
+                trade.best_timeframe or "",                        # TF
+                trade.market_regime or "",                         # Rejim
+                trade.ai_decision or "",                           # AI karar
+                trade.status or "",                                # Durum
+                trade.exit_reason or "",                           # Çıkış nedeni
+                trade.duration_minutes if trade.duration_minutes else None,
+            ]
+            
+            for col_idx, value in enumerate(row_data, 1):
+                cell = ws_trades.cell(row=row_idx, column=col_idx, value=value)
+                cell.font = data_font                              # Veri fontu
+                cell.border = thin_border                          # Kenarlık
+                
+                # Sayı formatı uygula (sütun bazlı)
+                _, _, fmt = columns[col_idx - 1]
+                if fmt and value is not None:
+                    cell.number_format = fmt
+            
+            # ── Koşullu formatlama: Yön rengi ──
+            direction_cell = ws_trades.cell(row=row_idx, column=5)  # Yön sütunu (E)
+            if trade.direction == "LONG":
+                direction_cell.fill = long_fill                    # LONG → açık yeşil
+            elif trade.direction == "SHORT":
+                direction_cell.fill = short_fill                   # SHORT → açık kırmızı
+            
+            # ── Koşullu formatlama: PnL renklendirme ──
+            pnl_val = trade.net_pnl or trade.pnl_absolute or 0
+            for pnl_col in [14, 17]:                               # PnL($) ve Net PnL($) sütunları
+                pnl_cell = ws_trades.cell(row=row_idx, column=pnl_col)
+                if pnl_val > 0:
+                    pnl_cell.font = green_font                     # Kâr → yeşil font
+                    pnl_cell.fill = green_fill                     # Yeşil arka plan
+                elif pnl_val < 0:
+                    pnl_cell.font = red_font                       # Zarar → kırmızı font
+                    pnl_cell.fill = red_fill                       # Kırmızı arka plan
+            
+            # ── Durum sütunu renklendirme ──
+            status_cell = ws_trades.cell(row=row_idx, column=22)   # Durum sütunu
+            if "tp" in (trade.status or "").lower():
+                status_cell.fill = green_fill                      # TP → yeşil
+            elif "sl" in (trade.status or "").lower():
+                status_cell.fill = red_fill                        # SL → kırmızı
+        
+        # ── AutoFilter ekle (sıralama/filtreleme için) ──
+        if len(all_trade_list) > 0:
+            last_col = get_column_letter(len(columns))
+            ws_trades.auto_filter.ref = f"A1:{last_col}{len(all_trade_list) + 1}"
+        
+        # ─────────────────────────────────────────────────────────
+        # SHEET 2: SUMMARY (Performans özeti)
+        # ─────────────────────────────────────────────────────────
+        ws_summary = wb.create_sheet("Summary")                    # İkinci sheet
+        
+        # Performans metriklerini hesapla
+        summary = self.get_summary()                               # Mevcut summary metodu
+        
+        # ── Başlık stili ──
+        title_font = Font(name='Arial', bold=True, size=14, color='2F5496')
+        section_font = Font(name='Arial', bold=True, size=11, color='2F5496')
+        label_font = Font(name='Arial', size=10)
+        value_font = Font(name='Arial', bold=True, size=10)
+        
+        # ── Başlık ──
+        ws_summary['A1'] = '📊 PAPER TRADING PERFORMANS RAPORU'
+        ws_summary['A1'].font = title_font
+        ws_summary.merge_cells('A1:D1')
+        
+        ws_summary['A2'] = f'Oluşturulma: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+        ws_summary['A2'].font = Font(name='Arial', size=9, italic=True, color='808080')
+        
+        # ── Sütun genişlikleri ──
+        ws_summary.column_dimensions['A'].width = 22               # Metrik adı
+        ws_summary.column_dimensions['B'].width = 15               # Değer
+        ws_summary.column_dimensions['C'].width = 22               # Metrik adı (2. sütun)
+        ws_summary.column_dimensions['D'].width = 15               # Değer (2. sütun)
+        
+        # ── BAKİYE BİLGİLERİ (Satır 4'ten başla) ──
+        row = 4
+        ws_summary.cell(row=row, column=1, value='💰 BAKİYE').font = section_font
+        row += 1
+        
+        balance_items = [
+            ('Başlangıç Bakiye', f"${summary.get('initial_balance', 0):.2f}"),
+            ('Güncel Bakiye', f"${summary.get('current_balance', 0):.2f}"),
+            ('Toplam Getiri', f"{summary.get('total_return_pct', 0):+.1f}%"),
+            ('Net PnL', f"${summary.get('total_pnl', 0):+.2f}"),
+            ('Toplam Fee', f"${summary.get('total_fees', 0):.2f}"),
+        ]
+        
+        for label, value in balance_items:
+            ws_summary.cell(row=row, column=1, value=label).font = label_font
+            val_cell = ws_summary.cell(row=row, column=2, value=value)
+            val_cell.font = value_font
+            # Getiri rengini ayarla
+            if 'Getiri' in label or 'PnL' in label:
+                if '+' in value or (value.replace('$','').replace('%','').strip().startswith('-') is False and float(value.replace('$','').replace('%','').replace('+','').strip() or 0) > 0):
+                    val_cell.font = Font(name='Arial', bold=True, size=10, color='006100')
+                elif '-' in value:
+                    val_cell.font = Font(name='Arial', bold=True, size=10, color='9C0006')
+            row += 1
+        
+        # ── TRADE İSTATİSTİKLERİ ──
+        row += 1
+        ws_summary.cell(row=row, column=1, value='📈 TRADE İSTATİSTİKLERİ').font = section_font
+        row += 1
+        
+        trade_items = [
+            ('Toplam Trade', str(summary.get('total_trades', 0))),
+            ('Açık Pozisyon', str(summary.get('open_trades', 0))),
+            ('Kapalı Trade', str(summary.get('closed_trades', 0))),
+            ('Kazanan', str(summary.get('winning_trades', 0))),
+            ('Kaybeden', str(summary.get('losing_trades', 0))),
+        ]
+        
+        for label, value in trade_items:
+            ws_summary.cell(row=row, column=1, value=label).font = label_font
+            ws_summary.cell(row=row, column=2, value=value).font = value_font
+            row += 1
+        
+        # ── PERFORMANS METRİKLERİ ──
+        row += 1
+        ws_summary.cell(row=row, column=1, value='📊 PERFORMANS METRİKLERİ').font = section_font
+        row += 1
+        
+        perf_items = [
+            ('Win Rate', f"{summary.get('win_rate_pct', 0):.1f}%"),
+            ('Profit Factor', f"{summary.get('profit_factor', 0):.2f}"),
+            ('Ort. PnL', f"${summary.get('avg_pnl', 0):.2f}"),
+            ('Ort. Kazanç', f"${summary.get('avg_win', 0):.2f}"),
+            ('Ort. Kayıp', f"${summary.get('avg_loss', 0):.2f}"),
+            ('Ort. Süre', f"{summary.get('avg_duration_min', 0):.0f} dk"),
+        ]
+        
+        for label, value in perf_items:
+            ws_summary.cell(row=row, column=1, value=label).font = label_font
+            ws_summary.cell(row=row, column=2, value=value).font = value_font
+            row += 1
+        
+        # ── RİSK METRİKLERİ ──
+        row += 1
+        ws_summary.cell(row=row, column=1, value='⚠️ RİSK METRİKLERİ').font = section_font
+        row += 1
+        
+        risk_items = [
+            ('Peak Bakiye', f"${summary.get('peak_balance', 0):.2f}"),
+            ('Max Drawdown', f"{summary.get('max_drawdown_pct', 0):.1f}%"),
+        ]
+        
+        for label, value in risk_items:
+            ws_summary.cell(row=row, column=1, value=label).font = label_font
+            ws_summary.cell(row=row, column=2, value=value).font = value_font
+            row += 1
+        
+        # ── GÜNLÜK PNL TABLOSU (varsa) ──
+        if self.daily_pnl:
+            row += 2
+            ws_summary.cell(row=row, column=1, value='📅 GÜNLÜK PNL').font = section_font
+            row += 1
+            
+            # Başlıklar
+            for col, title in enumerate(['Tarih', 'PnL ($)', 'Trade Sayısı'], 1):
+                cell = ws_summary.cell(row=row, column=col, value=title)
+                cell.font = header_font
+                cell.fill = header_fill
+                cell.alignment = Alignment(horizontal='center')
+            row += 1
+            
+            # Günlük veriler (tarihe göre sıralı)
+            for date_str in sorted(self.daily_pnl.keys()):
+                ws_summary.cell(row=row, column=1, value=date_str).font = label_font
+                
+                pnl_val = self.daily_pnl[date_str]
+                pnl_cell = ws_summary.cell(row=row, column=2, value=f"${pnl_val:+.2f}")
+                pnl_cell.font = Font(
+                    name='Arial', size=10, bold=True,
+                    color='006100' if pnl_val >= 0 else '9C0006'   # Yeşil/kırmızı
+                )
+                
+                trade_count = self.daily_trades.get(date_str, 0)
+                ws_summary.cell(row=row, column=3, value=trade_count).font = label_font
+                row += 1
+        
+        # ── Kaydet ──
+        try:
+            wb.save(str(filepath))                                 # Excel dosyasını diske yaz
+            logger.info(f"📊 Excel export: {filepath} ({len(all_trade_list)} trade)")
+        except PermissionError:
+            # Dosya açıksa (Excel'de izliyorsa) alternatif isimle kaydet
+            alt_path = filepath.with_stem(filepath.stem + f"_{datetime.now().strftime('%H%M%S')}")
+            wb.save(str(alt_path))
+            logger.warning(f"⚠️ Orijinal dosya kilitli, alternatif kaydedildi: {alt_path}")
+            filepath = alt_path
+        
         return filepath
 
     def reset(self) -> None:

@@ -177,9 +177,9 @@ class RiskConfig:
 @dataclass
 class GateKeeperConfig:
     """IC kapı bekçisi eşikleri."""
-    no_trade: float = 35.0                   # Bu altında: işlem yapma
-    report_only: float = 50.0                # Bu aralıkta: sadece rapor
-    full_trade: float = 50.0                 # Bu üstünde: tam işlem (test için 70.0)
+    no_trade: float = 40.0                   # IC < 40 → İşlem yapma
+    report_only: float = 55.0                # IC 40-55 → Sadece rapor
+    full_trade: float = 55.0                 # IC > 55 → AI + Trade
     
     def __post_init__(self):
         self.no_trade = get_setting('gate_keeper.no_trade_threshold', self.no_trade)

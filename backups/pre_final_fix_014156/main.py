@@ -82,17 +82,16 @@ logger = logging.getLogger(__name__)
 # VERSİYON VE SABİTLER
 # =============================================================================
 
-VERSION = "1.2.0"                              # Paper trading eklendi
-MAX_COINS_PER_CYCLE = 20                       # Cycle başına max analiz edilecek coin
+VERSION = "1.1.0"                              # Paper trading eklendi
+MAX_COINS_PER_CYCLE = 15                       # Maksimum analiz edilecek coin
 DEFAULT_FWD_PERIOD = 6                         # IC forward period (bar)
 
 # Varsayılan timeframe'ler
 DEFAULT_TIMEFRAMES = {
-    '15m': 400,                                # Day trading — 400 bar ≈ 4 gün
-    '30m': 300,                                # Trend konfirmasyonu — 300 bar ≈ 6 gün
-    '1h':  250,                                # İntraday trend — 250 bar ≈ 10 gün
-    '2h':  200,                                # Swing noktaları — 200 bar ≈ 17 gün
-    '4h':  150,                                # Büyük resim — 150 bar ≈ 25 gün
+    '15m': 200,                                # Scalping
+    '1h': 250,                                 # Kısa vade
+    '4h': 150,                                 # Orta vade
+    '1d': 100,                                 # Uzun vade
 }
 
 # AI Quota tracking

@@ -45,11 +45,9 @@ risk:
 # IC Güven > 45  → Tam işlem (AI + trade)
 # ⚠️ Sadece test için — canlıya geçmeden 50/62/62 veya üstüne çek
 gate_keeper:
-  no_trade_threshold: 30.0
-  report_only_threshold: 45.0
-  full_trade_threshold: 45.0
-
-# -----------------------------------------------------------------------------
+  no_trade_threshold: 40.0                          # IC < 40 → İŞLEM YAPMA
+  report_only_threshold: 55.0                          # IC 40-55 → Sadece rapor
+  full_trade_threshold: 55.0                          # IC > 55 → AI + Trade
 # ANALİZ AYARLARI
 # -----------------------------------------------------------------------------
 analysis:
@@ -57,10 +55,9 @@ analysis:
   # Daha fazla veri = daha güvenilir IC (büyük örneklem)
   # Çok fazla = rejim değişikliği riski (non-stationarity)
   timeframes:
-    "5m":  2000                              # Scalping
-    "15m": 1500                              # Day trading
+    "15m": 1500                              # Day trading kısa vade
     "30m": 1000                              # Trend konfirmasyonu
-    "1h":  1000                              # İntraday trend
+    "1h":  1000                              # İntraday trend (ana TF)
     "2h":  750                               # Swing noktaları
     "4h":  500                               # Büyük resim
 
@@ -98,10 +95,10 @@ thresholds:
 # TARAYICI AYARLARI (Adım 4)
 # -----------------------------------------------------------------------------
 scanner:
-  min_24h_volume_usdt: 5000000               # Min 24h USDT hacim ($5M)
+  min_24h_volume_usdt: 2500000               # Min 24h USDT hacim ($2.5M) — daha geniş coin havuzu
   min_24h_trades: 1000                       # Min 24h işlem sayısı
   max_spread_pct: 0.1                        # Max bid-ask spread (%)
-  top_n_coins: 15                            # Top N coin seç (analiz sayısı)
+  top_n_coins: 20                            # Top N coin seç (daha geniş tarama)
   scan_interval_minutes: 60                  # Tarama aralığı
 
 # -----------------------------------------------------------------------------

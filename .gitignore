@@ -10,3 +10,15 @@ logs/
 __pycache__/
 venv/
 .env*
+
+# Güncelleme script yedekleri
+*.bak_*
+
+# Güncelleme scriptleri (tek seferlik)
+update_*.py
+
+# Temizlik scriptleri
+cleanup_*.py
+
+# Test scriptleri
+smoke_test_*.py

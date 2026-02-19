@@ -66,3 +66,5 @@ matplotlib>=3.8.0          # Temel grafik kütüphanesi (mplfinance bağımlıl�
 # GELİŞTİRME ARAÇLARI
 # -----------------------------------------------------------------------------
 pytest>=8.0.0              # Birim testleri
+
+openpyxl>=3.1.0                    # Excel (.xlsx) okuma/yazma
