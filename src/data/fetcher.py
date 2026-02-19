@@ -462,7 +462,9 @@ class BitgetFetcher:
                 if max_bars_override:
                     bars = max_bars_override
                 elif cfg.timeframes and tf in cfg.timeframes:
-                    bars = cfg.timeframes[tf].get('bars', self.RECOMMENDED_BARS.get(tf, 500))
+                    # cfg.timeframes[tf] int veya dict olabilir — her ikisini de destekle
+                    tf_cfg = cfg.timeframes[tf]
+                    bars = tf_cfg.get("bars", self.RECOMMENDED_BARS.get(tf, 500)) if isinstance(tf_cfg, dict) else int(tf_cfg)
                 else:
                     bars = self.RECOMMENDED_BARS.get(tf, 500)
                 
