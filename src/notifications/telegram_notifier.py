@@ -159,7 +159,6 @@ class TelegramNotifier:
     async def send_message(self, text: str, disable_notification: bool = False) -> bool:
         """
         Telegram mesajı gönderir (async).
-        
         Retry logic + rate limit handling dahil.
         """
         if not self.is_configured():
@@ -170,26 +169,28 @@ class TelegramNotifier:
         if len(text) > self.MAX_MESSAGE_LENGTH:
             text = text[:self.MAX_MESSAGE_LENGTH - 50] + "\n\n<i>... (kısaltıldı)</i>"
         
-        for attempt in range(self.MAX_RETRIES):
-            try:
-                await self.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=text,
-                    parse_mode=ParseMode.HTML,
-                    disable_notification=disable_notification
-                )
-                logger.info("✅ Telegram mesajı gönderildi")
-                return True
-                
-            except RetryAfter as e:
-                # Telegram rate limit — belirtilen süre kadar bekle
-                logger.warning(f"⏳ Rate limit, {e.retry_after}s bekleniyor...")
-                await asyncio.sleep(e.retry_after + 1)
-                
-            except TelegramError as e:
-                logger.error(f"❌ Telegram hatası (deneme {attempt+1}/{self.MAX_RETRIES}): {e}")
-                if attempt < self.MAX_RETRIES - 1:
-                    await asyncio.sleep(self.RATE_LIMIT_DELAY * (attempt + 1))
+        # EVENT LOOP HATASINI ÇÖZEN KISIM (async with Bot...)
+        async with Bot(token=self.token) as bot:
+            for attempt in range(self.MAX_RETRIES):
+                try:
+                    await bot.send_message(
+                        chat_id=self.chat_id,
+                        text=text,
+                        parse_mode=ParseMode.HTML,
+                        disable_notification=disable_notification
+                    )
+                    logger.info("✅ Telegram mesajı gönderildi")
+                    return True
+                    
+                except RetryAfter as e:
+                    # Telegram rate limit — belirtilen süre kadar bekle
+                    logger.warning(f"⏳ Rate limit, {e.retry_after}s bekleniyor...")
+                    await asyncio.sleep(e.retry_after + 1)
+                    
+                except TelegramError as e:
+                    logger.error(f"❌ Telegram hatası (deneme {attempt+1}/{self.MAX_RETRIES}): {e}")
+                    if attempt < self.MAX_RETRIES - 1:
+                        await asyncio.sleep(self.RATE_LIMIT_DELAY * (attempt + 1))
         
         return False
     
@@ -579,16 +580,14 @@ class TelegramNotifier:
             logger.error("Telegram yapılandırılmamış!")
             return False
         try:
-            me = await self.bot.get_me()
-            logger.info(f"✅ Bot bağlantısı: @{me.username}")
-            return True
+            # EVENT LOOP HATASINI ÇÖZEN KISIM (async with Bot...)
+            async with Bot(token=self.token) as bot:
+                me = await bot.get_me()
+                logger.info(f"✅ Bot bağlantısı: @{me.username}")
+                return True
         except TelegramError as e:
             logger.error(f"❌ Bağlantı hatası: {e}")
             return False
-    
-    def test_connection_sync(self) -> bool:
-        """Sync bağlantı testi."""
-        return asyncio.run(self.test_connection())
 
 
 # =============================================================================

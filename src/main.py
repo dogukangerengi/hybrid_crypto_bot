@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
+from ai import GeminiOptimizer, AIDecision, GateAction, AIAnalysisInput  # AIAnalysisInput eklendi
 
 # ---- Mevcut Modüller (Proje Yapısına Göre) ----
 from config import cfg
@@ -42,7 +43,7 @@ from data import BitgetFetcher, DataPreprocessor
 from indicators import IndicatorCalculator, IndicatorSelector
 
 # AI modülü (ai/ klasöründen)
-from ai import GeminiOptimizer, AIDecision, GateAction
+from ai import GeminiOptimizer, AIDecision, AIDecisionResult, GateAction
 
 # Execution modülü (execution/ klasöründen)
 from execution import RiskManager, BitgetExecutor
@@ -616,70 +617,99 @@ class HybridTradingPipeline:
     def _get_ai_decision(self, result: CoinAnalysisResult) -> CoinAnalysisResult:
         """
         AI kararı al (quota yönetimli).
-        
-        Free tier için:
-        - 5 request/dakika
-        - ~20 request/gün
-        
-        Quota biterse IC-only mode'a geç.
         """
         global AI_QUOTA_EXHAUSTED, AI_ERRORS_TODAY
         
+        # 1. AI Input Objesi Hazırla
+        ai_input = AIAnalysisInput(
+            symbol=result.full_symbol,
+            coin=result.coin,
+            price=result.price,
+            change_24h=result.change_24h,
+            best_timeframe=result.best_timeframe,
+            ic_confidence=result.ic_confidence,
+            ic_direction=result.ic_direction,
+            category_tops={},  # Gerekirse scanner'dan buraya veri taşı
+            tf_rankings=[],    # Gerekirse scanner'dan buraya veri taşı
+            atr=result.atr,
+            atr_pct=result.atr_pct,
+            sl_price=result.sl_price,
+            tp_price=result.tp_price,
+            market_regime=result.market_regime,
+            volume_24h=result.volume_24h,
+            volatility=0.0     # Hesaplanmadıysa 0
+        )
+
         # AI devre dışı mı?
         if AI_QUOTA_EXHAUSTED or not self._ai_available:
             result.ai_skipped = True
-            result.ai_decision = AIDecision(
-                decision=AIDecisionType.from_direction(result.ic_direction),
-                confidence=result.ic_confidence * 0.8,  # IC'den %20 düşük güven
-                reasoning="AI quota aşıldı - IC skoru ile karar verildi",
+            # MANUEL AIDecisionResult OLUŞTURMA (Hata buradaydı)
+            # AIDecision objesi değil, AIDecisionResult objesi döndürmeli veya
+            # result.ai_decision alanına uygun formatta veri yazmalı.
+            
+            # Geçici çözüm: Basit bir obje yapısı kullanıyoruz, 
+            # çünkü result.ai_decision Tipi AIDecisionResult olmalı.
+            from ai import AIDecisionResult # Importu unutma
+            
+            decision_enum = AIDecisionType.from_direction(result.ic_direction)
+            # Enum dönüşümü: Senin tanımladığın AIDecisionType ile ai modülündeki AIDecision çakışabilir.
+            # ai modülündekini kullanmak en doğrusu:
+            from ai import AIDecision as AI_Decision_Enum
+            decision_val = AI_Decision_Enum[decision_enum.name]
+
+            result.ai_decision = AIDecisionResult(
+                decision=decision_val,
+                confidence=result.ic_confidence * 0.8,
+                reasoning="AI quota aşıldı/kapalı - IC skoru ile karar verildi",
+                gate_action=result.gate_action,
+                ic_score=result.ic_confidence,
+                model_used="ic_only_mode",
+                timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             )
             logger.info(f"⚡ {result.coin}: AI atlandı (IC-only mode)")
             return result
         
         try:
-            # Rate limiting: 12 saniye bekle (5 req/dk = 12s/req)
+            # Rate limiting
             time.sleep(12)
             
-            # AI'ya gönder
-            ai_decision = self.ai_optimizer.optimize(
-                symbol=result.coin,
-                ic_score=result.ic_confidence,
-                ic_direction=result.ic_direction,
-                regime=result.market_regime,
-                timeframe=result.best_timeframe,
-                price=result.price,
-                atr=result.atr,
-            )
+            # AI'ya gönder (get_decision metodu, optimize değil)
+            # get_decision geriye AIDecisionResult döndürür
+            ai_decision_result = self.ai_optimizer.get_decision(ai_input)
             
-            result.ai_decision = ai_decision
+            result.ai_decision = ai_decision_result
             result.ai_skipped = False
             
             logger.info(
-                f"🤖 {result.coin}: AI → {ai_decision.decision.value} "
-                f"(Güven: {ai_decision.confidence:.0f})"
+                f"🤖 {result.coin}: AI → {ai_decision_result.decision.value} "
+                f"(Güven: {ai_decision_result.confidence:.0f})"
             )
             
-            # Başarılı istek - hata sayacını sıfırla
             AI_ERRORS_TODAY = 0
             
         except Exception as e:
             error_msg = str(e).lower()
             
-            # Quota hatası mı?
             if 'quota' in error_msg or '429' in error_msg or 'rate' in error_msg:
                 AI_ERRORS_TODAY += 1
                 logger.warning(f"⚠️ AI quota hatası ({AI_ERRORS_TODAY}/{AI_ERROR_THRESHOLD}): {e}")
-                
                 if AI_ERRORS_TODAY >= AI_ERROR_THRESHOLD:
                     AI_QUOTA_EXHAUSTED = True
-                    logger.warning("🚫 AI quota tükendi! IC-only mode aktif.")
             
-            # IC bazlı fallback
+            # Fallback oluştur
+            from ai import AIDecisionResult, AIDecision as AI_Decision_Enum
+            decision_enum = AIDecisionType.from_direction(result.ic_direction)
+            decision_val = AI_Decision_Enum[decision_enum.name]
+
             result.ai_skipped = True
-            result.ai_decision = AIDecision(
-                decision=AIDecisionType.from_direction(result.ic_direction),
+            result.ai_decision = AIDecisionResult(
+                decision=decision_val,
                 confidence=result.ic_confidence * 0.8,
-                reasoning=f"AI hatası - IC fallback: {str(e)[:50]}",
+                reasoning=f"AI hatası ({str(e)[:30]}) - IC fallback",
+                gate_action=result.gate_action,
+                ic_score=result.ic_confidence,
+                model_used="error_fallback",
+                timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             )
         
         return result
@@ -699,18 +729,26 @@ class HybridTradingPipeline:
             if direction == "WAIT":
                 return result
             
-            risk_params = self._risk_manager.calculate(
+            # AI'dan gelen ATR çarpanını al (yoksa varsayılan 1.5)
+            atr_mult = 1.5
+            if result.ai_decision and hasattr(result.ai_decision, 'atr_multiplier'):
+                 atr_mult = float(result.ai_decision.atr_multiplier)
+
+            # risk_manager.py'deki doğru metod: calculate_trade
+            trade_calc = self._risk_manager.calculate_trade(
                 entry_price=result.price,
-                atr=result.atr,
                 direction=direction,
-                confidence=result.ic_confidence,
+                atr=result.atr,
+                symbol=result.full_symbol,
+                atr_multiplier=atr_mult
             )
             
-            result.sl_price = risk_params['stop_loss']
-            result.tp_price = risk_params['take_profit']
-            result.position_size = risk_params['position_size']
-            result.leverage = risk_params['leverage']
-            result.risk_reward = risk_params['risk_reward']
+            # TradeCalculation objesinden verileri al
+            result.sl_price = trade_calc.stop_loss.price
+            result.tp_price = trade_calc.take_profit.price
+            result.position_size = trade_calc.position.size
+            result.leverage = trade_calc.position.leverage
+            result.risk_reward = trade_calc.take_profit.risk_reward
             
         except Exception as e:
             logger.error(f"❌ Risk hesaplama hatası: {e}")
@@ -878,7 +916,7 @@ class HybridTradingPipeline:
                     result = self._get_ai_decision(result)
                     
                     # WAIT kararı?
-                    if result.ai_decision and result.ai_decision.decision == AIDecisionType.WAIT:
+                    if result.ai_decision and result.ai_decision.decision == AIDecision.WAIT:
                         result.status = "ai_wait"
                         report.coins.append(result)
                         continue

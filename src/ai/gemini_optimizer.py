@@ -450,13 +450,12 @@ Aşağıdaki IC (Information Coefficient) analiz sonuçlarını değerlendir ve 
 5. ATR çarpanı: Yüksek volatilitede 2.0, düşükte 1.0, normal 1.5 öner.
 
 ## ÇIKTI FORMATI
-Yanıtını SADECE aşağıdaki JSON formatında ver, başka hiçbir şey yazma:
-```json
+Yanıtını SADECE geçerli bir JSON formatında ver. Başka hiçbir kelime veya markdown işareti kullanma.
 {{
-  "decision": "LONG" | "SHORT" | "WAIT",
-  "confidence": 0-100,
-  "reasoning": "Türkçe 1-2 cümle gerekçe",
-  "atr_multiplier": 1.0-3.0
+  "decision": "LONG",
+  "confidence": 85,
+  "reasoning": "Kısa gerekçen",
+  "atr_multiplier": 1.5
 }}
 ```"""
         
@@ -490,13 +489,11 @@ Yanıtını SADECE aşağıdaki JSON formatında ver, başka hiçbir şey yazma:
         for model_name in models_to_try:
             for attempt in range(self.ai_cfg.max_retries):
                 try:
-                    model = genai.GenerativeModel(
-                        model_name=model_name,
-                        generation_config={
-                            'temperature': self.ai_cfg.temperature,
-                            'max_output_tokens': 500,      # JSON yanıt kısa olacak
-                        }
-                    )
+                    # model_name parametresini isimsiz (positional) olarak gönderiyoruz
+                    # Limitleri kaldırdık, varsayılan ayarlarla çalışacak
+                    model = genai.GenerativeModel(model_name)
+                    
+                    response = model.generate_content(prompt)
                     
                     response = model.generate_content(prompt)
                     
@@ -524,6 +521,8 @@ Yanıtını SADECE aşağıdaki JSON formatında ver, başka hiçbir şey yazma:
         Gemini yanıtını temizler ve JSON'a çevirir.
         Hata durumunda 'WAIT' döndürür (None döndürmez).
         """
+        import re  # Fazladan virgülleri temizlemek için Regex kütüphanesi
+        
         fallback_response = {
             "decision": "WAIT",
             "confidence": 0,
@@ -546,14 +545,19 @@ Yanıtını SADECE aşağıdaki JSON formatında ver, başka hiçbir şey yazma:
             end_idx = clean_text.rfind('}')
 
             if start_idx != -1 and end_idx != -1:
-                json_str = clean_text[start_idx : end_idx + 1]
-                return json.loads(json_str)
+                clean_text = clean_text[start_idx : end_idx + 1]
             
-            # Süslü parantez yoksa direkt dene
+            # 4. HAYAT KURTARAN DOKUNUŞ: Sondaki gereksiz virgülleri temizle
+            # Örn: { "decision": "WAIT", } hatasını { "decision": "WAIT" } yapar
+            clean_text = re.sub(r',\s*}', '}', clean_text)
+            clean_text = re.sub(r',\s*\]', ']', clean_text)
+
+            # Temizlenmiş metni JSON'a çevir
             return json.loads(clean_text)
 
         except (json.JSONDecodeError, Exception) as e:
-            print(f"JSON Parse Hatası: {e} -> Güvenli moda geçiliyor.")
+            print(f"\nJSON Parse Hatası: {e} -> Güvenli moda geçiliyor.")
+            print(f"--- GEMİNİ'NİN DÖNDÜRDÜĞÜ HATALI METİN ---\n{response_text}\n------------------------------------------")
             return fallback_response
     
     def _validate_parsed(self, parsed: Dict) -> Dict:
