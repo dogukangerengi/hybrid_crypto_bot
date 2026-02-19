@@ -15,7 +15,8 @@
 # Bu dosyadaki kodları main.py'ye entegre et veya
 # bu dosyayı direkt çalıştır (standalone mode).
 # =============================================================================
-
+import numpy as np
+import pandas as pd
 import asyncio
 import sys
 import time
@@ -450,36 +451,131 @@ class HybridTradingPipeline:
             
             for tf, limit in self.timeframes.items():
                 try:
-                    # OHLCV çek
+                    # ── 1. OHLCV Veri Çekme ──
                     df = self.fetcher.fetch_ohlcv(full_symbol, timeframe=tf, limit=limit)
                     if df is None or len(df) < 50:
                         continue
-                    
-                    # Preprocess
-                    df = self.preprocessor.prepare(df)
-                    
-                    # İndikatörler hesapla
-                    df = self.calculator.add_all_indicators(df)
-                    
-                    # IC analiz
-                    ic_result = self.selector.analyze(df, forward_period=self.fwd_period)
-                    
-                    if ic_result and ic_result.get('composite_score', 0) > 0:
+
+                    # ── 2. İndikatör Hesaplama (64+ teknik indikatör) ──
+                    df = self.calculator.calculate_all(df)          # pandas-ta ile hesapla
+                    df = self.calculator.add_price_features(df)     # log_return, simple_return
+                    df = self.calculator.add_forward_returns(       # IC hedef değişkeni
+                        df, periods=[1, self.fwd_period]
+                    )
+
+                    # ── 3. IC Analiz — Spearman + FDR ──
+                    target_col = f'fwd_ret_{self.fwd_period}'
+                    scores = self.selector.evaluate_all_indicators(
+                        df, target_col=target_col
+                    )
+
+                    # ── 4. Anlamlı İndikatörleri Filtrele ──
+                    valid_categories = ['trend', 'momentum', 'volatility', 'volume']
+                    sig_scores = [
+                        s for s in scores
+                        if not np.isnan(s.ic_mean)           # NaN kontrolü
+                        and abs(s.ic_mean) > 0.02            # Noise threshold
+                        and s.category in valid_categories   # Sadece bilinen kategoriler
+                    ]
+
+                    if not sig_scores:
+                        continue                             # Bu TF'de anlamlı sinyal yok
+
+                    # ── 5. Composite Score Hesaplama ──
+                    # En yüksek |IC| (top sinyal gücü)
+                    top_score = max(sig_scores, key=lambda x: abs(x.ic_mean))
+                    top_ic_val = abs(top_score.ic_mean)
+
+                    # Ortalama |IC| (genel sinyal seviyesi)
+                    avg_ic = np.mean([abs(s.ic_mean) for s in sig_scores])
+
+                    # Yön tutarlılığı (bullish/bearish consensus)
+                    pos_count = sum(1 for s in sig_scores if s.ic_mean > 0)
+                    neg_count = sum(1 for s in sig_scores if s.ic_mean < 0)
+                    consistency = max(pos_count, neg_count) / len(sig_scores)
+
+                    # Dominant yön belirleme
+                    if neg_count > pos_count * 1.5:
+                        direction = 'SHORT'
+                    elif pos_count > neg_count * 1.5:
+                        direction = 'LONG'
+                    else:
+                        direction = 'NEUTRAL'
+
+                    # ── 6. Market Rejimi Tespiti (ADX bazlı) ──
+                    regime = 'unknown'
+                    if hasattr(self, '_detect_regime'):
+                        regime = self._detect_regime(df)
+                    elif 'ADX_14' in df.columns:
+                        adx_val = float(df['ADX_14'].dropna().iloc[-1]) if not df['ADX_14'].dropna().empty else 20
+                        if adx_val > 25:
+                            regime = 'trending'
+                        elif adx_val < 15:
+                            regime = 'ranging'
+                        else:
+                            regime = 'transitioning'
+
+                    # ── 7. Normalize + Ağırlıklı Composite (0-100) ──
+                    top_norm  = min((top_ic_val - 0.02) / 0.38 * 100, 100)
+                    avg_norm  = min((avg_ic - 0.02) / 0.13 * 100, 100)
+                    cnt_norm  = min(len(sig_scores) / 50 * 100, 100)
+                    cons_norm = max(0, min((consistency - 0.5) / 0.5 * 100, 100))
+
+                    composite = (
+                        top_norm  * 0.40 +               # Top IC ağırlığı
+                        avg_norm  * 0.25 +               # Avg IC ağırlığı
+                        cnt_norm  * 0.15 +               # Anlamlı sayı ağırlığı
+                        cons_norm * 0.20                  # Tutarlılık ağırlığı
+                    )
+
+                    # Rejim bazlı düzeltme
+                    regime_mult = {'ranging': 0.85, 'volatile': 0.80, 'transitioning': 0.90}
+                    composite *= regime_mult.get(regime, 1.0)
+
+                    # ── 8. ATR Hesaplama (Risk Manager için) ──
+                    atr_val = 0.0
+                    atr_pct = 0.0
+                    if 'ATRr_14' in df.columns and not df['ATRr_14'].dropna().empty:
+                        atr_val = float(df['ATRr_14'].dropna().iloc[-1])
+                    elif 'NATR_14' in df.columns and not df['NATR_14'].dropna().empty:
+                        natr = float(df['NATR_14'].dropna().iloc[-1])
+                        last_price = float(df['close'].iloc[-1])
+                        atr_val = last_price * natr / 100
+                    else:
+                        # Manuel ATR hesabı (14 periyot)
+                        high = df['high']
+                        low = df['low']
+                        close = df['close']
+                        tr = pd.concat([
+                            high - low,
+                            (high - close.shift(1)).abs(),
+                            (low - close.shift(1)).abs()
+                        ], axis=1).max(axis=1)
+                        atr_series = tr.rolling(14).mean()
+                        if not atr_series.dropna().empty:
+                            atr_val = float(atr_series.iloc[-1])
+
+                    last_close = float(df['close'].iloc[-1])
+                    atr_pct = (atr_val / last_close * 100) if last_close > 0 else 0
+
+                    # ── 9. Sonuç Ekle ──
+                    if composite > 0:
                         tf_results.append({
                             'tf': tf,
-                            'score': ic_result['composite_score'],
-                            'direction': ic_result.get('direction', 'NEUTRAL'),
-                            'regime': ic_result.get('regime', 'unknown'),
-                            'significant': len(ic_result.get('significant_indicators', [])),
-                            'atr': ic_result.get('atr', 0),
-                            'atr_pct': ic_result.get('atr_pct', 0),
+                            'score': composite,
+                            'direction': direction,
+                            'regime': regime,
+                            'significant': len(sig_scores),
+                            'atr': atr_val,
+                            'atr_pct': atr_pct,
                         })
-                        
+
                 except Exception as e:
-                    # logger.debug(f"TF {tf} hatası: {e}") # Debug'ı kapattık
+                    logger.debug(f"  {full_symbol} {tf}: Analiz hatası — {e}")
                     continue
-            
+
             if not tf_results:
+                logger.warning(f"  ⚠️ {full_symbol}: tf_results BOŞ — tüm TF'lerde hata oluştu")
                 result.status = "no_data"
                 return result
             

@@ -457,8 +457,9 @@ def test_07_risk_manager():
     # SL kontrolü
     sl = result.stop_loss
     print(f"  SL: ${sl.price:,.2f} ({sl.distance_pct:+.2f}%)")
-    assert sl.price < btc_price, f"LONG SL entry'nin üstünde! SL={sl.price}"
-    assert sl.distance_pct < 0, f"LONG SL distance pozitif! {sl.distance_pct}"
+    # RiskManager distance_pct'yi mutlak değer olarak saklar (her zaman pozitif)
+    assert sl.distance_pct > 0, f"LONG SL distance sıfır! {sl.distance_pct}"
+    assert sl.price < btc_price, f"LONG SL entry üstünde! SL={sl.price}"
 
     # TP kontrolü
     tp = result.take_profit
