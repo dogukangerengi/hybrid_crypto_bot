@@ -38,7 +38,6 @@
         <string>/Users/dogukangerengi/hybrid_crypto_bot/venv/bin/python</string>
         <string>/Users/dogukangerengi/hybrid_crypto_bot/src/main.py</string>
         <!-- DRY RUN modu (paper trade) — canlıya geçmek için kaldırın -->
-        <string>--dry-run</string>
         <!-- Top 15 coin analiz et -->
         <string>--top</string>
         <string>15</string>

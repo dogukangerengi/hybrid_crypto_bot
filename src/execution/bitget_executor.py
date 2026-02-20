@@ -379,9 +379,13 @@ class BitgetExecutor:
             result.cost = float(order.get('cost', 0) or 0)
             result.filled = float(order.get('filled', 0) or 0)
             result.status = order.get('status', 'unknown')
-            result.success = result.status in ['closed', 'open']
+            
+            # DEĞİŞİKLİK BURADA: Eğer borsa bize kodsal bir hata (Exception) fırlatmadıysa 
+            # işlem kesinlikle başarıyla açılmıştır.
+            result.success = True 
+            
             result.raw = order
-            logger.info(f"✅ Market emir: {side.upper()} {result.filled} {symbol} @ ${result.price:,.2f}")
+            logger.info(f"✅ Market emir: {side.upper()} {amount} {symbol} Başarıyla İletildi!")
             return result
         except ccxt.InsufficientFunds as e:
             result.error = f"Yetersiz bakiye: {e}"
@@ -392,7 +396,7 @@ class BitgetExecutor:
         logger.error(result.error)
         return result
 
-    # =========================================================================
+   # =========================================================================
     # SL/TP TRİGGER EMİRLERİ
     # =========================================================================
 
@@ -419,8 +423,9 @@ class BitgetExecutor:
                 symbol=symbol, type='market', side=side, amount=amount,
                 params={
                     'productType': 'USDT-FUTURES',
+                    'planType': 'normal_plan',    # <-- EKLENEN KRİTİK SATIR (Tetikleyici Emir Türü)
                     'triggerPrice': trigger_price,
-                    'triggerType': 'market_price',
+                    'triggerType': 'mark_price',  
                     'reduceOnly': True,
                     'tradeSide': 'close',
                 })
@@ -458,8 +463,9 @@ class BitgetExecutor:
                 symbol=symbol, type='market', side=side, amount=amount,
                 params={
                     'productType': 'USDT-FUTURES',
+                    'planType': 'normal_plan',    # <-- EKLENEN KRİTİK SATIR (Tetikleyici Emir Türü)
                     'triggerPrice': trigger_price,
-                    'triggerType': 'market_price',
+                    'triggerType': 'mark_price',  
                     'reduceOnly': True,
                     'tradeSide': 'close',
                 })

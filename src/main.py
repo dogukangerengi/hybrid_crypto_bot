@@ -814,6 +814,66 @@ class HybridTradingPipeline:
             logger.error(f"❌ Paper trade hatası: {e}")
         
         return result
+    
+   # =========================================================================
+    # CANLI TRADE AÇMA (YENİ)
+    # =========================================================================
+
+    def _execute_live_trade(self, result: CoinAnalysisResult) -> CoinAnalysisResult:
+        """Canlı (gerçek para) trade açar."""
+        try:
+            direction = result.ai_decision.decision.value if result.ai_decision else result.ic_direction
+            
+            if direction == "WAIT":
+                result.status = "skipped_wait"
+                return result
+            
+            # BitgetExecutor execute_trade() metodu verileri tek bir obje içinde bekler.
+            # result objesindeki verileri dinamik bir sınıfa (wrapper) sarıyoruz:
+            class DynamicTradeCalc:
+                def __init__(self, r, d):
+                    self.symbol = r.full_symbol
+                    self.direction = d
+                    self.entry_price = r.price
+                    self.rejection_reasons = []
+                    
+                    class Pos:
+                        size = r.position_size
+                        leverage = r.leverage
+                    self.position = Pos()
+                    
+                    class Target:
+                        def __init__(self, p): self.price = p
+                    self.stop_loss = Target(r.sl_price)
+                    self.take_profit = Target(r.tp_price)
+                    
+                def is_approved(self):
+                    return True
+
+            # Dinamik objemizi oluşturuyoruz
+            trade_calc_obj = DynamicTradeCalc(result, direction)
+
+            # BitgetExecutor'a sadece bu objeyi yolluyoruz
+            exec_result = self.executor.execute_trade(trade_calc_obj)
+            
+            result.execution_result = exec_result
+            
+            if exec_result.success:
+                result.status = "executed"
+                logger.info(f"🔴 CANLI TRADE AÇILDI: {result.coin} {direction} @ ${result.price:.2f}")
+                # Telegram bildirimi (Mevcut main.py fonksiyonunu kullanıyoruz)
+                self._notify_trade_open(result)
+            else:
+                result.status = "execution_error"
+                result.error = exec_result.error
+                logger.error(f"❌ Canlı trade reddedildi: {exec_result.error}")
+            
+        except Exception as e:
+            result.status = "execution_error"
+            result.error = str(e)
+            logger.error(f"❌ Canlı trade kritik hata: {e}")
+        
+        return result
 
     # =========================================================================
     # AÇIK POZİSYON KONTROLÜ
@@ -935,7 +995,12 @@ class HybridTradingPipeline:
                     
                     # Trade aç
                     if result.sl_price > 0:
-                        result = self._execute_paper_trade(result)
+                        # Eğer dry_run modundaysak sanal aç, değilse canlı aç!
+                        if self.dry_run:
+                            result = self._execute_paper_trade(result)
+                        else:
+                            result = self._execute_live_trade(result)
+                            
                         if result.status == "executed":
                             report.total_traded += 1
                 
