@@ -22,3 +22,5 @@ cleanup_*.py
 
 # Test scriptleri
 smoke_test_*.py
+main
+main
