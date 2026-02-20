@@ -45,7 +45,7 @@
     
     <!-- Çalışma aralığı: Her 90 dakikada bir -->
     <key>StartInterval</key>
-    <integer>5400</integer>
+    <integer>4500</integer>
     
     <!-- Çalışma dizini -->
     <key>WorkingDirectory</key>

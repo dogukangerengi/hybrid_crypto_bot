@@ -371,7 +371,9 @@ class BitgetExecutor:
         try:
             params = {'productType': 'USDT-FUTURES'}
             if reduce_only:
-                params['reduceOnly'] = True
+            params['reduceOnly'] = True
+            params['tradeSide'] = 'close'   # Pozisyon kapatma emri
+
             order = exchange.create_order(symbol=symbol, type='market', side=side,
                                           amount=amount, params=params)
             result.order_id = str(order.get('id', ''))
@@ -418,12 +420,13 @@ class BitgetExecutor:
             order = exchange.create_order(
                 symbol=symbol, type='market', side=side, amount=amount,
                 params={
-                    'productType': 'USDT-FUTURES',
-                    'triggerPrice': trigger_price,
-                    'triggerType': 'market_price',
-                    'reduceOnly': True,
-                    'tradeSide': 'close',
-                })
+                'productType': 'USDT-FUTURES',
+                'planType': 'normal_plan',        # ✅ EKLE
+                'triggerPrice': trigger_price,
+                'triggerType': 'mark_price',      # ✅ DÜZELT
+                'reduceOnly': True,
+                'tradeSide': 'close',
+            }) 
             result.order_id = str(order.get('id', ''))
             result.status = order.get('status', 'open')
             result.success = True
@@ -540,6 +543,9 @@ class BitgetExecutor:
             exec_result.actual_entry = main_order.price or trade_calc.entry_price
             exec_result.actual_amount = main_order.filled or pos.size
             exec_result.actual_cost = main_order.cost or (pos.size * trade_calc.entry_price)
+            import time
+            time.sleep(2)   # 2 saniye bekle, pozisyon Bitget'te onaylansın
+            logger.info(f"⏳ Ana emir onaylandı, SL/TP gönderiliyor...")
 
             # SL
             if not skip_sl:

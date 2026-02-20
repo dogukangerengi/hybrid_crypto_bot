@@ -306,7 +306,15 @@ class GeminiOptimizer:
             parsed = self._parse_response(raw_response)
             
             # Karar objesini oluştur
-            decision = AIDecision[parsed.get('decision', 'WAIT').upper()]
+            DECISION_MAP = {
+    'LONG': 'LONG', 'BUY': 'LONG', 'BULLISH': 'LONG',
+    'SHORT': 'SHORT', 'SELL': 'SHORT', 'BEARISH': 'SHORT',
+    'WAIT': 'WAIT', 'NO_TRADE': 'WAIT', 'FLAT': 'WAIT',
+    'NEUTRAL': 'WAIT', 'HOLD': 'WAIT', 'NONE': 'WAIT',
+}
+            raw_decision = parsed.get('decision', 'WAIT').upper().strip()
+            mapped = DECISION_MAP.get(raw_decision, 'WAIT')
+            decision = AIDecision[mapped]
             confidence = float(parsed.get('confidence', 50))
             reasoning = parsed.get('reasoning', 'Gerekçe alınamadı')
             atr_mult = float(parsed.get('atr_multiplier', 1.5))

@@ -46,9 +46,9 @@ risk:
 # IC Güven > 45  → Tam işlem (AI + trade)
 # ⚠️ Sadece test için — canlıya geçmeden 50/62/62 veya üstüne çek
 gate_keeper:
-  no_trade_threshold: 60.0                          # IC < 40 → İŞLEM YAPMA
-  report_only_threshold: 70.0                          # IC 40-55 → Sadece rapor
-  full_trade_threshold: 75.0                          # IC > 55 → AI + Trade
+  no_trade_threshold: 50.0      # IC < 50 → kesinlikle trade yapma
+  report_only_threshold: 62.0   # IC 50-62 → sadece izle, giriş yok
+  full_trade_threshold: 70.0    # IC > 70 → trade aç (canlı için bu eşik)
 # ANALİZ AYARLARI
 # -----------------------------------------------------------------------------
 analysis:
@@ -111,6 +111,8 @@ ai:
     - "gemini-2.0-flash"
   temperature: 0.3                           # Düşük = daha tutarlı
   max_retries: 3
+  min_confidence: 60        # 60 altı güven → trade açma
+
 
 # -----------------------------------------------------------------------------
 # TELEGRAM
