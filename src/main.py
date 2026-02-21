@@ -1,45 +1,58 @@
 # =============================================================================
-# MAIN.PY — HYBRID TRADING PIPELINE v1.3.0
+# MAIN.PY — ML-DRIVEN TRADING PIPELINE v2.1.0
 # =============================================================================
-import numpy as np
-import pandas as pd
-import asyncio
-import sys
-import time
-import signal
-import logging
-import argparse
-from datetime import datetime
+# Gemini tamamen kaldırıldı → LightGBM pipeline entegre edildi.
+#
+# Gerçek API:
+#   FeatureEngineer.build_features(analysis, ohlcv_df, all_tf_analyses) → MLFeatureVector
+#   LGBMSignalModel.predict(fv, ic_score, ic_direction) → MLDecisionResult
+#   SignalValidator.validate(fv, model, decision, confidence, ...) → ValidationResult
+#   LGBMSignalModel.train(X, y) → ModelMetrics
+#
+# Çalıştırma:
+#   python main.py              ← paper trade (varsayılan)
+#   python main.py --live       ← canlı trade
+#   python main.py --train      ← sadece eğitim
+#   python main.py --report     ← performans raporu
+#   python main.py --schedule   ← 75dk scheduler
+# =============================================================================
+
+import sys, os, time, signal, argparse, logging, traceback
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
-from ai import GeminiOptimizer, AIDecision, GateAction, AIAnalysisInput
 
+import numpy as np
+import pandas as pd
+
+# ── .env yükle ────────────────────────────────────────────────────────────────
+from dotenv import load_dotenv
+_src_dir  = Path(__file__).parent
+_root_dir = _src_dir.parent
+load_dotenv(_root_dir / ".env")
+sys.path.insert(0, str(_src_dir))
+
+# ── Mevcut modüller ───────────────────────────────────────────────────────────
 from config import cfg
 from scanner import CoinScanner
 from data import BitgetFetcher, DataPreprocessor
 from indicators import IndicatorCalculator, IndicatorSelector
-from ai import GeminiOptimizer, AIDecision, AIDecisionResult, GateAction
 from execution import RiskManager, BitgetExecutor
 from notifications import TelegramNotifier
-
-class AIDecisionType(Enum):
-    LONG = "LONG"
-    SHORT = "SHORT"
-    WAIT = "WAIT"
-
-    @classmethod
-    def from_direction(cls, direction: str) -> 'AIDecisionType':
-        d = (direction or "").upper()
-        if d in ("LONG", "BUY", "BULLISH"):
-            return cls.LONG
-        elif d in ("SHORT", "SELL", "BEARISH"):
-            return cls.SHORT
-        return cls.WAIT
-
-from paper_trader import PaperTrader, TradeStatus
+from paper_trader import PaperTrader
 from performance_analyzer import PerformanceAnalyzer
+
+# ── ML modülleri (v2.0) ───────────────────────────────────────────────────────
+from ml.feature_engineer import FeatureEngineer, MLFeatureVector
+from ml.lgbm_model import LGBMSignalModel, MLDecisionResult
+from ml.signal_validator import SignalValidator, ValidationResult
+from ml.trade_memory import TradeMemory, TradeOutcome
+
+# =============================================================================
+# LOGLAMA
+# =============================================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -47,668 +60,548 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-VERSION = "1.3.0"
-MAX_COINS_PER_CYCLE = 20
-DEFAULT_FWD_PERIOD = 6
-MAX_OPEN_POSITIONS = 5
+# =============================================================================
+# SABİTLER
+# =============================================================================
+
+VERSION                = "2.1.0"
+MAX_COINS_PER_CYCLE    = 20
+DEFAULT_FWD_PERIOD     = 6
+MAX_OPEN_POSITIONS     = 5
+MAX_CONSECUTIVE_ERRORS = 5
+ERROR_COOLDOWN_SECONDS = 300
 
 DEFAULT_TIMEFRAMES = {
     '15m': 400,
     '30m': 300,
-    '1h':  250,
-    '2h':  200,
+    '1h' : 250,
+    '2h' : 200,
 }
 
-AI_QUOTA_EXHAUSTED = False
-AI_ERRORS_TODAY = 0
-AI_ERROR_THRESHOLD = 3
+IC_NO_TRADE = 55.0   # IC < bu → analizi atla, işlem yapma
+IC_TRADE    = 60.0   # IC >= bu → ML pipeline'a gönder
 
+# =============================================================================
+# ENUM'LAR
+# =============================================================================
 
 class CycleStatus(Enum):
-    SUCCESS = "success"
-    PARTIAL = "partial"
+    SUCCESS   = "success"
+    PARTIAL   = "partial"
     NO_SIGNAL = "no_signal"
-    ERROR = "error"
-    KILLED = "killed"
+    ERROR     = "error"
+    KILLED    = "killed"
 
+# =============================================================================
+# DATACLASS'LAR
+# =============================================================================
 
 @dataclass
 class CoinAnalysisResult:
-    coin: str = ""
-    full_symbol: str = ""
-    price: float = 0.0
-    change_24h: float = 0.0
-    volume_24h: float = 0.0
-    best_timeframe: str = ""
-    ic_confidence: float = 0.0
-    ic_direction: str = ""
-    significant_count: int = 0
-    market_regime: str = ""
-    atr: float = 0.0
-    atr_pct: float = 0.0
-    sl_price: float = 0.0
-    tp_price: float = 0.0
-    position_size: float = 0.0
-    leverage: int = 1
-    risk_reward: float = 0.0
-    gate_action: GateAction = GateAction.NO_TRADE
-    ai_decision: Optional[AIDecision] = None
-    ai_skipped: bool = False
-    status: str = "pending"
-    error: str = ""
-    execution_result: Any = None
-    paper_trade_id: str = ""
+    """
+    Tek bir coin'in tüm analiz sonuçlarını tutan veri yapısı.
+    FeatureEngineer bu nesneyi doğrudan kullanır.
+    """
+    # ── Kimlik ──
+    coin:             str   = ""               # Kısa sembol: 'BTC'
+    full_symbol:      str   = ""               # Tam sembol: 'BTC/USDT:USDT'
+    price:            float = 0.0              # Son fiyat ($)
+    change_24h:       float = 0.0             # 24h % değişim
+    volume_24h:       float = 0.0             # 24h USDT hacim
+
+    # ── IC Analiz (FeatureEngineer bu alanları okur) ──
+    best_timeframe:   str   = ""              # En yüksek IC skorlu TF
+    ic_confidence:    float = 0.0            # Composite IC skoru (0-100)
+    ic_direction:     str   = ""            # 'LONG' / 'SHORT' / 'NEUTRAL'
+    significant_count: int  = 0             # İstatistiksel anlamlı indikatör sayısı
+    market_regime:    str   = ""            # 'trending' / 'ranging' / 'volatile'
+
+    # ── FeatureEngineer için ek alanlar ──
+    category_tops:    Dict  = field(default_factory=dict)
+    # IC analizinin kategori bazlı en iyi indikatörleri
+    # {'trend': {'name': 'EMA_20', 'ic': 0.15}, ...}
+    tf_rankings:      List  = field(default_factory=list)
+    # TF sıralama listesi — cross-TF feature'lar için
+    # [{'tf': '1h', 'composite': 65, 'direction': 'LONG', 'sig_count': 10}, ...]
+
+    # ── Risk ──
+    atr:              float = 0.0
+    atr_pct:          float = 0.0
+    sl_price:         float = 0.0
+    tp_price:         float = 0.0
+    position_size:    float = 0.0
+    leverage:         int   = 1
+    risk_reward:      float = 0.0
+
+    # ── ML Karar ──
+    ml_result:        Optional[MLDecisionResult] = None
+    val_result:       Optional[ValidationResult] = None
+    ml_skipped:       bool  = False           # Model henüz eğitilmediyse True
+
+    # ── Execution ──
+    trade_executed:   bool  = False
+    status:           str   = "pending"
+    error:            str   = ""
+    execution_result: Any   = None
+    paper_trade_id:   str   = ""
 
 
 @dataclass
 class CycleReport:
-    timestamp: str = ""
-    status: CycleStatus = CycleStatus.NO_SIGNAL
-    total_scanned: int = 0
-    total_analyzed: int = 0
-    total_above_gate: int = 0
-    total_traded: int = 0
-    coins: List[CoinAnalysisResult] = field(default_factory=list)
-    balance: float = 0.0
-    paper_balance: float = 0.0
-    errors: List[str] = field(default_factory=list)
-    elapsed: float = 0.0
-    ai_mode: str = "normal"
+    """Bir tarama döngüsünün özet raporu."""
+    timestamp:        str         = ""
+    status:           CycleStatus = CycleStatus.NO_SIGNAL
+    total_scanned:    int         = 0
+    total_analyzed:   int         = 0
+    total_above_gate: int         = 0
+    total_traded:     int         = 0
+    coins:            List[CoinAnalysisResult] = field(default_factory=list)
+    balance:          float       = 0.0
+    paper_balance:    float       = 0.0
+    errors:           List[str]   = field(default_factory=list)
+    elapsed:          float       = 0.0
+    ml_stats:         Dict        = field(default_factory=dict)
 
 
 # =============================================================================
 # ANA PIPELINE
 # =============================================================================
 
-class HybridTradingPipeline:
+class MLTradingPipeline:
+    """
+    LightGBM tabanlı trading pipeline.
+
+    Adımlar:
+    1. CoinScanner → Top N coin
+    2. OHLCV + İndikatör + IC Analizi
+    3. FeatureEngineer → MLFeatureVector
+    4. LGBMSignalModel.predict() → MLDecisionResult
+    5. SignalValidator.validate() → ValidationResult
+    6. RiskManager → SL/TP/pozisyon
+    7. Execution (paper veya canlı)
+    8. TradeMemory → kayıt + retrain feedback loop
+    9. Telegram bildirimi
+    """
 
     def __init__(
         self,
-        dry_run: bool = True,
-        top_n: int = MAX_COINS_PER_CYCLE,
-        timeframes: Dict[str, int] = None,
-        fwd_period: int = DEFAULT_FWD_PERIOD,
-        verbose: bool = True,
+        dry_run:    bool = True,
+        top_n:      int  = MAX_COINS_PER_CYCLE,
+        timeframes: Dict = None,
+        fwd_period: int  = DEFAULT_FWD_PERIOD,
+        verbose:    bool = True,
     ):
-        self.dry_run = dry_run
-        self.top_n = min(top_n, MAX_COINS_PER_CYCLE)
+        self.dry_run    = dry_run
+        self.top_n      = min(top_n, MAX_COINS_PER_CYCLE)
         self.timeframes = timeframes or DEFAULT_TIMEFRAMES
         self.fwd_period = fwd_period
-        self.verbose = verbose
+        self.verbose    = verbose
 
-        self.scanner = CoinScanner()
-        self.fetcher = BitgetFetcher()
+        # ── Mevcut modüller ──
+        self.scanner      = CoinScanner()
+        self.fetcher      = BitgetFetcher()
         self.preprocessor = DataPreprocessor()
-        self.calculator = IndicatorCalculator()
-        self.selector = IndicatorSelector(alpha=0.05)
-        self.ai_optimizer = GeminiOptimizer()
-        self.executor = BitgetExecutor(dry_run=dry_run)
+        self.calculator   = IndicatorCalculator()
+        self.selector     = IndicatorSelector(alpha=0.05)
+        self.risk_manager = RiskManager()
+        self.executor     = BitgetExecutor(dry_run=dry_run)
+        self.notifier     = TelegramNotifier()
+        self.paper_trader = PaperTrader()
 
-        self.notifier: Optional[TelegramNotifier] = None
-        try:
-            if getattr(cfg, "telegram", None) and cfg.telegram.enabled and cfg.telegram.is_configured():
-                self.notifier = TelegramNotifier(
-                    token=cfg.telegram.token,
-                    chat_id=cfg.telegram.chat_id,
-                )
-                logger.info("📨 Telegram bildirimi: AKTİF")
-            else:
-                logger.info("📨 Telegram bildirimi: PASİF veya yapılandırılmamış")
-        except Exception as e:
-            logger.warning(f"📨 Telegram yapılandırma hatası: {e}")
-            self.notifier = None
+        # ── ML modülleri ──
+        self.feature_eng  = FeatureEngineer()     # IC + context → MLFeatureVector
+        self.lgbm_model   = LGBMSignalModel()     # LightGBM model (train + predict)
+        self.validator    = SignalValidator()      # Bootstrap CI + regime filter
+        self.trade_memory = TradeMemory(
+            log_dir = _root_dir / "logs"
+        )                                          # Kalıcı trade hafızası
 
-        self.paper_trader = PaperTrader(
-            initial_balance=75.0,
-            log_dir=Path(__file__).parent.parent / "logs" / "paper_trades",
-            auto_save=True,
-        )
+        # ── State ──
+        self._balance          = 0.0
+        self._initial_balance  = 0.0
+        self._kill_switch      = False
+        self._is_running       = False
+        self._consecutive_errors = 0
 
-        self._balance: float = 0.0
-        self._initial_balance: float = 0.0
-        self._risk_manager: Optional[RiskManager] = None
-        self._is_running: bool = False
-        self._kill_switch: bool = False
-        self._cycle_count: int = 0
-        self._ai_available: bool = True
-        self._ai_errors: int = 0
-
-        logger.info(
-            f"🚀 HybridTradingPipeline v{VERSION} başlatıldı | "
-            f"Mode: {'🧪 DRY RUN' if dry_run else '🔴 CANLI'} | "
-            f"Paper Trading: ✅"
-        )
+        logger.info(f"🚀 ML Trading Pipeline v{VERSION} (dry_run={dry_run})")
 
     # =========================================================================
-    # TELEGRAM
-    # =========================================================================
-
-    def _notify_system(self, status_type: str, details: Dict[str, Any] | None = None) -> None:
-        if not self.notifier:
-            return
-        try:
-            self.notifier.send_system_status_sync(status_type, details or {})
-        except Exception as e:
-            logger.warning(f"Telegram sistem bildirimi hatası: {e}")
-
-    def _notify_trade_open(self, result: CoinAnalysisResult) -> None:
-        if not self.notifier:
-            return
-        try:
-            direction = (result.ai_decision.decision.value
-                         if result.ai_decision else result.ic_direction or "UNKNOWN")
-            text = (
-                f"📈 Yeni trade açıldı\n"
-                f"━━━━━━━━━━━━━━━━━━━━━\n"
-                f"🪙 Coin: {result.coin}\n"
-                f"⏱ TF: {result.best_timeframe}\n"
-                f"📊 IC Güven: {result.ic_confidence:.0f}/100\n"
-                f"📍 Yön: {direction}\n"
-                f"💰 Fiyat: ${result.price:,.6f}\n"
-                f"🛑 SL: ${result.sl_price:,.6f}\n"
-                f"🎯 TP: ${result.tp_price:,.6f}\n"
-                f"⚙️ Kaldıraç: x{result.leverage}\n"
-                f"━━━━━━━━━━━━━━━━━━━━━"
-            )
-            self.notifier.send_message_sync(text)
-        except Exception as e:
-            logger.warning(f"Telegram trade bildirimi hatası: {e}")
-
-    def _notify_trades_closed(self, closed_trades: List) -> None:
-        if not self.notifier or not closed_trades:
-            return
-        try:
-            lines = ["📊 Trade(ler) kapandı", "━━━━━━━━━━━━━━━━━━━━━"]
-            for trade in closed_trades:
-                emoji = "✅" if getattr(trade, "net_pnl", 0) > 0 else "❌"
-                lines.append(
-                    f"{emoji} {trade.symbol} {trade.direction} | "
-                    f"PnL: ${trade.net_pnl:+.2f} ({trade.pnl_percent:+.1f}%)"
-                )
-            lines.append("━━━━━━━━━━━━━━━━━━━━━")
-            self.notifier.send_message_sync("\n".join(lines))
-        except Exception as e:
-            logger.warning(f"Telegram kapanış bildirimi hatası: {e}")
-
-    # =========================================================================
-    # BAKİYE
+    # BAKIYE
     # =========================================================================
 
     def _init_balance(self) -> bool:
+        """Başlangıç bakiyesini başlatır. Paper trade'de sabit değer kullanır."""
         try:
             if self.dry_run:
-                self._balance = self.paper_trader.balance
-                self._initial_balance = self.paper_trader.initial_balance
+                self._balance = self._initial_balance = 75.0
                 logger.info(f"💰 Paper bakiye: ${self._balance:.2f}")
             else:
-                balance_info = self.executor.fetch_balance()
-                # total = free + margin'de kilitli → gerçek bakiyeyi yansıtır
-                self._balance = balance_info.get('total', 0.0)
-                self._initial_balance = balance_info.get('total', self._balance)
+                b = self.executor.fetch_balance()
+                self._balance = self._initial_balance = b
                 logger.info(f"💰 Canlı bakiye: ${self._balance:.2f}")
-
-            self._risk_manager = RiskManager(
-                balance=self._balance,
-                initial_balance=self._initial_balance
-            )
-            return self._balance > 0
-
+            return True
         except Exception as e:
             logger.error(f"❌ Bakiye hatası: {e}")
             return False
-
-    def _refresh_balance(self) -> None:
-        if self.dry_run:
-            self._balance = self.paper_trader.balance
-        else:
-            try:
-                balance_info = self.executor.fetch_balance()
-                # total kullan — free değil (pozisyon margin'i hesaba kat)
-                self._balance = balance_info.get('total', 0.0)
-            except Exception as e:
-                logger.warning(f"⚠️ Bakiye güncelleme hatası: {e}")
-
-        if self._risk_manager:
-            self._risk_manager.update_balance(self._balance)
 
     # =========================================================================
     # KILL SWITCH
     # =========================================================================
 
     def _check_kill_switch(self) -> bool:
+        """Drawdown >= eşik ise tüm işlemleri durdurur."""
+        if self._kill_switch:
+            return True
         if self._initial_balance <= 0:
             return False
-
-        if self.dry_run:
-            drawdown_pct = self.paper_trader.max_drawdown
-        else:
-            # total bakiye ile hesapla — gerçek drawdown
-            drawdown_pct = max(0, (self._initial_balance - self._balance) / self._initial_balance * 100)
-
-        threshold = cfg.risk.kill_switch_pct if hasattr(cfg.risk, 'kill_switch_pct') else 15.0
-
-        if drawdown_pct >= threshold:
+        dd = (self._initial_balance - self._balance) / self._initial_balance * 100
+        if dd >= cfg.risk.kill_switch_drawdown_pct:
             self._kill_switch = True
-            logger.warning(f"🛑 KILL SWITCH AKTİF! DD: {drawdown_pct:.1f}% >= {threshold:.1f}%")
-            try:
-                if self.notifier:
-                    self.notifier.send_risk_alert_sync(
-                        alert_type="kill_switch",
-                        details=f"DD: {drawdown_pct:.1f}% — Eşik: {threshold:.1f}%",
-                        severity="critical",
-                    )
-            except Exception:
-                pass
-
-            if self.dry_run and self.paper_trader.open_trades:
-                prices = self._get_current_prices()
-                self.paper_trader.close_all_trades(prices, "Kill switch")
-
+            logger.critical(f"🚨 KILL SWITCH! DD={dd:.1f}%")
+            if self.notifier.is_configured():
+                self.notifier.send_risk_alert_sync(
+                    alert_type="KILL_SWITCH",
+                    message=f"⛔ Kill switch! DD={dd:.1f}%",
+                    balance=self._balance, drawdown=dd,
+                )
             return True
-
         return False
 
-    def _get_current_prices(self) -> Dict[str, float]:
-        prices = {}
-        for trade_id, trade in self.paper_trader.open_trades.items():
-            try:
-                ticker = self.fetcher.get_ticker(trade.full_symbol)
-                prices[trade.symbol] = ticker['last']
-            except:
-                prices[trade.symbol] = trade.entry_price
-        return prices
-
     # =========================================================================
-    # MARKET TARAMA
+    # REJİM TESPİTİ
     # =========================================================================
 
-    def _scan_market(self) -> List:
+    def _detect_regime(self, df: pd.DataFrame) -> str:
+        """ADX bazlı piyasa rejimi: 'trending' / 'ranging' / 'volatile'"""
         try:
-            logger.info("🔍 Market taraması başlıyor...")
-            top_coins = self.scanner.scan(top_n=self.top_n)
-            logger.info(f"✅ {len(top_coins)} coin bulundu")
-            return top_coins
-        except Exception as e:
-            logger.error(f"❌ Tarama hatası: {e}")
-            return []
+            if 'ADX_14' in df.columns:
+                adx = df['ADX_14'].iloc[-1]
+                if adx > 25: return 'trending'
+                if adx > 15: return 'ranging'
+                return 'volatile'
+        except Exception:
+            pass
+        return 'unknown'
 
     # =========================================================================
-    # IC ANALİZ
+    # TEK COİN ANALİZİ
     # =========================================================================
 
-    def _analyze_coin(self, symbol: str) -> Optional[CoinAnalysisResult]:
-        clean_coin = symbol.split('/')[0] if '/' in symbol else symbol
-        result = CoinAnalysisResult(coin=clean_coin)
+    def _analyze_coin(self, symbol: str, coin: str) -> CoinAnalysisResult:
+        """
+        Tek bir coin için tam ML pipeline çalıştırır.
+
+        1. OHLCV veri çek (multi-TF)
+        2. İndikatör hesapla
+        3. IC analizi → composite skor + kategori bazlı top indikatörler
+        4. IC eşiği kontrolü
+        5. FeatureEngineer → MLFeatureVector
+        6. LGBMSignalModel.predict() → MLDecisionResult
+        7. SignalValidator.validate() → ValidationResult
+        8. RiskManager → SL/TP/pozisyon
+        """
+        result = CoinAnalysisResult(coin=coin, full_symbol=symbol)
 
         try:
-            full_symbol = f"{clean_coin}/USDT:USDT"
-            result.full_symbol = full_symbol
-
-            ticker = self.fetcher.get_ticker(full_symbol)
-            result.price = ticker.get('last', 0)
-            result.change_24h = ticker.get('percentage', 0) or 0
-            result.volume_24h = ticker.get('quoteVolume', 0) or 0
-
-            tf_results = []
-
+            # ── 1. Veri çek ─────────────────────────────────────────────────
+            all_data = {}
             for tf, limit in self.timeframes.items():
-                try:
-                    df = self.fetcher.fetch_ohlcv(full_symbol, timeframe=tf, limit=limit)
-                    if df is None or len(df) < 50:
-                        continue
+                df_raw = self.fetcher.fetch_ohlcv(symbol, tf, limit=limit)
+                if df_raw is None or len(df_raw) < 50:
+                    continue
+                df_clean = self.preprocessor.full_pipeline(df_raw)
+                if df_clean is not None and len(df_clean) > 50:
+                    all_data[tf] = df_clean
 
-                    df = self.calculator.calculate_all(df)
-                    df = self.calculator.add_price_features(df)
-                    df = self.calculator.add_forward_returns(df, periods=[1, self.fwd_period])
+            if not all_data:
+                result.status = "no_data"; return result
 
-                    target_col = f'fwd_ret_{self.fwd_period}'
-                    scores = self.selector.evaluate_all_indicators(df, target_col=target_col)
+            result.price = float(next(iter(all_data.values()))['close'].iloc[-1])
 
-                    valid_categories = ['trend', 'momentum', 'volatility', 'volume']
-                    sig_scores = [
-                        s for s in scores
-                        if not np.isnan(s.ic_mean)
-                        and abs(s.ic_mean) > 0.02
-                        and s.category in valid_categories
-                    ]
+            # ── 2. İndikatörler ──────────────────────────────────────────────
+            indicator_data = {}
+            for tf, df in all_data.items():
+                df_ind = self.calculator.calculate_all(df)
+                df_ind = self.calculator.add_forward_returns(
+                    df_ind, periods=[self.fwd_period]
+                )
+                if df_ind is not None and len(df_ind) > 50:
+                    indicator_data[tf] = df_ind
 
-                    if not sig_scores:
-                        continue
+            if not indicator_data:
+                result.status = "indicator_error"; return result
 
-                    top_score = max(sig_scores, key=lambda x: abs(x.ic_mean))
-                    top_ic_val = abs(top_score.ic_mean)
-                    avg_ic = np.mean([abs(s.ic_mean) for s in sig_scores])
+            # ── 3. IC Analizi ────────────────────────────────────────────────
+            target_col = f'fwd_ret_{self.fwd_period}'
+            best_tf    = None
+            best_ic    = -1.0
+            best_scores= []
+            tf_rankings= []
 
-                    pos_count = sum(1 for s in sig_scores if s.ic_mean > 0)
-                    neg_count = sum(1 for s in sig_scores if s.ic_mean < 0)
-                    consistency = max(pos_count, neg_count) / len(sig_scores)
-
-                    if neg_count > pos_count * 1.5:
-                        direction = 'SHORT'
-                    elif pos_count > neg_count * 1.5:
-                        direction = 'LONG'
-                    else:
-                        direction = 'NEUTRAL'
-
-                    regime = 'unknown'
-                    if 'ADX_14' in df.columns:
-                        adx_series = df['ADX_14'].dropna()
-                        if not adx_series.empty:
-                            adx_val = float(adx_series.iloc[-1])
-                            regime = 'trending' if adx_val > 25 else ('ranging' if adx_val < 15 else 'transitioning')
-
-                    top_norm  = min((top_ic_val - 0.02) / 0.38 * 100, 100)
-                    avg_norm  = min((avg_ic - 0.02) / 0.13 * 100, 100)
-                    cnt_norm  = min(len(sig_scores) / 50 * 100, 100)
-                    cons_norm = max(0, min((consistency - 0.5) / 0.5 * 100, 100))
-
-                    composite = (
-                        top_norm  * 0.40 +
-                        avg_norm  * 0.25 +
-                        cnt_norm  * 0.15 +
-                        cons_norm * 0.20
-                    )
-
-                    regime_mult = {'ranging': 0.85, 'volatile': 0.80, 'transitioning': 0.90}
-                    composite *= regime_mult.get(regime, 1.0)
-
-                    atr_val = 0.0
-                    if 'ATRr_14' in df.columns and not df['ATRr_14'].dropna().empty:
-                        atr_val = float(df['ATRr_14'].dropna().iloc[-1])
-                    elif 'NATR_14' in df.columns and not df['NATR_14'].dropna().empty:
-                        natr = float(df['NATR_14'].dropna().iloc[-1])
-                        last_price = float(df['close'].iloc[-1])
-                        atr_val = last_price * natr / 100
-                    else:
-                        high = df['high']
-                        low = df['low']
-                        close = df['close']
-                        tr = pd.concat([
-                            high - low,
-                            (high - close.shift(1)).abs(),
-                            (low - close.shift(1)).abs()
-                        ], axis=1).max(axis=1)
-                        atr_series = tr.rolling(14).mean()
-                        if not atr_series.dropna().empty:
-                            atr_val = float(atr_series.iloc[-1])
-
-                    last_close = float(df['close'].iloc[-1])
-                    atr_pct = (atr_val / last_close * 100) if last_close > 0 else 0
-
-                    if composite > 0:
-                        tf_results.append({
-                            'tf': tf, 'score': composite, 'direction': direction,
-                            'regime': regime, 'significant': len(sig_scores),
-                            'atr': atr_val, 'atr_pct': atr_pct,
-                        })
-
-                except Exception as e:
-                    logger.debug(f"  {full_symbol} {tf}: Analiz hatası — {e}")
+            for tf, df in indicator_data.items():
+                if target_col not in df.columns:
+                    continue
+                scores = self.selector.evaluate_all_indicators(df, target_col=target_col)
+                if not scores:
+                    continue
+                significant = [s for s in scores if s.is_significant]
+                if not significant:
                     continue
 
-            if not tf_results:
-                result.status = "no_data"
+                ic_mean = np.mean([abs(s.ic_mean) for s in significant]) * 100
+
+                # TF sıralama listesi (cross-TF feature için)
+                top_ic_val = max(significant, key=lambda s: abs(s.ic_mean))
+                tf_dir     = "LONG" if top_ic_val.ic_mean > 0 else "SHORT"
+                tf_rankings.append({
+                    "tf":        tf,
+                    "composite": round(ic_mean, 2),
+                    "direction": tf_dir,
+                    "sig_count": len(significant),
+                    "top_ic":    round(top_ic_val.ic_mean, 4),
+                })
+
+                if ic_mean > best_ic:
+                    best_ic     = ic_mean
+                    best_tf     = tf
+                    best_scores = scores
+
+            if best_tf is None:
+                result.status = "no_ic"; return result
+
+            result.best_timeframe    = best_tf
+            result.ic_confidence     = round(best_ic, 2)
+            result.significant_count = sum(1 for s in best_scores if s.is_significant)
+            result.tf_rankings       = sorted(tf_rankings, key=lambda x: -x["composite"])
+
+            # IC yön tespiti
+            sig_sorted = sorted(
+                [s for s in best_scores if s.is_significant],
+                key=lambda s: abs(s.ic_mean), reverse=True
+            )
+            result.ic_direction = (
+                "LONG"  if sig_sorted and sig_sorted[0].ic_mean > 0
+                else "SHORT" if sig_sorted
+                else "NEUTRAL"
+            )
+
+            # Kategori bazlı top indikatörler (FeatureEngineer için)
+            from indicators.categories import get_category_names, get_indicators_by_category
+            category_tops = {}
+            for cat in get_category_names():
+                cat_indicators = {i['name'] for i in get_indicators_by_category(cat)}
+                cat_scores = [s for s in best_scores
+                              if s.name in cat_indicators and s.is_significant]
+                if cat_scores:
+                    top = max(cat_scores, key=lambda s: abs(s.ic_mean))
+                    category_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
+            result.category_tops = category_tops
+
+            # ── 4. IC eşiği kontrolü ─────────────────────────────────────────
+            if result.ic_confidence < IC_NO_TRADE:
+                result.status = "low_ic"
+                logger.debug(f"  ⏭ {coin}: IC={result.ic_confidence:.1f} < {IC_NO_TRADE}")
                 return result
 
-            best = max(tf_results, key=lambda x: x['score'])
-            result.best_timeframe = best['tf']
-            result.ic_confidence = best['score']
-            result.ic_direction = best['direction']
-            result.market_regime = best['regime']
-            result.significant_count = best['significant']
-            result.atr = best['atr']
-            result.atr_pct = best['atr_pct']
+            # ── 5. Piyasa rejimi ─────────────────────────────────────────────
+            best_df = indicator_data[best_tf]
+            result.market_regime = self._detect_regime(best_df)
 
-            no_trade_threshold = cfg.gate.no_trade if hasattr(cfg.gate, 'no_trade') else 40
-            full_trade_threshold = cfg.gate.full_trade if hasattr(cfg.gate, 'full_trade') else 55
+            # ── 6. Feature Engineering ───────────────────────────────────────
+            try:
+                fv = self.feature_eng.build_features(
+                    analysis        = result,          # CoinAnalysisResult
+                    ohlcv_df        = best_df,         # İndikatörlü DataFrame
+                    all_tf_analyses = result.tf_rankings,  # TF listesi
+                )
+            except Exception as e:
+                logger.warning(f"  ⚠️ {coin} FeatureEngineer hatası: {e}")
+                result.status = "feature_error"; return result
 
-            if result.ic_confidence < no_trade_threshold:
-                result.gate_action = GateAction.NO_TRADE
-            elif result.ic_confidence < full_trade_threshold:
-                result.gate_action = GateAction.REPORT_ONLY
+            # ── 7. LightGBM Tahmini ──────────────────────────────────────────
+            if not self.lgbm_model.is_trained:
+                result.status    = "model_not_trained"
+                result.ml_skipped = True
+                logger.info(f"  ⏳ {coin}: Model henüz eğitilmedi → atlanıyor")
+                return result
+
+            try:
+                ml_result = self.lgbm_model.predict(
+                    feature_vector = fv,
+                    ic_score       = result.ic_confidence,
+                    ic_direction   = result.ic_direction,
+                )
+                result.ml_result = ml_result
+            except Exception as e:
+                logger.warning(f"  ⚠️ {coin} predict hatası: {e}")
+                result.status = "predict_error"; return result
+
+            # ── 8. İstatistiksel Doğrulama ───────────────────────────────────
+            try:
+                val_result = self.validator.validate(
+                    feature_vector   = fv,
+                    model            = self.lgbm_model,
+                    model_decision   = ml_result.decision,
+                    model_confidence = ml_result.confidence,
+                    ic_direction     = result.ic_direction,
+                    ic_score         = result.ic_confidence,
+                    regime           = result.market_regime,
+                )
+                result.val_result = val_result
+            except Exception as e:
+                logger.warning(f"  ⚠️ {coin} validate hatası: {e}")
+                result.status = "validate_error"; return result
+
+            # ── 9. Risk Hesapla ──────────────────────────────────────────────
+            if val_result.approved and str(ml_result.decision).upper() != "WAIT":
+                direction = str(ml_result.decision).upper()
+                try:
+                    trade_calc = self.risk_manager.validate_trade(
+                        symbol      = symbol,
+                        direction   = direction,
+                        entry_price = result.price,
+                        balance     = self._balance,
+                    )
+                    if trade_calc and trade_calc.is_approved():
+                        result.sl_price      = trade_calc.stop_loss.price
+                        result.tp_price      = trade_calc.take_profit.price
+                        result.position_size = trade_calc.position.size
+                        result.leverage      = trade_calc.position.leverage
+                        result.risk_reward   = trade_calc.take_profit.risk_reward
+                        result.status        = "ready"
+                    else:
+                        result.status = "risk_rejected"
+                        result.error  = ", ".join(getattr(trade_calc, 'rejection_reasons', []))
+                except Exception as e:
+                    result.status = "risk_error"
+                    result.error  = str(e)
             else:
-                result.gate_action = GateAction.FULL_TRADE
+                result.status = "ml_rejected"
+                result.error  = getattr(val_result, 'reason', "Doğrulama başarısız")
 
-            result.status = "analyzed"
-            return result
+            # Özet log
+            decision_str = str(ml_result.decision) if ml_result else "N/A"
+            logger.info(
+                f"  🔬 {coin:8} | IC={result.ic_confidence:.0f} | "
+                f"{'✅' if val_result and val_result.approved else '❌'} "
+                f"ML={decision_str} | Rejim={result.market_regime}"
+            )
 
         except Exception as e:
             result.status = "error"
-            result.error = str(e)
-            return result
-
-    # =========================================================================
-    # AI OPTİMİZASYON
-    # =========================================================================
-
-    def _get_ai_decision(self, result: CoinAnalysisResult) -> CoinAnalysisResult:
-        global AI_QUOTA_EXHAUSTED, AI_ERRORS_TODAY
-
-        ai_input = AIAnalysisInput(
-            symbol=result.full_symbol,
-            coin=result.coin,
-            price=result.price,
-            change_24h=result.change_24h,
-            best_timeframe=result.best_timeframe,
-            ic_confidence=result.ic_confidence,
-            ic_direction=result.ic_direction,
-            category_tops={},
-            tf_rankings=[],
-            atr=result.atr,
-            atr_pct=result.atr_pct,
-            sl_price=result.sl_price,
-            tp_price=result.tp_price,
-            market_regime=result.market_regime,
-            volume_24h=result.volume_24h,
-            volatility=0.0
-        )
-
-        if AI_QUOTA_EXHAUSTED or not self._ai_available:
-            result.ai_skipped = True
-            from ai import AIDecisionResult, AIDecision as AI_Decision_Enum
-            decision_enum = AIDecisionType.from_direction(result.ic_direction)
-            decision_val = AI_Decision_Enum[decision_enum.name]
-            result.ai_decision = AIDecisionResult(
-                decision=decision_val,
-                confidence=result.ic_confidence * 0.8,
-                reasoning="AI quota aşıldı — IC fallback",
-                gate_action=result.gate_action,
-                ic_score=result.ic_confidence,
-                model_used="ic_only_mode",
-                timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            )
-            logger.info(f"⚡ {result.coin}: AI atlandı (IC-only mode)")
-            return result
-
-        try:
-            time.sleep(12)  # Gemini free tier rate limit (5 req/min)
-            ai_decision_result = self.ai_optimizer.get_decision(ai_input)
-            result.ai_decision = ai_decision_result
-            result.ai_skipped = False
-
-            logger.info(
-                f"🤖 {result.coin}: AI → {ai_decision_result.decision.value} "
-                f"(Güven: {ai_decision_result.confidence:.0f})"
-            )
-
-            AI_ERRORS_TODAY = 0
-
-        except Exception as e:
-            error_msg = str(e).lower()
-            if 'quota' in error_msg or '429' in error_msg or 'rate' in error_msg:
-                AI_ERRORS_TODAY += 1
-                logger.warning(f"⚠️ AI quota hatası ({AI_ERRORS_TODAY}/{AI_ERROR_THRESHOLD}): {e}")
-                if AI_ERRORS_TODAY >= AI_ERROR_THRESHOLD:
-                    AI_QUOTA_EXHAUSTED = True
-
-            from ai import AIDecisionResult, AIDecision as AI_Decision_Enum
-            decision_enum = AIDecisionType.from_direction(result.ic_direction)
-            decision_val = AI_Decision_Enum[decision_enum.name]
-            result.ai_skipped = True
-            result.ai_decision = AIDecisionResult(
-                decision=decision_val,
-                confidence=result.ic_confidence * 0.8,
-                reasoning=f"AI hatası — IC fallback",
-                gate_action=result.gate_action,
-                ic_score=result.ic_confidence,
-                model_used="error_fallback",
-                timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            )
+            result.error  = str(e)
+            logger.error(f"  ❌ {coin} analiz hatası: {e}", exc_info=True)
 
         return result
 
     # =========================================================================
-    # RİSK HESAPLAMA
+    # TRADE EXECUTION
     # =========================================================================
 
-    def _calculate_risk(self, result: CoinAnalysisResult) -> CoinAnalysisResult:
-        if not self._risk_manager:
+    def _execute_trade(self, result: CoinAnalysisResult) -> CoinAnalysisResult:
+        """
+        Analiz sonucuna göre trade açar ve TradeMemory'ye kaydeder.
+        Paper trade veya canlı işlem — dry_run flag'ine göre seçilir.
+        """
+        if result.status != "ready" or result.ml_result is None:
+            return result
+
+        direction = str(result.ml_result.decision).upper()
+        if direction == "WAIT":
             return result
 
         try:
-            direction = result.ai_decision.decision.value if result.ai_decision else result.ic_direction
-            if direction == "WAIT":
-                return result
+            if self.dry_run:
+                paper_id = self.paper_trader.open_trade(
+                    symbol        = result.full_symbol,
+                    coin          = result.coin,
+                    direction     = direction,
+                    entry_price   = result.price,
+                    stop_loss     = result.sl_price,
+                    take_profit   = result.tp_price,
+                    position_size = result.position_size,
+                    leverage      = result.leverage,
+                    ic_confidence = result.ic_confidence,
+                    ic_direction  = result.ic_direction,
+                    best_timeframe= result.best_timeframe,
+                    market_regime = result.market_regime,
+                )
+                result.paper_trade_id = paper_id
+                result.trade_executed = True
+                result.status         = "paper_executed"
 
-            atr_mult = 1.5
-            if result.ai_decision and hasattr(result.ai_decision, 'atr_multiplier'):
-                atr_mult = float(result.ai_decision.atr_multiplier)
-
-            trade_calc = self._risk_manager.calculate_trade(
-                entry_price=result.price,
-                direction=direction,
-                atr=result.atr,
-                symbol=result.full_symbol,
-                atr_multiplier=atr_mult
-            )
-
-            result.sl_price = trade_calc.stop_loss.price
-            result.tp_price = trade_calc.take_profit.price
-            result.position_size = trade_calc.position.size
-            result.leverage = trade_calc.position.leverage
-            result.risk_reward = trade_calc.take_profit.risk_reward
-
-        except Exception as e:
-            logger.error(f"❌ Risk hesaplama hatası: {e}")
-            result.error = str(e)
-
-        return result
-
-    # =========================================================================
-    # PAPER TRADE AÇMA
-    # =========================================================================
-
-    def _execute_paper_trade(self, result: CoinAnalysisResult) -> CoinAnalysisResult:
-        try:
-            direction = result.ai_decision.decision.value if result.ai_decision else result.ic_direction
-            if direction == "WAIT":
-                result.status = "skipped_wait"
-                return result
-
-            # ✅ Max 5 pozisyon kontrolü
-            open_count = len(self.paper_trader.open_trades)
-            max_pos = MAX_OPEN_POSITIONS
-
-            if open_count >= max_pos:
-                logger.warning(f"⚠️ {result.coin}: Max pozisyon ({max_pos}) dolu — atlanıyor")
-                result.status = "position_limit"
-                return result
-
-            trade = self.paper_trader.open_trade(
-                symbol=result.coin,
-                full_symbol=result.full_symbol,
-                direction=direction,
-                entry_price=result.price,
-                position_size=result.position_size,
-                stop_loss=result.sl_price,
-                take_profit=result.tp_price,
-                leverage=result.leverage,
-                ic_confidence=result.ic_confidence,
-                ic_direction=result.ic_direction,
-                best_timeframe=result.best_timeframe,
-                market_regime=result.market_regime,
-                ai_decision=result.ai_decision.decision.value if result.ai_decision else None,
-                ai_confidence=result.ai_decision.confidence if result.ai_decision else None,
-            )
-
-            result.paper_trade_id = trade.trade_id
-            result.status = "executed"
-            logger.info(
-                f"📝 Paper Trade: {result.coin} {direction} @ ${result.price:,.6f} | "
-                f"SL: ${result.sl_price:,.6f} | TP: ${result.tp_price:,.6f}"
-            )
-            self._notify_trade_open(result)
-
-        except Exception as e:
-            result.status = "execution_error"
-            result.error = str(e)
-            logger.error(f"❌ Paper trade hatası: {e}")
-
-        return result
-
-    # =========================================================================
-    # CANLI TRADE AÇMA
-    # =========================================================================
-
-    def _execute_live_trade(self, result: CoinAnalysisResult) -> CoinAnalysisResult:
-        try:
-            direction = result.ai_decision.decision.value if result.ai_decision else result.ic_direction
-            if direction == "WAIT":
-                result.status = "skipped_wait"
-                return result
-
-            # ✅ Max 5 pozisyon kontrolü (canlı pozisyonlar Bitget'ten çekilir)
-            try:
-                live_positions = self.executor.fetch_positions()
-                open_count = len(live_positions)
-            except:
-                open_count = 0
-
-            max_pos = 5  # Sabit limit
-            if open_count >= max_pos:
-                logger.warning(f"⚠️ {result.coin}: Max canlı pozisyon ({max_pos}) dolu — atlanıyor")
-                result.status = "position_limit"
-                return result
-
-            class DynamicTradeCalc:
-                def __init__(self, r, d):
-                    self.symbol = r.full_symbol
-                    self.direction = d
-                    self.entry_price = r.price
-                    self.rejection_reasons = []
-
-                    class Pos:
-                        size = r.position_size
-                        leverage = r.leverage
-                    self.position = Pos()
-
-                    class Target:
-                        def __init__(self, p):
-                            self.price = p
-                    self.stop_loss = Target(r.sl_price)
-                    self.take_profit = Target(r.tp_price)
-
-                def is_approved(self):
-                    return True
-
-            trade_calc_obj = DynamicTradeCalc(result, direction)
-            exec_result = self.executor.execute_trade(trade_calc_obj)
-
-            result.execution_result = exec_result
-
-            if exec_result.success:
-                result.status = "executed"
-                logger.info(f"🔴 CANLI TRADE AÇILDI: {result.coin} {direction} @ ${result.price:.6f}")
-                self._notify_trade_open(result)
             else:
-                result.status = "execution_error"
-                result.error = exec_result.error
-                logger.error(f"❌ Canlı trade reddedildi: {exec_result.error}")
+                # Canlı: max pozisyon kontrolü
+                try:
+                    open_count = len(self.executor.fetch_positions())
+                except Exception:
+                    open_count = 0
+
+                if open_count >= MAX_OPEN_POSITIONS:
+                    result.status = "position_limit"
+                    return result
+
+                class _Adapter:
+                    """BitgetExecutor'un beklediği arayüzü sağlar."""
+                    def __init__(self, r, d):
+                        self.symbol = r.full_symbol
+                        self.direction = d
+                        self.entry_price = r.price
+                        self.rejection_reasons = []
+                        class _Pos: size = r.position_size; leverage = r.leverage
+                        class _Tgt:
+                            def __init__(self, p): self.price = p
+                        self.position   = _Pos()
+                        self.stop_loss  = _Tgt(r.sl_price)
+                        self.take_profit= _Tgt(r.tp_price)
+                    def is_approved(self): return True
+
+                exec_res = self.executor.execute_trade(_Adapter(result, direction))
+                result.execution_result = exec_res
+
+                if exec_res.success:
+                    result.trade_executed = True
+                    result.status = "executed"
+                else:
+                    result.status = "execution_error"
+                    result.error  = exec_res.error
+
+            # TradeMemory'ye kaydet
+            if result.trade_executed:
+                fv_dict = {}
+                if result.ml_result and hasattr(result.ml_result, 'feature_vector'):
+                    try:
+                        fv_dict = result.ml_result.feature_vector.to_dict()
+                    except Exception:
+                        pass
+
+                mem_rec = self.trade_memory.open_trade(
+                    symbol           = result.full_symbol,
+                    coin             = result.coin,
+                    direction        = direction,
+                    entry_price      = result.price,
+                    sl_price         = result.sl_price,
+                    tp_price         = result.tp_price,
+                    timeframe        = result.best_timeframe,
+                    ml_confidence    = getattr(result.ml_result, 'confidence', 0.0),
+                    ml_direction     = direction,
+                    ic_confidence    = result.ic_confidence,
+                    ic_direction     = result.ic_direction,
+                    market_regime    = result.market_regime,
+                    validated_conf   = getattr(result.val_result, 'confidence', 0.0),
+                    feature_snapshot = fv_dict,
+                    position_size    = result.position_size,
+                    leverage         = result.leverage,
+                    risk_reward      = result.risk_reward,
+                    atr              = result.atr,
+                )
+                if not result.paper_trade_id:
+                    result.paper_trade_id = mem_rec.trade_id
 
         except Exception as e:
             result.status = "execution_error"
-            result.error = str(e)
-            logger.error(f"❌ Canlı trade kritik hata: {e}")
+            result.error  = str(e)
+            logger.error(f"❌ {result.coin} execution hatası: {e}", exc_info=True)
 
         return result
 
@@ -717,21 +610,37 @@ class HybridTradingPipeline:
     # =========================================================================
 
     def _check_open_positions(self) -> List:
+        """
+        PaperTrader'daki açık pozisyonları kontrol eder.
+        SL/TP tetiklenmiş trade'leri kapatır ve TradeMemory'yi günceller.
+        Kapanan her trade için retrain_if_ready() çağrılır.
+        """
         if not self.paper_trader.open_trades:
             return []
 
-        prices = self._get_current_prices()
+        prices = {}
+        for trade in self.paper_trader.open_trades.values():
+            try:
+                df = self.fetcher.fetch_ohlcv(trade.symbol, '1m', limit=2)
+                if df is not None and len(df) > 0:
+                    prices[trade.symbol] = float(df['close'].iloc[-1])
+            except Exception:
+                pass
+
         closed = self.paper_trader.check_exits(prices)
 
         for trade in closed:
-            emoji = "✅" if trade.net_pnl > 0 else "❌"
-            logger.info(
-                f"{emoji} Trade kapandı: {trade.trade_id} | "
-                f"{trade.symbol} {trade.direction} | "
-                f"PnL: ${trade.net_pnl:+.2f} ({trade.pnl_percent:+.1f}%)"
+            self.trade_memory.close_trade(
+                trade_id    = trade.trade_id,
+                exit_price  = trade.exit_price,
+                pnl         = trade.net_pnl,
+                exit_reason = trade.exit_reason or "SL_TP",
             )
+            # Yeterli trade birikince modeli retrain et
+            self.trade_memory.retrain_if_ready(self.lgbm_model)
+            emoji = "✅" if trade.net_pnl > 0 else "❌"
+            logger.info(f"{emoji} Kapandı: {trade.symbol} | PnL=${trade.net_pnl:+.2f}")
 
-        self._notify_trades_closed(closed)
         return closed
 
     # =========================================================================
@@ -739,264 +648,236 @@ class HybridTradingPipeline:
     # =========================================================================
 
     def run_cycle(self) -> CycleReport:
-        self._cycle_count += 1
-        cycle_start = time.time()
+        """
+        Tek bir tarama→analiz→execution döngüsü.
+        Scheduler bu metodu periyodik olarak çağırır.
+        """
+        start  = time.time()
+        report = CycleReport(timestamp=datetime.now(timezone.utc).isoformat())
 
-        report = CycleReport(
-            timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            ai_mode="ic_only" if AI_QUOTA_EXHAUSTED else "normal",
-        )
+        logger.info(f"\n{'═'*60}")
+        logger.info(f"🔄 YENİ DÖNGÜ — {datetime.now().strftime('%H:%M:%S')} "
+                    f"| v{VERSION} | {'PAPER' if self.dry_run else 'CANLI'}")
+        logger.info(f"{'═'*60}")
 
-        logger.info(f"\n{'='*60}")
-        logger.info(f"🚀 CYCLE #{self._cycle_count} | {report.timestamp}")
-        logger.info(f"🔧 Mode: {'🧪 PAPER' if self.dry_run else '🔴 CANLI'}")
-        logger.info(f"🤖 AI: {'⚡ IC-ONLY' if AI_QUOTA_EXHAUSTED else '✅ AKTIF'}")
-        logger.info(f"{'='*60}")
+        if self._check_kill_switch():
+            report.status = CycleStatus.KILLED
+            return report
 
         try:
-            self._refresh_balance()
-            report.balance = self._balance
-            report.paper_balance = self.paper_trader.balance
+            # Açık pozisyonları kontrol et (SL/TP kapanışları işle)
+            self._check_open_positions()
 
-            if self._check_kill_switch():
-                report.status = CycleStatus.KILLED
-                report.elapsed = time.time() - cycle_start
+            # Coin tarama
+            logger.info(f"\n📡 Coin taraması (top {self.top_n})...")
+            coins = self.scanner.scan(top_n=self.top_n)
+            if not coins:
+                report.status = CycleStatus.ERROR
                 return report
+            report.total_scanned = len(coins)
 
-            closed_trades = self._check_open_positions()
-            if closed_trades:
-                logger.info(f"📊 {len(closed_trades)} pozisyon kapandı")
-
-            top_coins = self._scan_market()
-            report.total_scanned = len(top_coins)
-
-            if not top_coins:
-                report.status = CycleStatus.NO_SIGNAL
-                report.elapsed = time.time() - cycle_start
-                return report
-
-            for coin_data in top_coins:
-                symbol = coin_data.symbol if hasattr(coin_data, 'symbol') else coin_data.get('symbol', '')
-
-                result = self._analyze_coin(symbol)
-
-                if not result or result.status == "error":
-                    logger.warning(f"⚠️ {symbol}: Analiz hatası")
-                    continue
-
-                if result.status == "no_data":
-                    logger.warning(f"⚠️ {symbol}: Yetersiz veri")
-                    continue
-
+            # Her coin için ML analizi
+            logger.info(f"\n🔬 ML analizi ({len(coins)} coin)...")
+            results = []
+            for c in coins:
+                r = self._analyze_coin(c.symbol, c.coin)
+                results.append(r)
                 report.total_analyzed += 1
+                if r.ic_confidence >= IC_TRADE:
+                    report.total_above_gate += 1
 
-                if result.gate_action == GateAction.NO_TRADE:
-                    logger.info(f"🚫 {symbol}: Reddedildi (IC: {result.ic_confidence:.1f})")
-                    result.status = "below_gate"
-                    report.coins.append(result)
-                    continue
-
-                report.total_above_gate += 1
-                logger.info(f"✨ {symbol}: Gate GEÇTİ! (IC: {result.ic_confidence:.1f}) -> AI'ya gidiyor...")
-
-                if result.gate_action == GateAction.FULL_TRADE:
-                    result = self._get_ai_decision(result)
-
-                    # WAIT kararı → atla
-                    if result.ai_decision and result.ai_decision.decision == AIDecision.WAIT:
-                        result.status = "ai_wait"
-                        report.coins.append(result)
-                        continue
-
-                    # ✅ Minimum güven kontrolü (60 altı = trade yok)
-                    if result.ai_decision:
-                        min_confidence = cfg.ai.__dict__.get('min_confidence', 60)
-                        if result.ai_decision.confidence < min_confidence:
-                            logger.warning(
-                                f"⚠️ {result.coin}: AI güveni düşük "
-                                f"({result.ai_decision.confidence:.0f} < {min_confidence}) → SKIP"
-                            )
-                            result.status = "low_confidence"
-                            report.coins.append(result)
-                            continue
-
-                    # Risk hesapla
-                    result = self._calculate_risk(result)
-
-                    # ✅ SL/TP zorunlu — ikisi de sıfırsa trade açma
-                    if result.sl_price <= 0 or result.tp_price <= 0:
-                        logger.warning(f"⚠️ {result.coin}: SL/TP hesaplanamadı → trade açılmıyor")
-                        result.status = "no_sltp"
-                        report.coins.append(result)
-                        continue
-
-                    # Trade aç
-                    if self.dry_run:
-                        result = self._execute_paper_trade(result)
-                    else:
-                        result = self._execute_live_trade(result)
-
-                    # ✅ SL/TP gönderilemezse trade başarısız say
-                    if result.execution_result and not result.execution_result.success:
-                        logger.error(f"❌ {result.coin}: Trade execution başarısız")
-                    elif result.status == "executed":
+            # Execution
+            logger.info(f"\n💹 Execution...")
+            for r in results:
+                if r.status == "ready":
+                    r = self._execute_trade(r)
+                    if r.trade_executed:
                         report.total_traded += 1
 
-                report.coins.append(result)
+            report.coins        = results
+            report.paper_balance= self.paper_trader.balance
+            report.balance      = self._balance
 
-            if report.total_traded > 0:
-                report.status = CycleStatus.SUCCESS
-            elif report.total_above_gate > 0:
-                report.status = CycleStatus.PARTIAL
-            else:
-                report.status = CycleStatus.NO_SIGNAL
+            # ML istatistikleri
+            mem_stats = self.trade_memory.get_stats()
+            report.ml_stats = {
+                "closed_trades":  mem_stats["closed_trades"],
+                "win_rate":       mem_stats["win_rate"],
+                "retrain_count":  mem_stats["total_retrain_count"],
+                "next_retrain_in":mem_stats["next_retrain_in"],
+                "model_trained":  self.lgbm_model.is_trained,
+            }
+
+            report.status = (
+                CycleStatus.SUCCESS   if report.total_traded > 0
+                else CycleStatus.PARTIAL   if report.total_above_gate > 0
+                else CycleStatus.NO_SIGNAL
+            )
+            self._consecutive_errors = 0
 
         except Exception as e:
             report.status = CycleStatus.ERROR
             report.errors.append(str(e))
-            logger.error(f"❌ Cycle hatası: {e}")
+            self._consecutive_errors += 1
+            logger.error(f"❌ Döngü hatası: {e}", exc_info=True)
 
-        report.elapsed = time.time() - cycle_start
-        self._print_cycle_summary(report)
+        report.elapsed = time.time() - start
+        self._log_cycle_summary(report)
         return report
 
-    def _print_cycle_summary(self, report: CycleReport) -> None:
-        print(f"\n{'─'*50}")
-        print(f"📊 CYCLE #{self._cycle_count} ÖZET")
-        print(f"{'─'*50}")
-        print(f"  Status: {report.status.value}")
-        print(f"  Taranan: {report.total_scanned} | Analiz: {report.total_analyzed}")
-        print(f"  Gate+: {report.total_above_gate} | Trade: {report.total_traded}")
-        print(f"  Paper Bakiye: ${report.paper_balance:.2f}")
-        print(f"  Açık Pozisyon: {len(self.paper_trader.open_trades)}")
-        print(f"  Süre: {report.elapsed:.1f}s")
-        print(f"{'─'*50}\n")
+    # =========================================================================
+    # İLK EĞİTİM (Walk-forward)
+    # =========================================================================
+
+    def initial_train(self, symbol: str = "BTC/USDT:USDT") -> bool:
+        """
+        Pipeline ilk başladığında LightGBM'i tarihsel veri ile eğitir.
+        TradeMemory'de yeterli geçmiş yoksa bu metod çağrılır.
+
+        BTC 1h verisini kullanır → feature colonlarını öğrenir → train().
+        """
+        logger.info(f"🎓 İlk eğitim: {symbol} 1h verisi kullanılıyor...")
+
+        try:
+            df_raw = self.fetcher.fetch_ohlcv(symbol, "1h", limit=500)
+            if df_raw is None or len(df_raw) < 200:
+                logger.error("❌ Yeterli veri çekilemedi")
+                return False
+
+            df_clean = self.preprocessor.full_pipeline(df_raw)
+            df_ind   = self.calculator.calculate_all(df_clean)
+            df_ind   = self.calculator.add_forward_returns(df_ind, periods=[self.fwd_period])
+            df_ind   = df_ind.dropna()
+
+            target_col   = f'fwd_ret_{self.fwd_period}'
+            skip_cols    = {"open","high","low","close","volume",target_col}
+            feature_cols = [c for c in df_ind.columns
+                            if c not in skip_cols and not c.startswith("fwd_")]
+
+            X = df_ind[feature_cols].replace([np.inf, -np.inf], np.nan)
+            X = X.fillna(X.median())
+            y = (df_ind[target_col] > 0).astype(int)  # Binary: fiyat artarsa 1
+
+            logger.info(f"  Eğitim: {X.shape[0]}×{X.shape[1]} | WIN={y.mean():.1%}")
+
+            metrics = self.lgbm_model.train(X, y)  # LightGBM eğit
+
+            logger.info(f"✅ İlk eğitim tamamlandı | Metrik: {metrics}")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ İlk eğitim hatası: {e}", exc_info=True)
+            return False
+
+    # =========================================================================
+    # YARDIMCI
+    # =========================================================================
+
+    def _log_cycle_summary(self, report: CycleReport) -> None:
+        emoji = {"success":"✅","partial":"⚡","no_signal":"😴",
+                 "error":"❌","killed":"⛔"}.get(report.status.value, "❓")
+        logger.info(f"\n{'─'*50}")
+        logger.info(f"  {emoji} Döngü | Taranan={report.total_scanned} "
+                    f"IC-geçen={report.total_above_gate} "
+                    f"İşlem={report.total_traded} "
+                    f"Süre={report.elapsed:.1f}s")
+        if report.ml_stats:
+            s = report.ml_stats
+            logger.info(f"  ML: eğitildi={s.get('model_trained')} | "
+                        f"win={s.get('win_rate',0):.0%} | "
+                        f"retrain#{s.get('retrain_count',0)}")
+        logger.info(f"{'─'*50}\n")
 
     def print_performance(self) -> None:
-        analyzer = PerformanceAnalyzer(self.paper_trader)
-        report = analyzer.full_analysis()
-        analyzer.print_report(report)
-
-    def get_summary(self) -> Dict:
-        return self.paper_trader.get_summary()
+        """Paper trade performans raporunu konsola yazdırır."""
+        PerformanceAnalyzer(self.paper_trader).print_report(
+            PerformanceAnalyzer(self.paper_trader).full_analysis()
+        )
+        self.trade_memory.print_summary()
 
 
 # =============================================================================
 # SCHEDULER
 # =============================================================================
 
-def run_scheduler(pipeline: HybridTradingPipeline, interval_minutes: int = 60):
+def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 75) -> None:
+    """Pipeline'ı belirli aralıklarla otomatik çalıştırır. Ctrl+C ile durur."""
     pipeline._is_running = True
 
-    def signal_handler(signum, frame):
-        logger.info("\n🛑 Durdurma sinyali alındı...")
+    def _stop(signum, frame):
+        logger.info(f"\n🛑 Sinyal {signum} — durduruluyor...")
         pipeline._is_running = False
 
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
 
-    logger.info(f"⏰ Scheduler başladı | Interval: {interval_minutes} dakika")
+    logger.info(f"⏰ Scheduler: {interval_minutes}dk aralık")
 
     if not pipeline._init_balance():
-        logger.error("❌ Bakiye başlatılamadı")
         return
 
-    pipeline._notify_system('startup', {
-        'balance': pipeline._balance,
-        'mode': '🧪 DRY RUN' if pipeline.dry_run else '🔴 CANLI',
-    })
+    if not pipeline.lgbm_model.is_trained:
+        pipeline.initial_train()
 
     while pipeline._is_running:
+        if pipeline._kill_switch:
+            break
+        if pipeline._consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
+            time.sleep(ERROR_COOLDOWN_SECONDS)
+            pipeline._consecutive_errors = 0
+            continue
+
         report = pipeline.run_cycle()
-
         if report.status == CycleStatus.KILLED:
-            logger.warning("🛑 Kill switch — scheduler durduruluyor")
             break
 
-        if not pipeline._is_running:
-            break
-
-        logger.info(f"⏳ Sonraki döngü: {interval_minutes} dakika sonra...")
-        for _ in range(interval_minutes):
+        logger.info(f"⏰ Sonraki: {(datetime.now()+timedelta(minutes=interval_minutes)).strftime('%H:%M:%S')}")
+        for _ in range(interval_minutes * 60):
             if not pipeline._is_running:
                 break
-            time.sleep(60)
+            time.sleep(1)
 
-    pipeline.print_performance()
+    logger.info("🏁 Scheduler kapatıldı.")
 
 
 # =============================================================================
 # CLI
 # =============================================================================
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Hybrid Crypto Trading Bot v" + VERSION)
-    parser.add_argument('--dry-run', '-d', action='store_true', default=True)
-    parser.add_argument('--live', '-L', action='store_true')
-    parser.add_argument('--schedule', '-s', action='store_true')
-    parser.add_argument('--interval', '-i', type=int, default=75)
-    parser.add_argument('--symbol', type=str)
-    parser.add_argument('--top', '-n', type=int, default=15)
-    parser.add_argument('--quiet', '-q', action='store_true')
-    parser.add_argument('--report', '-r', action='store_true')
-    return parser.parse_args()
-
-
 def main():
-    args = parse_args()
-    dry_run = not args.live
+    parser = argparse.ArgumentParser(description=f"ML Crypto Bot v{VERSION}")
+    parser.add_argument("--live",     action="store_true", help="Canlı trade")
+    parser.add_argument("--top",      type=int, default=15, help="Top N coin")
+    parser.add_argument("--schedule", action="store_true", help="Scheduler modu")
+    parser.add_argument("-i","--interval", type=int, default=75, help="Aralık (dk)")
+    parser.add_argument("--report",   action="store_true", help="Performans raporu")
+    parser.add_argument("--train",    action="store_true", help="Sadece eğitim")
+    parser.add_argument("--verbose",  action="store_true", help="Debug çıktısı")
+    args = parser.parse_args()
 
-    print(f"\n{'='*60}")
-    print(f"  🚀 HYBRID CRYPTO BOT v{VERSION}")
-    print(f"  📅 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  🔧 Mode: {'🧪 PAPER TRADE' if dry_run else '🔴 CANLI'}")
-    print(f"  🤖 AI: {'⚡ Free Tier (quota yönetimli)' if not AI_QUOTA_EXHAUSTED else '🚫 IC-Only'}")
-    print(f"{'='*60}\n")
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
 
-    if not dry_run:
-        print("⚠️  CANLI MOD! Gerçek para riski var!")
-        if sys.stdin.isatty():
-            confirm = input("Devam etmek için 'EVET' yazın: ")
-            if confirm != 'EVET':
-                print("İptal edildi.")
-                sys.exit(0)
-        else:
-            logger.info("⚡ Arka plan modu — onay atlandı, CANLI başlıyor")
-
-    pipeline = HybridTradingPipeline(
-        dry_run=dry_run,
-        top_n=args.top,
-        verbose=not args.quiet,
-    )
+    pipeline = MLTradingPipeline(dry_run=not args.live, top_n=args.top)
 
     if args.report:
-        pipeline.print_performance()
-        sys.exit(0)
+        pipeline.print_performance(); return
+
+    if args.train:
+        pipeline.initial_train(); return
+
+    if not pipeline._init_balance():
+        sys.exit(1)
+
+    if not pipeline.lgbm_model.is_trained:
+        logger.info("🎓 Model eğitilmemiş — ilk eğitim başlıyor...")
+        pipeline.initial_train()
 
     if args.schedule:
-        run_scheduler(pipeline, interval_minutes=args.interval)
+        run_scheduler(pipeline, args.interval)
     else:
-        if not pipeline._init_balance():
-            logger.error("❌ Bakiye başlatılamadı")
-            sys.exit(1)
-
-        pipeline._notify_system('startup', {
-            'balance': pipeline._balance,
-            'mode': '🧪 DRY RUN' if dry_run else '🔴 CANLI',
-        })
-
         report = pipeline.run_cycle()
-
-        print("\n" + "─"*40)
-        summary = pipeline.get_summary()
-        print(f"📊 Paper Trading Özeti:")
-        print(f"   Bakiye: ${summary['current_balance']:.2f}")
-        print(f"   Toplam Trade: {summary['total_trades']}")
-        print(f"   Win Rate: {summary['win_rate_pct']:.1f}%")
-        print(f"   Return: {summary['total_return_pct']:+.2f}%")
-        print("─"*40 + "\n")
-
-        sys.exit(0 if report.status != CycleStatus.ERROR else 1)
+        logger.info(f"Döngü: {report.status.value}")
 
 
 if __name__ == "__main__":
