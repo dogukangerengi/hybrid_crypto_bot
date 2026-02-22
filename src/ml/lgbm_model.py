@@ -528,7 +528,7 @@ class LGBMSignalModel:
         """
         # Varsayılan gate eşikleri
         if gate_thresholds is None:
-            gate_thresholds = {'no_trade': 40, 'full_trade': 70}
+            gate_thresholds = {'no_trade': 15, 'full_trade': 20}
 
         # ── 1. Gate Keeper ──
         # IC eşik kontrolü (mevcut sistemle aynı mantık)
@@ -593,9 +593,9 @@ class LGBMSignalModel:
         # prob >= 0.55 → IC yönünde işlem aç (küçük edge bile değerli)
         # prob < 0.45  → IC yönünün tersi veya WAIT
         # 0.45-0.55    → Belirsiz bölge → WAIT
-        if prob >= 0.55:
+        if prob >= 0.53:
             decision = MLDecision.from_direction(ic_direction)  # IC yönünde
-        elif prob < 0.45:
+        elif prob < 0.47:
             decision = MLDecision.WAIT                          # Model onaylamıyor
         else:
             decision = MLDecision.WAIT                          # Belirsiz bölge

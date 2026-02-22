@@ -271,11 +271,8 @@ class TradeMemory:
         self._trim_memory()                      # Bellek limitini kontrol et
         self._append_to_disk(record)             # Diske yaz
 
-        logger.info(
-            f"📝 Trade açıldı: {record.trade_id} | "
-            f"{coin} {direction} @ ${entry_price:.4f} | "
-            f"ML güven: {ml_confidence:.2%}"
-        )
+        logger.info(f"📝 Trade hafızaya eklendi: {symbol} {direction} @ ${entry_price:.4f} | ML güven: {ml_confidence:.2f}%")
+        
         return record
 
     def close_trade(

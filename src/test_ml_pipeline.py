@@ -258,7 +258,7 @@ def test_03_lgbm_model():
     assert result is not None
     assert hasattr(result, 'decision')
     assert hasattr(result, 'confidence')
-    print(f"  Tahmin          : {result.decision} | güven={result.confidence:.2%}")
+    print(f"  Tahmin          : {result.decision} | güven={result.confidence:.2f}%")
     print("  ✓ LGBMSignalModel çalışıyor")
 
 
@@ -293,7 +293,7 @@ def test_04_signal_validator():
     fv       = fe.build_features(analysis=analysis, ohlcv_df=df_test)
 
     ml_result = model.predict(fv, ic_score=65.0, ic_direction="LONG")
-    print(f"  ML karar        : {ml_result.decision} | güven={ml_result.confidence:.2%}")
+    print(f"  ML karar        : {ml_result.decision} | güven={ml_result.confidence:.2f}%")
 
     # Doğrulama
     validator  = SignalValidator()
@@ -323,11 +323,11 @@ def test_04_signal_validator():
     print(f"  regime_passed       : {val_result.regime_passed}")
 
     # Eğer hâlâ 0-1 dışındaysa ne döndüğünü göster (assert yumuşak)
-    if not (0.0 <= conf <= 1.0):
-        print(f"  ⚠️  adjusted_confidence={conf:.4f} (0-1 dışında!)")
+    if not (0.0 <= conf <= 100.0):
+        print(f"  ⚠️  adjusted_confidence={conf:.4f} (0-100 dışında!)")
         print(f"  Tüm ValidationResult: {val_result}")
         raise AssertionError(
-            f"adjusted_confidence={conf:.4f} → 0-1 aralığında olmalı. "
+            f"adjusted_confidence={conf:.4f} → 0-100 aralığında olmalı. "
             f"Feature uyumsuzluğu hâlâ var mı? "
             f"Model kolonları ile fv kolonları eşleşiyor mu?"
         )

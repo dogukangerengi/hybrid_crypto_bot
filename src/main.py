@@ -78,8 +78,8 @@ DEFAULT_TIMEFRAMES = {
     '2h' : 200,
 }
 
-IC_NO_TRADE = 55.0   # IC < bu → analizi atla, işlem yapma
-IC_TRADE    = 60.0   # IC >= bu → ML pipeline'a gönder
+IC_NO_TRADE = 12.0   # IC < bu → analizi atla, işlem yapma
+IC_TRADE    = 16.0   # IC >= bu → ML pipeline'a gönder
 
 # =============================================================================
 # ENUM'LAR
@@ -233,7 +233,7 @@ class MLTradingPipeline:
         """Başlangıç bakiyesini başlatır. Paper trade'de sabit değer kullanır."""
         try:
             if self.dry_run:
-                self._balance = self._initial_balance = 75.0
+                self._balance = self._initial_balance = 1000.0
                 logger.info(f"💰 Paper bakiye: ${self._balance:.2f}")
             else:
                 b = self.executor.fetch_balance()
@@ -389,7 +389,7 @@ class MLTradingPipeline:
             from indicators.categories import get_category_names, get_indicators_by_category
             category_tops = {}
             for cat in get_category_names():
-                cat_indicators = {i['name'] for i in get_indicators_by_category(cat)}
+                cat_indicators = {i.name if hasattr(i, 'name') else i['name'] for i in get_indicators_by_category(cat)}
                 cat_scores = [s for s in best_scores
                               if s.name in cat_indicators and s.is_significant]
                 if cat_scores:
@@ -406,6 +406,12 @@ class MLTradingPipeline:
             # ── 5. Piyasa rejimi ─────────────────────────────────────────────
             best_df = indicator_data[best_tf]
             result.market_regime = self._detect_regime(best_df)
+
+            # ATR (Volatilite) değerini çek (Risk Manager için gerekli)
+            if 'ATR_14' in best_df.columns:
+                result.atr = float(best_df['ATR_14'].iloc[-1])
+            else:
+                result.atr = result.price * 0.02  # Bulunamazsa %2 varsay
 
             # ── 6. Feature Engineering ───────────────────────────────────────
             try:
@@ -453,15 +459,22 @@ class MLTradingPipeline:
                 result.status = "validate_error"; return result
 
             # ── 9. Risk Hesapla ──────────────────────────────────────────────
-            if val_result.approved and str(ml_result.decision).upper() != "WAIT":
-                direction = str(ml_result.decision).upper()
+            # ── 9. Risk Hesapla ──────────────────────────────────────────────
+            if val_result.is_valid and ml_result.decision.value != "WAIT":
+                direction = ml_result.decision.value
                 try:
-                    trade_calc = self.risk_manager.validate_trade(
+                    # Bakiyeyi güncelle
+                    current_balance = self.paper_trader.balance if hasattr(self, 'paper_trader') and getattr(self.paper_trader, 'balance', 0) > 0 else 1000.0
+                    self.risk_manager.update_state(balance=current_balance)
+                    
+                    # İşlemi ve Stop-Loss'u hesapla
+                    trade_calc = self.risk_manager.calculate_trade(
                         symbol      = symbol,
                         direction   = direction,
                         entry_price = result.price,
-                        balance     = self._balance,
+                        atr         = result.atr,
                     )
+                    
                     if trade_calc and trade_calc.is_approved():
                         result.sl_price      = trade_calc.stop_loss.price
                         result.tp_price      = trade_calc.take_profit.price
@@ -479,11 +492,23 @@ class MLTradingPipeline:
                 result.status = "ml_rejected"
                 result.error  = getattr(val_result, 'reason', "Doğrulama başarısız")
 
+            # Özet log ve Hata Raporlama
+            decision_str = ml_result.decision.value if ml_result else "N/A"
+            status_emoji = "✅" if result.status == "ready" else "⚠️" if result.status in ["risk_rejected", "risk_error"] else "❌"
+            
+            logger.info(
+                f"  🔬 {coin:8} | IC={result.ic_confidence:.0f} | "
+                f"{status_emoji} ML={decision_str} | Rejim={result.market_regime} | Durum={result.status}"
+            )
+            if result.error:
+                logger.debug(f"     └ Neden: {result.error}")
+
+            # Özet log
             # Özet log
             decision_str = str(ml_result.decision) if ml_result else "N/A"
             logger.info(
                 f"  🔬 {coin:8} | IC={result.ic_confidence:.0f} | "
-                f"{'✅' if val_result and val_result.approved else '❌'} "
+                f"{'✅' if val_result and val_result.is_valid else '❌'} "
                 f"ML={decision_str} | Rejim={result.market_regime}"
             )
 
@@ -506,15 +531,15 @@ class MLTradingPipeline:
         if result.status != "ready" or result.ml_result is None:
             return result
 
-        direction = str(result.ml_result.decision).upper()
+        direction = result.ml_result.decision.value
         if direction == "WAIT":
             return result
 
         try:
             if self.dry_run:
                 paper_id = self.paper_trader.open_trade(
-                    symbol        = result.full_symbol,
-                    coin          = result.coin,
+                    symbol        = result.coin,           # 'BTC'
+                    full_symbol   = result.full_symbol,    # 'BTC/USDT:USDT'
                     direction     = direction,
                     entry_price   = result.price,
                     stop_loss     = result.sl_price,
@@ -609,39 +634,46 @@ class MLTradingPipeline:
     # AÇIK POZİSYON KONTROLÜ
     # =========================================================================
 
-    def _check_open_positions(self) -> List:
-        """
-        PaperTrader'daki açık pozisyonları kontrol eder.
-        SL/TP tetiklenmiş trade'leri kapatır ve TradeMemory'yi günceller.
-        Kapanan her trade için retrain_if_ready() çağrılır.
-        """
-        if not self.paper_trader.open_trades:
-            return []
+    def _check_open_positions(self):
+        """Açık pozisyonların güncel fiyatlarını kontrol eder ve SL/TP olanları kapatır."""
+        logger.info("\n🔍 Açık pozisyonlar kontrol ediliyor...")
+        
+        if self.dry_run:
+            # DÜZELTME BURADA: Metot değil, doğrudan property (sözlük) çağırılıyor.
+            open_trades_dict = self.paper_trader.open_trades 
+            
+            if not open_trades_dict:
+                logger.info("   Açık pozisyon yok.")
+                return
 
-        prices = {}
-        for trade in self.paper_trader.open_trades.values():
-            try:
-                df = self.fetcher.fetch_ohlcv(trade.symbol, '1m', limit=2)
-                if df is not None and len(df) > 0:
-                    prices[trade.symbol] = float(df['close'].iloc[-1])
-            except Exception:
-                pass
-
-        closed = self.paper_trader.check_exits(prices)
-
-        for trade in closed:
-            self.trade_memory.close_trade(
-                trade_id    = trade.trade_id,
-                exit_price  = trade.exit_price,
-                pnl         = trade.net_pnl,
-                exit_reason = trade.exit_reason or "SL_TP",
-            )
-            # Yeterli trade birikince modeli retrain et
-            self.trade_memory.retrain_if_ready(self.lgbm_model)
-            emoji = "✅" if trade.net_pnl > 0 else "❌"
-            logger.info(f"{emoji} Kapandı: {trade.symbol} | PnL=${trade.net_pnl:+.2f}")
-
-        return closed
+            closed_count = 0
+            # Sözlük olduğu için .values() üzerinden dönüyoruz
+            for trade in open_trades_dict.values():
+                try:
+                    # Coinin anlık fiyatını borsadan çek
+                    ticker = self.fetcher.get_ticker(f"{trade.symbol}USDT")
+                    if ticker and 'lastPr' in ticker:
+                        current_price = float(ticker['lastPr'])
+                        
+                        # Fiyatı PaperTrader'a gönder, o SL/TP'yi kontrol etsin
+                        close_reason = self.paper_trader.update_trade_price(trade.id, current_price)
+                        
+                        if close_reason: # Eğer kapanmışsa ('SL', 'TP' vb. döner)
+                            closed_count += 1
+                            logger.info(f"   ✅ {trade.symbol} işlemi kapandı! Neden: {close_reason} | Fiyat: {current_price}")
+                            
+                            # Kapanan işlemi TradeMemory'e bildir
+                            self.trade_memory.close_trade(
+                                trade_id=trade.id,
+                                exit_price=current_price,
+                                pnl_pct=trade.pnl_pct if hasattr(trade, 'pnl_pct') else 0.0,
+                                is_win=(getattr(trade, 'pnl_pct', 0.0) > 0)
+                            )
+                except Exception as e:
+                    logger.error(f"   ❌ {trade.symbol} fiyat güncellenirken hata: {e}")
+            
+            if closed_count > 0:
+                logger.info(f"   Mevcut Bakiye: ${self.paper_trader.balance:.2f}")
 
     # =========================================================================
     # ANA DÖNGÜ
@@ -679,13 +711,17 @@ class MLTradingPipeline:
             # Her coin için ML analizi
             logger.info(f"\n🔬 ML analizi ({len(coins)} coin)...")
             results = []
-            for c in coins:
-                r = self._analyze_coin(c.symbol, c.coin)
-                results.append(r)
-                report.total_analyzed += 1
-                if r.ic_confidence >= IC_TRADE:
-                    report.total_above_gate += 1
+            
+            # Açık olan coinlerin isimlerini al (Örn: 'BTC')
+            open_coins = [trade.symbol for trade in self.paper_trader.open_trades.values()] if self.dry_run else []
 
+            for c in coins:
+                # EĞER BU COINDE AÇIK İŞLEM VARSA ATLA!
+                if c.coin in open_coins:
+                    logger.info(f"   ⏭️ {c.coin} atlanıyor (Zaten açık pozisyon var)")
+                    continue
+                    
+                r = self._analyze_coin(c.symbol, c.coin)
             # Execution
             logger.info(f"\n💹 Execution...")
             for r in results:
@@ -733,8 +769,7 @@ class MLTradingPipeline:
         """
         Pipeline ilk başladığında LightGBM'i tarihsel veri ile eğitir.
         TradeMemory'de yeterli geçmiş yoksa bu metod çağrılır.
-
-        BTC 1h verisini kullanır → feature colonlarını öğrenir → train().
+        FeatureEngineer kullanarak gerçeğe en yakın eğitim setini oluşturur.
         """
         logger.info(f"🎓 İlk eğitim: {symbol} 1h verisi kullanılıyor...")
 
@@ -747,22 +782,127 @@ class MLTradingPipeline:
             df_clean = self.preprocessor.full_pipeline(df_raw)
             df_ind   = self.calculator.calculate_all(df_clean)
             df_ind   = self.calculator.add_forward_returns(df_ind, periods=[self.fwd_period])
-            df_ind   = df_ind.dropna()
+            
+            target_col = f'fwd_ret_{self.fwd_period}'
 
-            target_col   = f'fwd_ret_{self.fwd_period}'
-            skip_cols    = {"open","high","low","close","volume",target_col}
-            feature_cols = [c for c in df_ind.columns
-                            if c not in skip_cols and not c.startswith("fwd_")]
+            # FeatureEngineer için simüle edilmiş temel analiz objesi
+            class DummyAnalysis:
+                def __init__(self, sym):
+                    self.symbol = sym
+                    self.coin = sym.split('/')[0]
+                    self.price = 0.0
+                    self.change_24h = 0.0
+                    self.volume_24h = 0.0
+                    self.ic_confidence = 65.0
+                    self.ic_direction = 'LONG'
+                    self.significant_count = 10
+                    self.market_regime = 'trending'
+                    self.category_tops = {}
+                    self.tf_rankings = []
+                    self.atr = 0.0
+                    self.atr_pct = 0.0
+                    self.sl_price = 0.0
+                    self.tp_price = 0.0
+                    self.risk_reward = 0.0
+                    self.position_size = 0.0
+                    self.leverage = 1
 
-            X = df_ind[feature_cols].replace([np.inf, -np.inf], np.nan)
-            X = X.fillna(X.median())
-            y = (df_ind[target_col] > 0).astype(int)  # Binary: fiyat artarsa 1
+            analysis_stub = DummyAnalysis(symbol)
+            rows_X = []
+            rows_y = []
 
-            logger.info(f"  Eğitim: {X.shape[0]}×{X.shape[1]} | WIN={y.mean():.1%}")
+            logger.info("  ⚙️ Feature matrisi oluşturuluyor (zaman yolculuğu simülasyonu)...")
+            
+            # İlk 100 barı indikatörlerin dolması (warm-up) için atlıyoruz
+            start_idx = 100
+            end_idx = len(df_ind) - self.fwd_period
 
-            metrics = self.lgbm_model.train(X, y)  # LightGBM eğit
+            for i in range(start_idx, end_idx):
+                target = df_ind[target_col].iloc[i]
+                if pd.isna(target):
+                    continue
+                
+                # Sadece i. bara kadar olan geçmişi veriyoruz (geleceği görmemesi için)
+                df_slice = df_ind.iloc[:i+1]
+                
+                # Dinamik güncellemeler
+                analysis_stub.price = float(df_slice['close'].iloc[-1])
+                try:
+                    analysis_stub.market_regime = self._detect_regime(df_slice)
+                except Exception:
+                    pass
 
-            logger.info(f"✅ İlk eğitim tamamlandı | Metrik: {metrics}")
+                # Feature vektörünü üret
+                fv = self.feature_eng.build_features(
+                    analysis=analysis_stub,
+                    ohlcv_df=df_slice
+                )
+                
+                rows_X.append(fv.to_dict())
+                rows_y.append(1 if target > 0 else 0)
+
+            if len(rows_X) < 30:
+                logger.error(f"❌ Yetersiz eğitim verisi: {len(rows_X)} < 30")
+                return False
+
+            # Modeli eğit
+            X = pd.DataFrame(rows_X).replace([np.inf, -np.inf], np.nan)
+            y = pd.Series(rows_y)
+
+            logger.info(f"  Eğitim Verisi: {X.shape[0]} satır × {X.shape[1]} feature | WIN={y.mean():.1%}")
+
+            metrics = self.lgbm_model.train(X, y)
+            # ==========================================
+            # 📊 EXCEL RAPORU OLUŞTURMA BAŞLANGICI
+            # ==========================================
+            try:
+                from pathlib import Path
+                
+                report_dir = Path("logs/reports")
+                report_dir.mkdir(parents=True, exist_ok=True)
+                report_path = report_dir / "model_egitim_raporu.xlsx"
+                
+                with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
+                    # 1. Sayfa: Genel Başarı Metrikleri
+                    df_metrics = pd.DataFrame([{
+                        "Tarih": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Eğitim Satır Sayısı": len(X),
+                        "Kazanma Oranı (Win Rate)": f"{y.mean():.1%}",
+                        "Doğruluk (Accuracy)": metrics.accuracy,
+                        "AUC Skoru": metrics.auc_roc,
+                        "F1 Skoru": getattr(metrics, 'f1', 0.0)
+                    }])
+                    df_metrics.to_excel(writer, sheet_name="1_Genel_Metrikler", index=False)
+                    
+                    # 2. Sayfa: Feature (Kolon) Önem Dereceleri
+                    # Model hangi kolonları daha çok dikkate aldı?
+                    if hasattr(self.lgbm_model, 'model') and self.lgbm_model.model is not None:
+                        importance = self.lgbm_model.model.feature_importances_
+                        df_imp = pd.DataFrame({
+                            "Feature (Kolon)": X.columns,
+                            "Önem Puanı": importance
+                        }).sort_values(by="Önem Puanı", ascending=False)
+                        df_imp.to_excel(writer, sheet_name="2_Kolon_Onemleri", index=False)
+                    
+                    # 3. Sayfa: Ham Eğitim Verisi (Ne Neden Oldu?)
+                    df_raw = X.copy()
+                    df_raw['TARGET_SONUC'] = y.values
+                    df_raw['TARGET_ACIKLAMA'] = df_raw['TARGET_SONUC'].apply(lambda x: "KÂR (1)" if x == 1 else "ZARAR (0)")
+                    df_raw.to_excel(writer, sheet_name="3_Gecmis_Ham_Veri", index=False)
+                    
+                logger.info(f"📊 Detaylı Eğitim Raporu Excel olarak kaydedildi: {report_path}")
+            except Exception as ex:
+                logger.error(f"⚠️ Excel raporu oluşturulurken hata: {ex}")
+            # ==========================================
+
+            logger.info(f"✅ İlk eğitim tamamlandı | Metrik: AUC={metrics.auc_roc:.3f}, Acc={metrics.accuracy:.2f}")
+            return True
+
+        except Exception as e:
+            logger.error(f"❌ İlk eğitim hatası: {e}", exc_info=True)
+            return False
+
+            logger.info(f"✅ İlk eğitim tamamlandı | Metrik: AUC={metrics.auc_roc:.3f}, Acc={metrics.accuracy:.2f}")
             return True
 
         except Exception as e:
@@ -881,4 +1021,45 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+    import time
+    import schedule
+    
+    parser = argparse.ArgumentParser(description="ML Trading Bot")
+    parser.add_argument('--train', action='store_true', help='İlk modeli manuel eğitir')
+    parser.add_argument('--schedule', action='store_true', help='Botu 15 dakikada bir döngüye sokar')
+    args = parser.parse_args()
+
+    pipeline = MLTradingPipeline()
+
+    if args.train:
+        pipeline.initial_train()
+        
+    elif args.schedule:
+        logger.info("⏳ Bot zamanlanmış moda alındı. Piyasaya çıkmadan önce hazırlık yapılıyor...")
+        
+        # EĞER MODEL EĞİTİLMEMİŞSE ÖNCE ONU EĞİT
+        if not pipeline.lgbm_model.is_trained:
+            logger.info("🧠 Modelin boş olduğu tespit edildi. İlk eğitim (Warm-Up) başlatılıyor...")
+            pipeline.initial_train()
+            
+        logger.info("✅ Hazırlık tamam. İlk döngü başlıyor ve ardından 15 dakikalık periyotlara geçiliyor.")
+        
+        # İlk turu hemen at
+        try:
+            pipeline.run_cycle()
+        except Exception as e:
+            logger.error(f"Döngü hatası: {e}")
+            
+        # Sonrakileri 15 dakikaya bağla
+        schedule.every(15).minutes.do(pipeline.run_cycle)
+        
+        try:
+            while True:
+                schedule.run_pending()
+                time.sleep(1) 
+        except KeyboardInterrupt:
+            logger.info("🛑 Bot kullanıcı tarafından manuel olarak durduruldu.")
+            
+    else:
+        pipeline.run_cycle()

@@ -116,7 +116,7 @@ class MLDecisionResult:
         return (
             self.gate_action == "FULL_TRADE"           # IC eşiğini geçmiş
             and self.decision in [MLDecision.LONG, MLDecision.SHORT]  # Net yön var
-            and self.confidence >= 60                   # Model yeterince emin
+            and self.confidence >= 53                   # Model yeterince emin
         )
 
     def summary(self) -> str:
