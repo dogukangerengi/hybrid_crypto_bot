@@ -222,6 +222,7 @@ class MLTradingPipeline:
         self._kill_switch      = False
         self._is_running       = False
         self._consecutive_errors = 0
+        self.cooldowns         = {}  # ❄️ SL olan coinler için bekleme hafızası
 
         logger.info(f"🚀 ML Trading Pipeline v{VERSION} (dry_run={dry_run})")
 
@@ -671,6 +672,14 @@ class MLTradingPipeline:
                         
                         # LONG (Yükseliş) pozisyonu kontrolü
                         if trade.direction == "LONG":
+                            # 🛡️ BREAK-EVEN (Başa Baş) KALKANI
+                            # Hedefe (TP) %50 yaklaşıldıysa ve Stop henüz giriş fiyatına çekilmediyse:
+                            halfway_target = trade.entry_price + (trade.take_profit - trade.entry_price) * 0.5
+                            if max_high >= halfway_target and trade.stop_loss < trade.entry_price:
+                                trade.stop_loss = trade.entry_price
+                                self.paper_trader._save_trades() # Değişikliği anında Excel'e kaydet
+                                logger.info(f"   🛡️ {trade.symbol} için Break-Even kalkanı aktif! İşlem risksiz (Yeni SL: ${trade.entry_price:,.4f})")
+
                             if min_low <= trade.stop_loss:
                                 close_reason = "SL Hit"
                                 exit_price = trade.stop_loss
@@ -682,6 +691,14 @@ class MLTradingPipeline:
                                 
                         # SHORT (Düşüş) pozisyonu kontrolü
                         else:
+                            # 🛡️ BREAK-EVEN (Başa Baş) KALKANI
+                            # Hedefe (TP) %50 yaklaşıldıysa ve Stop henüz giriş fiyatına çekilmediyse:
+                            halfway_target = trade.entry_price - (trade.entry_price - trade.take_profit) * 0.5
+                            if min_low <= halfway_target and trade.stop_loss > trade.entry_price:
+                                trade.stop_loss = trade.entry_price
+                                self.paper_trader._save_trades() # Değişikliği anında Excel'e kaydet
+                                logger.info(f"   🛡️ {trade.symbol} için Break-Even kalkanı aktif! İşlem risksiz (Yeni SL: ${trade.entry_price:,.4f})")
+
                             if max_high >= trade.stop_loss:
                                 close_reason = "SL Hit"
                                 exit_price = trade.stop_loss
@@ -693,6 +710,11 @@ class MLTradingPipeline:
                         
                         # Eğer TP veya SL tetiklendiyse işlemi kâr/zarar ile kapat!
                         if close_reason:
+                            # ❄️ SOĞUMA SÜRESİ EKLENTİSİ: Eğer SL olduysa 2 saat ceza ver
+                            if close_reason == "SL Hit":
+                                self.cooldowns[trade.symbol] = datetime.now() + timedelta(hours=2)
+                                logger.info(f"   ❄️ {trade.symbol} SL oldu! 2 saat soğuma süresine alındı.")
+                                
                             self.paper_trader._close_trade(trade, exit_price, status, close_reason)
                             closed_count += 1
                             logger.info(f"   ✅ {trade.symbol} işlemi kapandı! Neden: {close_reason} | Fiyat: ${exit_price:,.4f}")
@@ -763,6 +785,15 @@ class MLTradingPipeline:
                     logger.info(f"   ⏭️ {c.coin} atlanıyor (Zaten açık pozisyon var)")
                     continue
                     
+                # ❄️ SOĞUMA SÜRESİ KONTROLÜ
+                if c.coin in self.cooldowns:
+                    if datetime.now() < self.cooldowns[c.coin]:
+                        kalan_dk = int((self.cooldowns[c.coin] - datetime.now()).total_seconds() / 60)
+                        logger.info(f"   ❄️ {c.coin} atlanıyor (Soğuma süresinde - Kalan: {kalan_dk} dk)")
+                        continue
+                    else:
+                        del self.cooldowns[c.coin] # Süre doldu, cezayı kaldır
+                    
                 r = self._analyze_coin(c.symbol, c.coin)
                 
                 # EKSİK OLAN VE GERİ EKLENEN KISIM BURASI
@@ -800,8 +831,8 @@ class MLTradingPipeline:
                 if target_retrain_count > current_retrain_count:
                     logger.info(f"\n🧠 [RETRAIN] {total_closed} kapalı işleme ulaşıldı! Model yeniden eğitiliyor...")
                     try:
-                        if hasattr(self, '_initial_training'):
-                            self._initial_training() # Yapay zekayı yeni verilerle baştan eğit
+                        if hasattr(self, 'initial_train'):
+                            self.initial_train() # Yapay zekayı yeni verilerle baştan eğit
                     except Exception as e:
                         logger.error(f"Eğitim tetiklenemedi: {e}")
                     
