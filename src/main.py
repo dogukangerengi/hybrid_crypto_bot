@@ -635,11 +635,11 @@ class MLTradingPipeline:
     # =========================================================================
 
     def _check_open_positions(self):
-        """Açık pozisyonların güncel fiyatlarını kontrol eder ve SL/TP olanları kapatır."""
+        """Açık pozisyonların OHLCV (Mum) verisini çekerek aradaki iğneleri (SL/TP) yakalar."""
         logger.info("\n🔍 Açık pozisyonlar kontrol ediliyor...")
         
         if self.dry_run:
-            # DÜZELTME BURADA: Metot değil, doğrudan property (sözlük) çağırılıyor.
+            from paper_trader import TradeStatus  # Enum tanımını içeri alıyoruz
             open_trades_dict = self.paper_trader.open_trades 
             
             if not open_trades_dict:
@@ -647,30 +647,72 @@ class MLTradingPipeline:
                 return
 
             closed_count = 0
-            # Sözlük olduğu için .values() üzerinden dönüyoruz
-            for trade in open_trades_dict.values():
+            # Döngü esnasında silinme hatası olmaması için kopyasını alıyoruz
+            trades_to_check = list(open_trades_dict.values())
+            
+            for trade in trades_to_check:
                 try:
-                    # Coinin anlık fiyatını borsadan çek
-                    ticker = self.fetcher.get_ticker(f"{trade.symbol}USDT")
-                    if ticker and 'lastPr' in ticker:
-                        current_price = float(ticker['lastPr'])
+                    # Sembolü Bitget formatına getir
+                    fetch_symbol = trade.symbol if "USDT" in trade.symbol else f"{trade.symbol}USDT"
+                    
+                    # Sadece anlık fiyata bakmak iğneleri kaçırır!
+                    # Bu yüzden uyuduğumuz 15 dakikanın mumlarını çekiyoruz (Limit=3 ile son 45 dkyı garantiye alıyoruz)
+                    ohlcv = self.fetcher.fetch_ohlcv(fetch_symbol, timeframe="15m", limit=3)
+                    
+                    if ohlcv is not None and not ohlcv.empty:
+                        # O aralıktaki en yüksek ve en düşük iğneleri al
+                        max_high = float(ohlcv['high'].max())
+                        min_low = float(ohlcv['low'].min())
+                        current_price = float(ohlcv['close'].iloc[-1])
                         
-                        # Fiyatı PaperTrader'a gönder, o SL/TP'yi kontrol etsin
-                        close_reason = self.paper_trader.update_trade_price(trade.id, current_price)
+                        close_reason = None
+                        exit_price = None
+                        status = None
                         
-                        if close_reason: # Eğer kapanmışsa ('SL', 'TP' vb. döner)
+                        # LONG (Yükseliş) pozisyonu kontrolü
+                        if trade.direction == "LONG":
+                            if min_low <= trade.stop_loss:
+                                close_reason = "SL Hit"
+                                exit_price = trade.stop_loss
+                                status = TradeStatus.CLOSED_SL
+                            elif max_high >= trade.take_profit:
+                                close_reason = "TP Hit"
+                                exit_price = trade.take_profit
+                                status = TradeStatus.CLOSED_TP
+                                
+                        # SHORT (Düşüş) pozisyonu kontrolü
+                        else:
+                            if max_high >= trade.stop_loss:
+                                close_reason = "SL Hit"
+                                exit_price = trade.stop_loss
+                                status = TradeStatus.CLOSED_SL
+                            elif min_low <= trade.take_profit:
+                                close_reason = "TP Hit"
+                                exit_price = trade.take_profit
+                                status = TradeStatus.CLOSED_TP
+                        
+                        # Eğer TP veya SL tetiklendiyse işlemi kâr/zarar ile kapat!
+                        if close_reason:
+                            self.paper_trader._close_trade(trade, exit_price, status, close_reason)
                             closed_count += 1
-                            logger.info(f"   ✅ {trade.symbol} işlemi kapandı! Neden: {close_reason} | Fiyat: {current_price}")
+                            logger.info(f"   ✅ {trade.symbol} işlemi kapandı! Neden: {close_reason} | Fiyat: ${exit_price:,.4f}")
                             
-                            # Kapanan işlemi TradeMemory'e bildir
-                            self.trade_memory.close_trade(
-                                trade_id=trade.id,
-                                exit_price=current_price,
-                                pnl_pct=trade.pnl_pct if hasattr(trade, 'pnl_pct') else 0.0,
-                                is_win=(getattr(trade, 'pnl_pct', 0.0) > 0)
-                            )
+                            # Yapay zekanın kendini eğitmesi için hafızaya bildir
+                            try:
+                                for mem_id, mem_trade in self.trade_memory.open_trades.items():
+                                    if mem_trade.symbol == trade.full_symbol or mem_trade.coin == trade.symbol:
+                                        self.trade_memory.close_trade(
+                                            trade_id=mem_id,
+                                            exit_price=exit_price,
+                                            pnl_pct=trade.pnl_percent if trade.pnl_percent else 0.0,
+                                            is_win=(trade.pnl_absolute > 0 if trade.pnl_absolute else False)
+                                        )
+                                        break
+                            except Exception as em:
+                                logger.debug(f"Memory update atlandı: {em}")
+
                 except Exception as e:
-                    logger.error(f"   ❌ {trade.symbol} fiyat güncellenirken hata: {e}")
+                    logger.error(f"   ❌ {trade.symbol} pozisyon kontrolünde hata: {e}")
             
             if closed_count > 0:
                 logger.info(f"   Mevcut Bakiye: ${self.paper_trader.balance:.2f}")
@@ -722,6 +764,13 @@ class MLTradingPipeline:
                     continue
                     
                 r = self._analyze_coin(c.symbol, c.coin)
+                
+                # EKSİK OLAN VE GERİ EKLENEN KISIM BURASI
+                results.append(r)
+                report.total_analyzed += 1
+                if r.ic_confidence >= IC_TRADE:
+                    report.total_above_gate += 1
+
             # Execution
             logger.info(f"\n💹 Execution...")
             for r in results:
@@ -734,16 +783,42 @@ class MLTradingPipeline:
             report.paper_balance= self.paper_trader.balance
             report.balance      = self._balance
 
-            # ML istatistikleri
-            mem_stats = self.trade_memory.get_stats()
+            # --- GERÇEK İSTATİSTİKLERİ PAPER_TRADER'DAN AL ---
+            pt_stats = self.paper_trader.get_summary()
+            total_closed = pt_stats.get("closed_trades", 0)
+            real_win_rate = pt_stats.get("win_rate_pct", 0.0)
+
+            # --- YENİDEN EĞİTİM (RETRAIN) TETİKLEME ---
+            retrain_threshold = 30
+            current_retrain_count = getattr(self.lgbm_model, 'retrain_count', 0)
+            
+            # Kapalı işlem sayısı 30'u geçtiyse (Örn: 31 // 30 = 1)
+            if total_closed >= retrain_threshold:
+                target_retrain_count = total_closed // retrain_threshold
+                
+                # Eğer hedeflenen eğitim sayısı mevcut sayıdan büyükse, EĞİTİMİ BAŞLAT!
+                if target_retrain_count > current_retrain_count:
+                    logger.info(f"\n🧠 [RETRAIN] {total_closed} kapalı işleme ulaşıldı! Model yeniden eğitiliyor...")
+                    try:
+                        if hasattr(self, '_initial_training'):
+                            self._initial_training() # Yapay zekayı yeni verilerle baştan eğit
+                    except Exception as e:
+                        logger.error(f"Eğitim tetiklenemedi: {e}")
+                    
+                    # Eğitim yapıldı olarak kaydet
+                    self.lgbm_model.retrain_count = target_retrain_count
+
+            # Sıradaki eğitime kaç işlem kaldı?
+            next_target = ((total_closed // retrain_threshold) + 1) * retrain_threshold
+            kalan_islem = next_target - total_closed
+
             report.ml_stats = {
-                "closed_trades":  mem_stats["closed_trades"],
-                "win_rate":       mem_stats["win_rate"],
-                "retrain_count":  mem_stats["total_retrain_count"],
-                "next_retrain_in":mem_stats["next_retrain_in"],
+                "closed_trades":  total_closed,
+                "win_rate":       real_win_rate,
+                "retrain_count":  getattr(self.lgbm_model, 'retrain_count', 0),
+                "next_retrain_in": kalan_islem,
                 "model_trained":  self.lgbm_model.is_trained,
             }
-
             report.status = (
                 CycleStatus.SUCCESS   if report.total_traded > 0
                 else CycleStatus.PARTIAL   if report.total_above_gate > 0
@@ -924,7 +999,7 @@ class MLTradingPipeline:
         if report.ml_stats:
             s = report.ml_stats
             logger.info(f"  ML: eğitildi={s.get('model_trained')} | "
-                        f"win={s.get('win_rate',0):.0%} | "
+                        f"win={s.get('win_rate',0):.1f}% | "
                         f"retrain#{s.get('retrain_count',0)}")
         logger.info(f"{'─'*50}\n")
 
@@ -1043,7 +1118,7 @@ if __name__ == "__main__":
             logger.info("🧠 Modelin boş olduğu tespit edildi. İlk eğitim (Warm-Up) başlatılıyor...")
             pipeline.initial_train()
             
-        logger.info("✅ Hazırlık tamam. İlk döngü başlıyor ve ardından 15 dakikalık periyotlara geçiliyor.")
+        logger.info("✅ Hazırlık tamam. İlk döngü başlıyor ve ardından 5 dakikalık periyotlara geçiliyor.")
         
         # İlk turu hemen at
         try:
@@ -1051,8 +1126,8 @@ if __name__ == "__main__":
         except Exception as e:
             logger.error(f"Döngü hatası: {e}")
             
-        # Sonrakileri 15 dakikaya bağla
-        schedule.every(15).minutes.do(pipeline.run_cycle)
+        # Sonrakileri 5 dakikaya bağla
+        schedule.every(5).minutes.do(pipeline.run_cycle)
         
         try:
             while True:

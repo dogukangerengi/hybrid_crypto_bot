@@ -215,7 +215,7 @@ class PaperTrader:
 
     def __init__(
         self,
-        initial_balance: float = 75.0,         # Başlangıç bakiyesi ($)
+        initial_balance: float = 1000.0,         # Başlangıç bakiyesi ($)
         log_dir: Path = DEFAULT_LOG_DIR,       # Kayıt dizini
         fee_rate: float = 0.0006,              # İşlem ücreti (%0.06)
         auto_save: bool = True,                # Her trade'de otomatik kaydet
