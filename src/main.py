@@ -460,13 +460,13 @@ class MLTradingPipeline:
                 logger.warning(f"  ⚠️ {coin} validate hatası: {e}")
                 result.status = "validate_error"; return result
 
-            # ── 9. Risk Hesapla ──────────────────────────────────────────────
+            
             # ── 9. Risk Hesapla ──────────────────────────────────────────────
             if val_result.is_valid and ml_result.decision.value != "WAIT":
                 direction = ml_result.decision.value
                 try:
-                    # Bakiyeyi güncelle
-                    current_balance = self.paper_trader.balance if hasattr(self, 'paper_trader') and getattr(self.paper_trader, 'balance', 0) > 0 else 1000.0
+                    # Bakiyeyi güncelle: Canlıdaysa GERÇEK bakiyeyi (_balance), sanaldaysa PAPER bakiyeyi kullan
+                    current_balance = self.paper_trader.balance if self.dry_run else self._balance
                     self.risk_manager.update_state(balance=current_balance)
                     
                     # İşlemi ve Stop-Loss'u hesapla
