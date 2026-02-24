@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
-from src.execution.risk_manager import RiskManager
+from execution.risk_manager import RiskManager
 
 import numpy as np
 import pandas as pd
