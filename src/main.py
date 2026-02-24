@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
+from src.execution.risk_manager import RiskManager
 
 import numpy as np
 import pandas as pd
@@ -65,9 +66,9 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 VERSION                = "2.1.0"
-MAX_COINS_PER_CYCLE    = 20
+MAX_COINS_PER_CYCLE    = 30
 DEFAULT_FWD_PERIOD     = 6
-MAX_OPEN_POSITIONS     = 5
+MAX_OPEN_POSITIONS     = 10
 MAX_CONSECUTIVE_ERRORS = 5
 ERROR_COOLDOWN_SECONDS = 300
 
@@ -538,23 +539,75 @@ class MLTradingPipeline:
 
         try:
             if self.dry_run:
+                # 🛡️ MAKSİMUM AÇIK POZİSYON KONTROLÜ (PAPER TRADER İÇİN)
+                if len(self.paper_trader.open_trades) >= MAX_OPEN_POSITIONS:
+                    result.status = "position_limit"
+                    logger.info(f"   ⚠️ {result.coin} atlandı: Maksimum pozisyon limitine ulaşıldı ({len(self.paper_trader.open_trades)}/{MAX_OPEN_POSITIONS})")
+                    return result
+
+                # ---------------------------------------------------------
+                # DÜZELTME: CANLI FİYAT ÇEKİLMESİ VE YENİDEN HESAPLAMA
+                # ---------------------------------------------------------
+                try:
+                    # Borsadan güncel/canlı ticker fiyatını çekiyoruz
+                    ticker = self.exchange.fetch_ticker(result.full_symbol)
+                    live_price = ticker['last']
+                    
+                    if live_price is None or live_price <= 0:
+                        raise ValueError(f"Geçersiz canlı fiyat: {live_price}")
+                        
+                    # Canlı fiyata göre SL ve TP'yi baştan hesaplıyoruz (eski mumun ATR'sini koruyarak)
+                    # Not: Burada kendi risk_manager hesaplamana göre SL/TP formülünü kullanmalısın.
+                    # Eğer sisteminde 'risk_manager' üzerinden geçiyorsa şu şekilde hesaplatmalısın:
+                    from execution.risk_manager import RiskManager # Eğer import edilmemişse en üste ekle
+                    risk_mgr = RiskManager(self.config['risk'])
+                    
+                    trade_params = risk_mgr.calculate_trade(
+                        entry_price = live_price,
+                        atr         = result.feature_snapshot.get('atr', live_price * 0.02), # Eğer ATR yoksa varsayılan %2
+                        direction   = direction,
+                        balance     = self.paper_trader.balance if self.dry_run else 1000 # Canlı bakiyeyi kendi modülünden çekmelisin
+                    )
+                    
+                    new_sl_price = trade_params['sl_price']
+                    new_tp_price = trade_params['tp_price']
+                    new_position_size = trade_params['position_size']
+
+                except Exception as e:
+                    logger.error(f"   ❌ {result.coin} için canlı fiyat çekilemedi veya hesaplanamadı: {e}")
+                    # Eğer canlı fiyat çekemezse, bayat fiyatla işlem açmasını engellemek için işlemi iptal et
+                    result.status = "live_price_error"
+                    return result
+                
+                # ---------------------------------------------------------
+
+                # BURASI İŞLEMİ AÇAN KOD, GÜNCELLENMİŞ DEĞERLERLE:
                 paper_id = self.paper_trader.open_trade(
-                    symbol        = result.coin,           # 'BTC'
-                    full_symbol   = result.full_symbol,    # 'BTC/USDT:USDT'
+                    symbol        = result.coin,           
+                    full_symbol   = result.full_symbol,    
                     direction     = direction,
-                    entry_price   = result.price,
-                    stop_loss     = result.sl_price,
-                    take_profit   = result.tp_price,
-                    position_size = result.position_size,
+                    entry_price   = live_price,            # DÜZELTİLDİ: Artık result.price (bayat) değil, live_price
+                    stop_loss     = new_sl_price,          # DÜZELTİLDİ: Yeni fiyata göre yeni SL
+                    take_profit   = new_tp_price,          # DÜZELTİLDİ: Yeni fiyata göre yeni TP
+                    position_size = new_position_size,     # DÜZELTİLDİ: Yeni fiyata göre miktar
                     leverage      = result.leverage,
                     ic_confidence = result.ic_confidence,
                     ic_direction  = result.ic_direction,
                     best_timeframe= result.best_timeframe,
                     market_regime = result.market_regime,
                 )
-                result.paper_trade_id = paper_id
-                result.trade_executed = True
-                result.status         = "paper_executed"
+                
+                # 📱 TELEGRAM BİLDİRİMİ: YENİ İŞLEM
+                if self.notifier.is_configured():
+                    msg = (f"🚀 <b>YENİ İŞLEM AÇILDI</b>\n"
+                           f"━━━━━━━━━━━━━━━━━━━━━\n"
+                           f"🪙 <b>Coin:</b> {result.coin}\n"
+                           f"📈 <b>Yön:</b> {direction}\n"
+                           f"💲 <b>Giriş:</b> ${result.price:,.4f}\n"
+                           f"🛑 <b>SL:</b> ${result.sl_price:,.4f}\n"
+                           f"🎯 <b>TP:</b> ${result.tp_price:,.4f}\n"
+                           f"📊 <b>Kaldıraç:</b> {result.leverage}x")
+                    self.notifier.send_message_sync(msg)
 
             else:
                 # Canlı: max pozisyon kontrolü
@@ -679,6 +732,12 @@ class MLTradingPipeline:
                                 trade.stop_loss = trade.entry_price
                                 self.paper_trader._save_trades() # Değişikliği anında Excel'e kaydet
                                 logger.info(f"   🛡️ {trade.symbol} için Break-Even kalkanı aktif! İşlem risksiz (Yeni SL: ${trade.entry_price:,.4f})")
+                            
+                            # 📱 TELEGRAM BİLDİRİMİ: BREAK-EVEN
+                                if self.notifier.is_configured():
+                                    self.notifier.send_message_sync(f"🛡️ <b>BREAK-EVEN KALKANI</b>\n━━━━━━━━━━━━━━━━━━━━━\n🪙 <b>Coin:</b> {trade.symbol}\nHedefin yarısına ulaşıldı! İşlem artık risksiz (SL Maliyete çekildi).")
+                        
+
 
                             if min_low <= trade.stop_loss:
                                 close_reason = "SL Hit"
@@ -688,6 +747,7 @@ class MLTradingPipeline:
                                 close_reason = "TP Hit"
                                 exit_price = trade.take_profit
                                 status = TradeStatus.CLOSED_TP
+                        
                                 
                         # SHORT (Düşüş) pozisyonu kontrolü
                         else:
@@ -698,6 +758,10 @@ class MLTradingPipeline:
                                 trade.stop_loss = trade.entry_price
                                 self.paper_trader._save_trades() # Değişikliği anında Excel'e kaydet
                                 logger.info(f"   🛡️ {trade.symbol} için Break-Even kalkanı aktif! İşlem risksiz (Yeni SL: ${trade.entry_price:,.4f})")
+
+                            # 📱 TELEGRAM BİLDİRİMİ: BREAK-EVEN
+                                if self.notifier.is_configured():
+                                    self.notifier.send_message_sync(f"🛡️ <b>BREAK-EVEN KALKANI</b>\n━━━━━━━━━━━━━━━━━━━━━\n🪙 <b>Coin:</b> {trade.symbol}\nHedefin yarısına ulaşıldı! İşlem artık risksiz (SL Maliyete çekildi).")
 
                             if max_high >= trade.stop_loss:
                                 close_reason = "SL Hit"
@@ -718,6 +782,20 @@ class MLTradingPipeline:
                             self.paper_trader._close_trade(trade, exit_price, status, close_reason)
                             closed_count += 1
                             logger.info(f"   ✅ {trade.symbol} işlemi kapandı! Neden: {close_reason} | Fiyat: ${exit_price:,.4f}")
+
+                            # 📱 TELEGRAM BİLDİRİMİ: İŞLEM KAPANDI
+                            if self.notifier.is_configured():
+                                pnl_emoji = "✅ KÂR" if trade.net_pnl > 0 else "❌ ZARAR"
+                                if trade.net_pnl > -3 and trade.net_pnl < 3: 
+                                    pnl_emoji = "🛡️ BAŞA BAŞ (BE)"
+                                
+                                msg = (f"{pnl_emoji} <b>({close_reason})</b>\n"
+                                       f"━━━━━━━━━━━━━━━━━━━━━\n"
+                                       f"🪙 <b>Coin:</b> {trade.symbol}\n"
+                                       f"💲 <b>Çıkış:</b> ${exit_price:,.4f}\n"
+                                       f"💰 <b>Net PnL:</b> ${trade.net_pnl:+.2f} ({trade.pnl_percent:+.2f}%)\n"
+                                       f"🏦 <b>Güncel Kasa:</b> ${self.paper_trader.balance:,.2f}")
+                                self.notifier.send_message_sync(msg)
                             
                             # Yapay zekanın kendini eğitmesi için hafızaya bildir
                             try:
