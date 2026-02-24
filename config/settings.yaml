@@ -28,7 +28,7 @@ exchange:
 # -----------------------------------------------------------------------------
 risk:
   risk_per_trade_pct: 2.0                    # İşlem başına max risk (%)
-  max_open_positions: 10                      # Max açık pozisyon
+  max_open_positions: 5                      # Max açık pozisyon
   max_margin_per_trade_pct: 25.0             # İşlem başına max margin (%)
   max_total_margin_pct: 60.0                 # Toplam max margin (%)
   min_leverage: 2                            # Min kaldıraç

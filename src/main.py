@@ -68,7 +68,7 @@ logger = logging.getLogger(__name__)
 VERSION                = "2.1.0"
 MAX_COINS_PER_CYCLE    = 30
 DEFAULT_FWD_PERIOD     = 6
-MAX_OPEN_POSITIONS     = 10
+MAX_OPEN_POSITIONS     = 5
 MAX_CONSECUTIVE_ERRORS = 5
 ERROR_COOLDOWN_SECONDS = 300
 
@@ -1212,9 +1212,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ML Trading Bot")
     parser.add_argument('--train', action='store_true', help='İlk modeli manuel eğitir')
     parser.add_argument('--schedule', action='store_true', help='Botu 15 dakikada bir döngüye sokar')
+    parser.add_argument('--live', action='store_true', help='Canlı (Gerçek Para) modu') # YENİ EKLENEN SATIR
     args = parser.parse_args()
 
-    pipeline = MLTradingPipeline()
+    # YENİ EKLENEN KISIM: dry_run=not args.live (Eğer --live yazarsak dry_run False olur, canlıya geçer)
+    pipeline = MLTradingPipeline(dry_run=not args.live)
 
     if args.train:
         pipeline.initial_train()
