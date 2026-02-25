@@ -99,7 +99,7 @@ scanner:
   min_24h_volume_usdt: 2500000               # Min 24h USDT hacim ($2.5M) — daha geniş coin havuzu
   min_24h_trades: 1000                       # Min 24h işlem sayısı
   max_spread_pct: 0.1                        # Max bid-ask spread (%)
-  top_n_coins: 30                            # Top N coin seç (daha geniş tarama)
+  top_n_coins: 29                            # Top N coin seç (daha geniş tarama)
   scan_interval_minutes: 60                  # Tarama aralığı
 
 # -----------------------------------------------------------------------------

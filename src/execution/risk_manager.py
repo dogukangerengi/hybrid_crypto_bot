@@ -441,93 +441,62 @@ class RiskManager:
         min_amount: float = 0.001,
         amount_precision: int = 3,
         contract_size: float = 1.0
-    ) -> PositionSizeResult:
+    ):
         """
-        ATR-bazlı pozisyon büyüklüğü hesaplar.
-        
-        Formül:
-        ------
-        risk_amount = balance × risk_per_trade_pct / 100
-        position_size = risk_amount / sl_distance
-        position_value = position_size × entry_price
-        margin_required = position_value / leverage
-        
-        Bu yaklaşım "fixed fractional" position sizing:
-        - Her işlemde bakiyenin sabit %'sini riske et
-        - SL mesafesi büyükse pozisyon küçülür (otomatik)
-        - SL mesafesi küçükse pozisyon büyür (otomatik)
-        
-        Kelly Criterion bağlantısı:
-        Half-Kelly ≈ %2 risk (conservative, geometric growth optimal'e yakın)
-        
-        Parameters:
-        ----------
-        entry_price : float
-            Giriş fiyatı ($)
-        sl_distance : float
-            SL mesafesi ($) — SL hesaplamasından gelir
-        min_amount : float
-            Minimum sipariş miktarı (borsa limiti)
-        amount_precision : int
-            Miktar decimal hassasiyeti (borsa limiti)
-        contract_size : float
-            Kontrat büyüklüğü (Bitget'te genellikle 1.0)
-            
-        Returns:
-        -------
-        PositionSizeResult
-            Size, value, risk_amount, margin, leverage
+        Kasa Yönetimi: %2 Risk, %65 Kullanım, %35 Nakit (Max 5 İşlem, Max 20x Kaldıraç)
         """
-        # Risk miktarı ($)
-        risk_amount = self.balance * (self.risk_cfg.risk_per_trade_pct / 100)
+        import math
         
-        # Pozisyon büyüklüğü (coin adedi)
+        # --- STRATEJİ KURALLARI ---
+        RISK_PERCENT = 0.02          # Stop olduğunda kasanın en fazla %2'si gitsin
+        MAX_TOTAL_MARGIN = 0.65      # Kasanın sadece %65'i işlemlerde kullanılabilir
+        MAX_TRADES = 5               # Maksimum 5 işlem hedefleniyor
+        MAX_LEVERAGE = 20.0          # İşlem başına maksimum 20x kaldıraç
+        
+        # 1. İşlem Başına Düşen Maksimum Marjin Limiti
+        # Örn: 1000$ kasanın %65'i = 650$. 5 işleme bölersek işlem başı nakit = 130$
+        max_margin_per_trade = (self.balance * MAX_TOTAL_MARGIN) / MAX_TRADES
+        
+        # 2. Riske Edilecek Miktar
+        # Örn: 1000$ * 0.02 = 20$
+        risk_amount = self.balance * RISK_PERCENT
+        
+        # 3. İdeal Lot (Coin Adedi) Hesaplama
         if sl_distance <= 0:
-            logger.error("SL distance <= 0, pozisyon hesaplanamaz")
-            return PositionSizeResult(
-                size=0, value=0, risk_amount=risk_amount,
-                margin_required=0, leverage=0
-            )
-        
-        raw_size = risk_amount / sl_distance
-        
-        # Borsa hassasiyetine yuvarla
-        size = round(raw_size, amount_precision)
-        
-        # Minimum miktar kontrolü
-        if size < min_amount:
-            logger.warning(
-                f"Hesaplanan pozisyon ({size}) < min ({min_amount}). "
-                f"Bakiye yetersiz olabilir."
-            )
-            size = 0.0                         # Açma
-        
-        # Pozisyon değeri ($)
-        position_value = size * entry_price
-        
-        # Kaldıraç hesaplama
-        # Max margin = bakiyenin max_margin_per_trade_pct'si
-        max_margin = self.balance * (self.risk_cfg.max_margin_per_trade_pct / 100)
-        
-        if position_value > 0 and max_margin > 0:
-            # Gereken kaldıraç = position_value / max_margin
-            raw_leverage = position_value / max_margin
+            sl_distance = entry_price * 0.01  # Güvenlik (Sıfıra bölmeyi önler)
             
-            # Config limitleri içinde kal
-            leverage = max(self.risk_cfg.min_leverage,
-                           min(math.ceil(raw_leverage), self.risk_cfg.max_leverage))
-            
-            # Gerçek margin
-            margin_required = position_value / leverage
+        ideal_size = risk_amount / sl_distance
+        ideal_pos_value = ideal_size * entry_price
+        
+        # 4. İhtiyaç Duyulan Kaldıraç (Bu işlemi kendi bütçemizle açmak için gereken X)
+        calculated_lev = ideal_pos_value / max_margin_per_trade if max_margin_per_trade > 0 else 1
+        
+        # 5. Sınırları Uygula ve Optimize Et
+        if calculated_lev > MAX_LEVERAGE:
+            # Eğer stop çok darsa ve 20x'i aşıyorsa, limiti 20x'e çakıp lotu küçült (Risk %2'nin de altına düşer, çok güvenli)
+            leverage = int(MAX_LEVERAGE)
+            max_allowed_value = max_margin_per_trade * leverage
+            final_size = max_allowed_value / entry_price
+            margin_used = max_margin_per_trade
         else:
-            leverage = 0
-            margin_required = 0
+            # Kaldıraç 20x'in altındaysa, tam %2 riskle ideale göre gir ve kaldıracı tavana yuvarla
+            leverage = int(max(1, math.ceil(calculated_lev)))
+            final_size = ideal_size
+            margin_used = ideal_pos_value / leverage
+            
+        # 6. Borsa Küsurat Kurallarına Göre Yuvarla
+        final_size = round(final_size / contract_size) * contract_size
+        final_size = round(final_size, amount_precision)
         
-        return PositionSizeResult(
-            size=size,
-            value=round(position_value, 2),
-            risk_amount=round(risk_amount, 2),
-            margin_required=round(margin_required, 2),
+        if final_size < min_amount:
+            final_size = min_amount
+
+        # Sonucu var olan objeyle döndür
+        from execution.risk_manager import PositionCalculation
+        
+        return PositionCalculation(
+            size=final_size,
+            margin_required=margin_used,
             leverage=leverage
         )
     

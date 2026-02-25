@@ -154,10 +154,16 @@ class BitgetExecutor:
                 'apiKey': cfg.exchange.api_key,
                 'secret': cfg.exchange.api_secret,
                 'password': cfg.exchange.passphrase,
-                'options': {'defaultType': 'swap'},
                 'enableRateLimit': True,
+                'options': {
+                    'defaultType': 'swap',
+                    'positionMode': True, # ✅ CCXT One-way (Tek Yönlü) Mod
+                },
                 'sandbox': cfg.exchange.sandbox,
             })
+            # ✅ Garantilemek için One-Way mod parametresini ekliyoruz:
+            self._exchange.options['positionMode'] = 'oneway'
+            
             self._exchange.load_markets()
             logger.info(f"Bitget exchange başlatıldı (sandbox={cfg.exchange.sandbox})")
         return self._exchange
@@ -290,7 +296,7 @@ class BitgetExecutor:
             logger.error(f"Kaldıraç hatası ({symbol}, {leverage}x): {e}")
             return False
 
-    def set_margin_mode(self, symbol: str, mode: str = 'cross') -> bool:
+    def set_margin_mode(self, symbol: str, mode: str = 'isolated') -> bool:
         """Margin mode ayarla. DRY RUN: log + True döner."""
         if self.dry_run:
             logger.info(f"🧪 DRY RUN: Margin mode {symbol} → {mode}")
@@ -312,13 +318,26 @@ class BitgetExecutor:
     # =========================================================================
 
     def round_price(self, price: float, symbol: str) -> float:
-        """Fiyatı borsa precision'ına yuvarlar."""
-        info = self.get_market_info(symbol)
-        precision = info['precision']['price']
-        if isinstance(precision, int):
-            return round(price, precision)
-        return round(price / precision) * precision
-
+        """Fiyatı, coinin izin verdiği tick size (fiyat adımı) kuralına göre uydurur."""
+        try:
+            info = self.get_market_info(symbol)
+            if info and 'precision' in info and 'price' in info['precision']:
+                precision = info['precision']['price']
+                if precision:
+                    # Decimal modülü veya ccxt'nin kendi formatter'ı ile güvenli yuvarlama
+                    return float(self._exchange.price_to_precision(symbol, price))
+            
+            # Eğer borsa bilgisi çekilemezse, fiyata bakarak akıllı yuvarlama yap
+            if price >= 100:
+                return round(price, 2)
+            elif price >= 1:
+                return round(price, 4)
+            else:
+                return round(price, 5)
+        except Exception as e:
+            logger.warning(f"Fiyat yuvarlama hatası ({symbol}): {e}. Manuel yuvarlanıyor.")
+            return round(price, 4)
+        
     def round_amount(self, amount: float, symbol: str) -> float:
         """Miktarı borsa precision'ına truncate eder (yukarı değil aşağı)."""
         info = self.get_market_info(symbol)
@@ -334,13 +353,7 @@ class BitgetExecutor:
 
     def place_market_order(self, symbol: str, side: str, amount: float,
                            reduce_only: bool = False) -> OrderResult:
-        """
-        Market emir gönderir.
-        ✅ tradeSide='open' → yeni pozisyon (one-way mode zorunlu)
-        ✅ tradeSide='close' → pozisyon kapatma
-        """
         result = OrderResult(symbol=symbol, side=side, order_type='market', amount=amount)
-
         amount = self.round_amount(amount, symbol)
         result.amount = amount
 
@@ -361,61 +374,58 @@ class BitgetExecutor:
 
         exchange = self._get_exchange()
         try:
-            params = {'productType': 'USDT-FUTURES'}
+            # DÜZELTME: One-Way Mode (Tek Yönlü) için parametreler
+            params = {
+                'productType': 'USDT-FUTURES', 
+                'marginCoin': 'USDT',
+                'marginMode': 'isolated',
+                # Bitget One-Way mode için 'marginMode' genellikle 'crossed' veya 'isolated' istenir, 
+                # ancak CCXT'nin hata vermemesi için pozisyon yönünü belirtmiyoruz.
+            }
             if reduce_only:
-                # Mevcut pozisyonu kapatma
                 params['reduceOnly'] = True
-                params['tradeSide'] = 'close'   # ✅ One-way mode için zorunlu
-            else:
-                # Yeni pozisyon açma
-                params['tradeSide'] = 'open'    # ✅ One-way mode için zorunlu
 
+            # CCXT'de One-Way modda 'side' sadece 'buy' veya 'sell' olur. 
+            # 'positionSide' belirtilmemelidir.
             order = exchange.create_order(
-                symbol=symbol, type='market', side=side, amount=amount, params=params
+                symbol=symbol, 
+                type='market', 
+                side=side, 
+                amount=amount, 
+                params=params
             )
             result.order_id = str(order.get('id', ''))
-            result.price = float(order.get('average', 0) or order.get('price', 0) or 0)
-            result.cost = float(order.get('cost', 0) or 0)
-            result.filled = float(order.get('filled', 0) or 0)
-            result.status = order.get('status', 'unknown')
-            result.success = result.status in ['closed', 'open']
+            result.price = float(order.get('average') or order.get('price') or 0.0)
+            result.filled = float(order.get('filled') or 0.0)
+            result.status = order.get('status') or 'unknown'
+            
+            result.success = True if result.order_id else False
             result.raw = order
-            logger.info(f"✅ Market emir: {side.upper()} {result.filled} {symbol} @ ${result.price:,.4f}")
+            
+            logger.info(f"✅ Market Emir İletildi: {side.upper()} {amount} {symbol} | ID: {result.order_id}")
             return result
-        except ccxt.InsufficientFunds as e:
-            result.error = f"Yetersiz bakiye: {e}"
-        except ccxt.InvalidOrder as e:
-            result.error = f"Geçersiz emir: {e}"
+            
         except Exception as e:
-            result.error = f"Emir hatası: {e}"
-        logger.error(result.error)
-        return result
+            result.error = f"{type(e).__name__}: {str(e)}"
+            logger.error(f"❌ Market emir hatası: {result.error}")
+            return result
 
     # =========================================================================
-    # SL/TP EMİRLERİ
+    # SL/TP EMİRLERİ (ONE-WAY MODE UYUMLU TRIGGER)
     # =========================================================================
 
     def place_stop_loss(self, symbol: str, side: str, amount: float,
                         trigger_price: float) -> OrderResult:
-        """
-        Stop-Loss trigger emri.
-        ✅ _format_trigger_price: Bitget 48001 hatasını önler (düşük fiyatlı coinler)
-        ✅ planType='normal_plan': Bitget trigger emir sınıflandırması (zorunlu)
-        ✅ triggerType='mark_price': Mark fiyatı — spike manipülasyonuna dayanıklı
-        ✅ tradeSide='close': One-way mode'da pozisyon kapatma
-        """
         result = OrderResult(symbol=symbol, side=side, order_type='stop_loss',
                              amount=amount, price=trigger_price)
 
-        # ✅ Önce precision fix, sonra round
-        # Düşük fiyatlı coinlerde 48001 hatasını önler
         if trigger_price >= 1:
            trigger_price = round(trigger_price, 4)
         elif trigger_price >= 0.01:
             trigger_price = round(trigger_price, 6)
         else:
             trigger_price = round(trigger_price, 8)
-        trigger_price = _format_trigger_price(trigger_price)
+            
         trigger_price = self.round_price(trigger_price, symbol)
         amount = self.round_amount(amount, symbol)
         result.price = trigger_price
@@ -423,46 +433,40 @@ class BitgetExecutor:
 
         if self.dry_run:
             result.order_id = f"DRY_SL_{int(time.time())}"
-            result.status = "open"
             result.success = True
-            logger.info(f"🧪 DRY RUN: SL {side} {amount} {symbol} @ {trigger_price}")
             return result
 
         exchange = self._get_exchange()
         try:
+            # DÜZELTME: One-Way Mod için 'normal_plan' kullanıyoruz, 'reduceOnly' ekliyoruz
             order = exchange.create_order(
                 symbol=symbol, type='market', side=side, amount=amount,
                 params={
                     'productType': 'USDT-FUTURES',
-                    'planType':    'normal_plan',   # ✅ Trigger emir sınıfı (zorunlu)
-                    'triggerPrice': trigger_price,
-                    'triggerType': 'mark_price',    # ✅ Mark price (stabil)
-                    'reduceOnly':  True,
-                    'tradeSide':   'close',         # ✅ One-way mode
+                    'marginCoin': 'USDT',
+                    'planType': 'normal_plan', # Bitget V2 One-Way modda bunu istiyor
+                    'triggerPrice': str(trigger_price),
+                    'triggerType': 'mark_price',
+                    'reduceOnly': True,
+                    'oneWayMode': True
                 }
             )
             result.order_id = str(order.get('id', ''))
-            result.status = order.get('status', 'open')
-            result.success = True
+            result.status = order.get('status') or 'unknown'
+            result.success = True if result.order_id else False
             result.raw = order
-            logger.info(f"🛑 SL emri: {side} {amount} {symbol} trigger={trigger_price}")
+            logger.info(f"🛑 SL Emri İletildi: {side.upper()} {amount} {symbol} @ {trigger_price}")
             return result
         except Exception as e:
-            result.error = f"SL emir hatası: {e}"
+            result.error = f"SL Hatası: {e}"
             logger.error(result.error)
             return result
 
     def place_take_profit(self, symbol: str, side: str, amount: float,
                           trigger_price: float) -> OrderResult:
-        """
-        Take-Profit trigger emri.
-        ✅ SL ile aynı düzeltmeler: precision fix, planType, mark_price, tradeSide
-        """
         result = OrderResult(symbol=symbol, side=side, order_type='take_profit',
                              amount=amount, price=trigger_price)
 
-        # ✅ Precision fix
-        trigger_price = _format_trigger_price(trigger_price)
         trigger_price = self.round_price(trigger_price, symbol)
         amount = self.round_amount(amount, symbol)
         result.price = trigger_price
@@ -470,32 +474,32 @@ class BitgetExecutor:
 
         if self.dry_run:
             result.order_id = f"DRY_TP_{int(time.time())}"
-            result.status = "open"
             result.success = True
-            logger.info(f"🧪 DRY RUN: TP {side} {amount} {symbol} @ {trigger_price}")
             return result
 
         exchange = self._get_exchange()
         try:
+            # DÜZELTME: One-Way Mod için 'normal_plan' kullanıyoruz, 'reduceOnly' ekliyoruz
             order = exchange.create_order(
                 symbol=symbol, type='market', side=side, amount=amount,
                 params={
                     'productType': 'USDT-FUTURES',
-                    'planType':    'normal_plan',   # ✅ Trigger emir sınıfı (zorunlu)
-                    'triggerPrice': trigger_price,
-                    'triggerType': 'mark_price',    # ✅ Mark price
-                    'reduceOnly':  True,
-                    'tradeSide':   'close',         # ✅ One-way mode
+                    'marginCoin': 'USDT',
+                    'planType': 'normal_plan', # Bitget V2 One-Way modda bunu istiyor
+                    'triggerPrice': str(trigger_price),
+                    'triggerType': 'mark_price',
+                    'reduceOnly': True,
+                    'oneWayMode': True
                 }
             )
             result.order_id = str(order.get('id', ''))
-            result.status = order.get('status', 'open')
-            result.success = True
+            result.status = order.get('status') or 'unknown'
+            result.success = True if result.order_id else False
             result.raw = order
-            logger.info(f"🎯 TP emri: {side} {amount} {symbol} trigger={trigger_price}")
+            logger.info(f"🎯 TP Emri İletildi: {side.upper()} {amount} {symbol} @ {trigger_price}")
             return result
         except Exception as e:
-            result.error = f"TP emir hatası: {e}"
+            result.error = f"TP Hatası: {e}"
             logger.error(result.error)
             return result
 
@@ -528,7 +532,7 @@ class BitgetExecutor:
                       skip_tp: bool = False) -> ExecutionResult:
         """
         Tam trade execution pipeline:
-        1. Margin mode ayarla (cross)
+        1. Margin mode ayarla (isolated)
         2. Kaldıraç ayarla
         3. Ana market emri gönder
         4. 2 saniye bekle (pozisyon onayı)
@@ -564,7 +568,7 @@ class BitgetExecutor:
 
         try:
             # 1. Margin mode
-            self.set_margin_mode(symbol, 'cross')
+            self.set_margin_mode(symbol, 'isolated')
 
             # 2. Kaldıraç
             self.set_leverage(symbol, pos.leverage)

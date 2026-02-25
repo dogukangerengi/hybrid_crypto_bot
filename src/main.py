@@ -17,14 +17,22 @@
 #   python main.py --schedule   ← 75dk scheduler
 # =============================================================================
 
-import sys, os, time, signal, argparse, logging, traceback
+import sys
+import os
+import time
+import signal
+import argparse
+import logging
+import traceback
+import schedule
+
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass, field
 from enum import Enum
-from execution.risk_manager import RiskManager
 
+from execution.risk_manager import RiskManager
 import numpy as np
 import pandas as pd
 
@@ -239,7 +247,12 @@ class MLTradingPipeline:
                 logger.info(f"💰 Paper bakiye: ${self._balance:.2f}")
             else:
                 b = self.executor.fetch_balance()
-                self._balance = self._initial_balance = b
+                # DÜZELTME: Gelen veri bir sözlük (dict) ise 'total' değerini alıyoruz
+                if isinstance(b, dict):
+                    self._balance = self._initial_balance = b.get('total', 0.0)
+                else:
+                    self._balance = self._initial_balance = float(b)
+                
                 logger.info(f"💰 Canlı bakiye: ${self._balance:.2f}")
             return True
         except Exception as e:
@@ -538,68 +551,78 @@ class MLTradingPipeline:
             return result
 
         try:
+            # ---------------------------------------------------------
+            # DÜZELTME: CANLI FİYAT ÇEKİLMESİ VE YENİDEN HESAPLAMA
+            # ---------------------------------------------------------
+            try:
+                # Borsadan güncel/canlı ticker fiyatını çekiyoruz (CCXT üzerinden)
+                exchange = self.executor._get_exchange() # Executor üzerinden güvenli borsa objesi
+                ticker = exchange.fetch_ticker(result.full_symbol)
+                live_price = ticker['last']
+                
+                if live_price is None or live_price <= 0:
+                    raise ValueError(f"Geçersiz canlı fiyat: {live_price}")
+                    
+                # Güncel kasayı belirle (Canlıysa gerçek, sanalsa paper)
+                current_balance = self.paper_trader.balance if self.dry_run else self._balance
+                
+                # Sistemdeki mevcut risk yöneticisine güncel bakiyeyi bildir
+                self.risk_manager.update_state(balance=current_balance)
+                
+                # Canlı fiyata göre SL ve TP'yi baştan hesaplıyoruz
+                trade_calc = self.risk_manager.calculate_trade(
+                    symbol      = result.full_symbol,
+                    direction   = direction,
+                    entry_price = live_price,
+                    atr         = result.atr,
+                )
+                
+                if not trade_calc.is_approved():
+                    logger.warning(f"   ⚠️ {result.coin} yeni canlı fiyatla riskten geçemedi.")
+                    result.status = "risk_rejected_live"
+                    return result
+                    
+                # Değerleri güncelle
+                result.price = live_price
+                result.sl_price = trade_calc.stop_loss.price
+                result.tp_price = trade_calc.take_profit.price
+                result.position_size = trade_calc.position.size
+
+            except Exception as e:
+                logger.error(f"   ❌ {result.coin} canlı fiyat hesaplama hatası: {e}")
+                result.status = "live_price_error"
+                return result
+
+            # ---------------------------------------------------------
+            # YÖNLENDİRME: SANAL MOD VEYA CANLI MOD
+            # ---------------------------------------------------------
+
             if self.dry_run:
-                # 🛡️ MAKSİMUM AÇIK POZİSYON KONTROLÜ (PAPER TRADER İÇİN)
+                # --- SANAL BORSA (PAPER TRADER) MANTIĞI ---
                 if len(self.paper_trader.open_trades) >= MAX_OPEN_POSITIONS:
                     result.status = "position_limit"
-                    logger.info(f"   ⚠️ {result.coin} atlandı: Maksimum pozisyon limitine ulaşıldı ({len(self.paper_trader.open_trades)}/{MAX_OPEN_POSITIONS})")
+                    logger.info(f"   ⚠️ {result.coin} atlandı: Maksimum pozisyon limitine ulaşıldı")
                     return result
 
-                # ---------------------------------------------------------
-                # DÜZELTME: CANLI FİYAT ÇEKİLMESİ VE YENİDEN HESAPLAMA
-                # ---------------------------------------------------------
-                try:
-                    # Borsadan güncel/canlı ticker fiyatını çekiyoruz
-                    ticker = self.exchange.fetch_ticker(result.full_symbol)
-                    live_price = ticker['last']
-                    
-                    if live_price is None or live_price <= 0:
-                        raise ValueError(f"Geçersiz canlı fiyat: {live_price}")
-                        
-                    # Canlı fiyata göre SL ve TP'yi baştan hesaplıyoruz (eski mumun ATR'sini koruyarak)
-                    # Not: Burada kendi risk_manager hesaplamana göre SL/TP formülünü kullanmalısın.
-                    # Eğer sisteminde 'risk_manager' üzerinden geçiyorsa şu şekilde hesaplatmalısın:
-                    from execution.risk_manager import RiskManager # Eğer import edilmemişse en üste ekle
-                    risk_mgr = RiskManager(self.config['risk'])
-                    
-                    trade_params = risk_mgr.calculate_trade(
-                        entry_price = live_price,
-                        atr         = result.feature_snapshot.get('atr', live_price * 0.02), # Eğer ATR yoksa varsayılan %2
-                        direction   = direction,
-                        balance     = self.paper_trader.balance if self.dry_run else 1000 # Canlı bakiyeyi kendi modülünden çekmelisin
-                    )
-                    
-                    new_sl_price = trade_params['sl_price']
-                    new_tp_price = trade_params['tp_price']
-                    new_position_size = trade_params['position_size']
-
-                except Exception as e:
-                    logger.error(f"   ❌ {result.coin} için canlı fiyat çekilemedi veya hesaplanamadı: {e}")
-                    # Eğer canlı fiyat çekemezse, bayat fiyatla işlem açmasını engellemek için işlemi iptal et
-                    result.status = "live_price_error"
-                    return result
-                
-                # ---------------------------------------------------------
-
-                # BURASI İŞLEMİ AÇAN KOD, GÜNCELLENMİŞ DEĞERLERLE:
                 paper_id = self.paper_trader.open_trade(
                     symbol        = result.coin,           
                     full_symbol   = result.full_symbol,    
                     direction     = direction,
-                    entry_price   = live_price,            # DÜZELTİLDİ: Artık result.price (bayat) değil, live_price
-                    stop_loss     = new_sl_price,          # DÜZELTİLDİ: Yeni fiyata göre yeni SL
-                    take_profit   = new_tp_price,          # DÜZELTİLDİ: Yeni fiyata göre yeni TP
-                    position_size = new_position_size,     # DÜZELTİLDİ: Yeni fiyata göre miktar
+                    entry_price   = result.price,          
+                    stop_loss     = result.sl_price,       
+                    take_profit   = result.tp_price,       
+                    position_size = result.position_size,  
                     leverage      = result.leverage,
                     ic_confidence = result.ic_confidence,
                     ic_direction  = result.ic_direction,
                     best_timeframe= result.best_timeframe,
                     market_regime = result.market_regime,
                 )
+                result.trade_executed = True
+                result.status = "executed"
                 
-                # 📱 TELEGRAM BİLDİRİMİ: YENİ İŞLEM
                 if self.notifier.is_configured():
-                    msg = (f"🚀 <b>YENİ İŞLEM AÇILDI</b>\n"
+                    msg = (f"🧪 <b>SANAL İŞLEM AÇILDI</b>\n"
                            f"━━━━━━━━━━━━━━━━━━━━━\n"
                            f"🪙 <b>Coin:</b> {result.coin}\n"
                            f"📈 <b>Yön:</b> {direction}\n"
@@ -610,7 +633,7 @@ class MLTradingPipeline:
                     self.notifier.send_message_sync(msg)
 
             else:
-                # Canlı: max pozisyon kontrolü
+                # --- GERÇEK BORSA (BİTGET) MANTIĞI ---
                 try:
                     open_count = len(self.executor.fetch_positions())
                 except Exception:
@@ -618,34 +641,93 @@ class MLTradingPipeline:
 
                 if open_count >= MAX_OPEN_POSITIONS:
                     result.status = "position_limit"
+                    logger.info(f"   ⚠️ {result.coin} atlandı: Canlı borsada max pozisyona ({MAX_OPEN_POSITIONS}) ulaşıldı.")
                     return result
 
-                class _Adapter:
-                    """BitgetExecutor'un beklediği arayüzü sağlar."""
-                    def __init__(self, r, d):
-                        self.symbol = r.full_symbol
-                        self.direction = d
-                        self.entry_price = r.price
-                        self.rejection_reasons = []
-                        class _Pos: size = r.position_size; leverage = r.leverage
-                        class _Tgt:
-                            def __init__(self, p): self.price = p
-                        self.position   = _Pos()
-                        self.stop_loss  = _Tgt(r.sl_price)
-                        self.take_profit= _Tgt(r.tp_price)
-                    def is_approved(self): return True
-
-                exec_res = self.executor.execute_trade(_Adapter(result, direction))
+                # BitgetExecutor'a emri SL ve TP'si ile yolla!
+                exec_res = self.executor.execute_trade(trade_calc)
                 result.execution_result = exec_res
 
                 if exec_res.success:
                     result.trade_executed = True
                     result.status = "executed"
+                    
+                    if self.notifier.is_configured():
+                        msg = (f"🔴 <b>CANLI İŞLEM AÇILDI</b>\n"
+                               f"━━━━━━━━━━━━━━━━━━━━━\n"
+                               f"🪙 <b>Coin:</b> {result.coin}\n"
+                               f"📈 <b>Yön:</b> {direction}\n"
+                               f"💲 <b>Giriş:</b> ${exec_res.actual_entry:,.4f}\n"
+                               f"🛑 <b>SL:</b> ${result.sl_price:,.4f}\n"
+                               f"🎯 <b>TP:</b> ${result.tp_price:,.4f}\n"
+                               f"📊 <b>Kaldıraç:</b> {result.leverage}x")
+                        self.notifier.send_message_sync(msg)
+
+                # ==============================================================
+                    # YENİ EKLENEN: CANLI İŞLEMLERİ EXCEL'E (live_trades.xlsx) KAYDET
+                    # ==============================================================
+                    try:
+                        import pandas as pd
+                        from pathlib import Path
+                        from datetime import datetime
+                        import uuid
+                        
+                        log_dir = Path("logs")
+                        log_dir.mkdir(parents=True, exist_ok=True)
+                        excel_path = log_dir / "live_trades.xlsx"
+                        
+                        # Hacim (Lot x Giriş Fiyatı) hesaplama
+                        islem_hacmi = exec_res.actual_entry * result.position_size
+                        
+                        yeni_islem = {
+                            "ID": str(uuid.uuid4())[:8],
+                            "Tarih (Açılış)": datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                            "Tarih (Kapanış)": "",
+                            "Coin": result.coin,
+                            "Yön": direction,
+                            "Giriş ($)": exec_res.actual_entry,
+                            "Çıkış ($)": "",
+                            "Lot (Coin)": result.position_size,
+                            "Hacim ($)": round(islem_hacmi, 2),
+                            "Kaldıraç": result.leverage,
+                            "SL ($)": result.sl_price,
+                            "TP ($)": result.tp_price,
+                            "R:R": getattr(result, 'risk_reward', 1.5),
+                            "PnL ($)": 0.0,
+                            "PnL (%)": 0.0,
+                            "Fee ($)": 0.0,
+                            "Net PnL ($)": 0.0,
+                            "IC Güven": getattr(result, 'ic_confidence', 0.0),
+                            "IC Yön": getattr(result, 'ic_direction', ''),
+                            "TF": getattr(result, 'best_timeframe', ''),
+                            "Rejim": getattr(result, 'market_regime', ''),
+                            "AI Karar": direction,
+                            "Durum": "open",
+                            "Çıkış Nedeni": "",
+                            "Süre (dk)": ""
+                        }
+                        
+                        df_yeni = pd.DataFrame([yeni_islem])
+                        
+                        if excel_path.exists():
+                            df_mevcut = pd.read_excel(excel_path)
+                            df_son = pd.concat([df_mevcut, df_yeni], ignore_index=True)
+                        else:
+                            df_son = df_yeni
+                            
+                        df_son.to_excel(excel_path, index=False)
+                        logger.info(f"📊 Canlı işlem Paper formatında Excel'e eklendi: {result.coin}")
+                    except Exception as e:
+                        logger.error(f"❌ Excel kayıt hatası: {e}")
+                    # ==============================================================
                 else:
                     result.status = "execution_error"
                     result.error  = exec_res.error
+                    logger.error(f"   ❌ Canlı işlem açılamadı: {exec_res.error}")
 
-            # TradeMemory'ye kaydet
+            # ---------------------------------------------------------
+            # HAFIZAYA KAYDET (TRADE MEMORY)
+            # ---------------------------------------------------------
             if result.trade_executed:
                 fv_dict = {}
                 if result.ml_result and hasattr(result.ml_result, 'feature_vector'):
@@ -1205,6 +1287,7 @@ def main():
 
 
 if __name__ == "__main__":
+    import sys
     import argparse
     import time
     import schedule
@@ -1212,11 +1295,33 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ML Trading Bot")
     parser.add_argument('--train', action='store_true', help='İlk modeli manuel eğitir')
     parser.add_argument('--schedule', action='store_true', help='Botu 15 dakikada bir döngüye sokar')
-    parser.add_argument('--live', action='store_true', help='Canlı (Gerçek Para) modu') # YENİ EKLENEN SATIR
+    parser.add_argument('--live', action='store_true', help='Canlı (Gerçek Para) modu')
     args = parser.parse_args()
 
-    # YENİ EKLENEN KISIM: dry_run=not args.live (Eğer --live yazarsak dry_run False olur, canlıya geçer)
     pipeline = MLTradingPipeline(dry_run=not args.live)
+
+    # ---------------------------------------------------------
+    # DÜZELTME: BORSADAN VEYA SANAL KASADAN BAKİYEYİ ÇEK!
+    # ---------------------------------------------------------
+    if __name__ == "__main__":
+     import sys
+    import argparse
+    import time
+    import schedule
+    
+    parser = argparse.ArgumentParser(description="ML Trading Bot")
+    parser.add_argument('--train', action='store_true', help='İlk modeli manuel eğitir')
+    parser.add_argument('--schedule', action='store_true', help='Botu 15 dakikada bir döngüye sokar')
+    parser.add_argument('--live', action='store_true', help='Canlı (Gerçek Para) modu')
+    args = parser.parse_args()
+
+    pipeline = MLTradingPipeline(dry_run=not args.live)
+
+    # ---------------------------------------------------------
+    # DÜZELTME: BORSADAN VEYA SANAL KASADAN BAKİYEYİ ÇEK!
+    # ---------------------------------------------------------
+    if not pipeline._init_balance():
+        sys.exit(1)
 
     if args.train:
         pipeline.initial_train()
