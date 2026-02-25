@@ -189,24 +189,6 @@ class GateKeeperConfig:
         self.full_trade = get_setting('gate_keeper.full_trade_threshold', self.full_trade)
 
 
-@dataclass
-class AIConfig:
-    """AI (Gemini) yapılandırması."""
-    provider: str = "gemini"
-    model: str = "gemini-2.5-flash"
-    fallback_models: List[str] = field(default_factory=lambda: ["gemini-2.0-flash"])
-    temperature: float = 0.3
-    max_retries: int = 3
-    api_key: str = ""
-    
-    def __post_init__(self):
-        self.api_key = get_env('GEMINI_API_KEY', '')
-        self.model = get_setting('ai.model', self.model)
-        self.fallback_models = get_setting('ai.fallback_models', self.fallback_models)
-        self.temperature = get_setting('ai.temperature', self.temperature)
-    
-    def is_configured(self) -> bool:
-        return bool(self.api_key)
 
 
 @dataclass
@@ -247,7 +229,6 @@ class AppConfig:
         self.exchange = ExchangeConfig()     # Borsa ayarları + API key'ler
         self.risk = RiskConfig()             # Risk yönetimi parametreleri
         self.gate = GateKeeperConfig()       # IC karar eşikleri
-        self.ai = AIConfig()                 # Gemini yapılandırması
         self.telegram = TelegramConfig()     # Telegram yapılandırması
         
         # Analiz ayarları (dict olarak)
@@ -263,7 +244,6 @@ class AppConfig:
         print("⚙️  YAPILANDIRMA DURUMU")
         print("=" * 60)
         print(f"  Bitget API : {'✅ Yapılandırılmış' if self.exchange.is_configured() else '❌ Eksik'}")
-        print(f"  Gemini API : {'✅ Yapılandırılmış' if self.ai.is_configured() else '❌ Eksik'}")
         print(f"  Telegram   : {'✅ Yapılandırılmış' if self.telegram.is_configured() else '❌ Eksik'}")
         print(f"  Sandbox    : {'⚠️  AÇIK (Demo)' if self.exchange.sandbox else '🔴 KAPALI (Canlı)'}")
         print(f"  Borsa      : {self.exchange.id.upper()}")

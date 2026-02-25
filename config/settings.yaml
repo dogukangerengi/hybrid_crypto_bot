@@ -102,16 +102,6 @@ scanner:
   top_n_coins: 29                            # Top N coin seç (daha geniş tarama)
   scan_interval_minutes: 60                  # Tarama aralığı
 
-# -----------------------------------------------------------------------------
-# AI AYARLARI (Adım 6 - Gemini)
-# -----------------------------------------------------------------------------
-ai:
-  model: "gemini-2.5-flash"
-  fallback_models:
-    - "gemini-2.0-flash"
-  temperature: 0.3                           # Düşük = daha tutarlı
-  max_retries: 3
-  min_confidence: 60        # 60 altı güven → trade açma
 
 
 # -----------------------------------------------------------------------------
