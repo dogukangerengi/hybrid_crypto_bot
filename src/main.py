@@ -76,7 +76,7 @@ logger = logging.getLogger(__name__)
 VERSION                = "2.1.0"
 MAX_COINS_PER_CYCLE    = 20
 DEFAULT_FWD_PERIOD     = 6
-MAX_OPEN_POSITIONS     = 5
+MAX_OPEN_POSITIONS     = 10
 MAX_CONSECUTIVE_ERRORS = 5
 ERROR_COOLDOWN_SECONDS = 300
 

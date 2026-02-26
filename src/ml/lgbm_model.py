@@ -593,9 +593,9 @@ class LGBMSignalModel:
         # prob >= 0.55 → IC yönünde işlem aç (küçük edge bile değerli)
         # prob < 0.45  → IC yönünün tersi veya WAIT
         # 0.45-0.55    → Belirsiz bölge → WAIT
-        if prob >= 0.53:
+        if prob >= 0.55:
             decision = MLDecision.from_direction(ic_direction)  # IC yönünde
-        elif prob < 0.47:
+        elif prob < 0.45:
             decision = MLDecision.WAIT                          # Model onaylamıyor
         else:
             decision = MLDecision.WAIT                          # Belirsiz bölge

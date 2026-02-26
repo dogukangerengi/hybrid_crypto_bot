@@ -450,7 +450,7 @@ class RiskManager:
         # --- STRATEJİ KURALLARI ---
         RISK_PERCENT = 0.02          # Stop olduğunda kasanın en fazla %2'si gitsin
         MAX_TOTAL_MARGIN = 0.65      # Kasanın sadece %65'i işlemlerde kullanılabilir
-        MAX_TRADES = 5               # Maksimum 5 işlem hedefleniyor
+        MAX_TRADES = 10               # Maksimum 5 işlem hedefleniyor
         MAX_LEVERAGE = 20.0          # İşlem başına maksimum 20x kaldıraç
         
         # 1. İşlem Başına Düşen Maksimum Marjin Limiti
@@ -492,10 +492,10 @@ class RiskManager:
             final_size = min_amount
 
         # Sonucu var olan objeyle döndür
-        from execution.risk_manager import PositionCalculation
-        
-        return PositionCalculation(
+        return PositionSizeResult(
             size=final_size,
+            value=final_size * entry_price,
+            risk_amount=risk_amount,
             margin_required=margin_used,
             leverage=leverage
         )
