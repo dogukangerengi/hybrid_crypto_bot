@@ -318,26 +318,26 @@ class MLTradingPipeline:
         result = CoinAnalysisResult(coin=coin, full_symbol=symbol)
 
         try:
-            # ── 1. Veri çek ─────────────────────────────────────────────────
-            # TRAIN_LIMIT=1000: 44 feature × 10x rule = 440 minimum sample.
-            # Dead-band ~%30 düşürür → 1000 bar → ~450-500 temiz sample.
-            # Diğer TF'ler analiz için orijinal limitle çekilir.
-            TRAIN_TF    = "1h"
-            TRAIN_LIMIT = 1000
+            # ── 1. Veri çek (Multi-Timeframe) ────────────────────────────────
+            # Her TF için ayrı OHLCV çekilir.
+            # all_data dict'i sonraki IC analizi ve feature engineering için kullanılır.
+            all_data = {}
+            for tf, limit in self.timeframes.items():
+                df_raw = self.fetcher.fetch_ohlcv(symbol, tf, limit=limit)
+                if df_raw is None or len(df_raw) < 50:
+                    continue
+                df_clean = self.preprocessor.full_pipeline(df_raw)
+                if df_clean is not None and len(df_clean) > 50:
+                    all_data[tf] = df_clean
 
-            df_raw = self.fetcher.fetch_ohlcv(symbol, TRAIN_TF, limit=TRAIN_LIMIT)
-            if df_raw is None or len(df_raw) < 200:
-                logger.error("❌ Yeterli veri çekilemedi")
-                return False
+            if not all_data:
+                result.status = "no_data"; return result
 
-            df_clean = self.preprocessor.full_pipeline(df_raw)
-            if df_clean is None or len(df_clean) < 100:
-                logger.error("❌ Preprocessing sonrası yetersiz veri")
-                return False
+            result.price = float(next(iter(all_data.values()))['close'].iloc[-1])
 
-            df_ind = self.calculator.calculate_all(df_clean)
-            df_ind = self.calculator.add_forward_returns(df_ind, periods=[self.fwd_period])
             # ── 2. İndikatörler ──────────────────────────────────────────────
+            # Her TF için indikatörler ve forward return hesaplanır.
+            # indicator_data: IC analizi için kullanılır.
             indicator_data = {}
             for tf, df in all_data.items():
                 df_ind = self.calculator.calculate_all(df)
@@ -1404,14 +1404,14 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 75) -> No
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description=f"ML Crypto Bot v{VERSION}")
+    parser = argparse.ArgumentParser(description="ML Crypto Bot")
     parser.add_argument("--live",     action="store_true", help="Canlı trade")
-    parser.add_argument("--top",      type=int, default=15, help="Top N coin")
+    parser.add_argument("--top",      type=int, default=15, help="Top N coin") # BURAYA DİKKAT
     parser.add_argument("--schedule", action="store_true", help="Scheduler modu")
-    parser.add_argument("-i","--interval", type=int, default=75, help="Aralık (dk)")
+    parser.add_argument("-i","--interval", type=int, default=75, help="Aralık")
     parser.add_argument("--report",   action="store_true", help="Performans raporu")
     parser.add_argument("--train",    action="store_true", help="Sadece eğitim")
-    parser.add_argument("--verbose",  action="store_true", help="Debug çıktısı")
+    parser.add_argument("--verbose",  action="store_true", help="Debug")
     args = parser.parse_args()
 
     if args.verbose:
@@ -1438,20 +1438,8 @@ def main():
         report = pipeline.run_cycle()
         logger.info(f"Döngü: {report.status.value}")
 
-
 if __name__ == "__main__":
-    import sys
-    import argparse
-    import time
-    import schedule
-    
-    parser = argparse.ArgumentParser(description="ML Trading Bot")
-    parser.add_argument('--train', action='store_true', help='İlk modeli manuel eğitir')
-    parser.add_argument('--schedule', action='store_true', help='Botu 15 dakikada bir döngüye sokar')
-    parser.add_argument('--live', action='store_true', help='Canlı (Gerçek Para) modu')
-    args = parser.parse_args()
-
-    pipeline = MLTradingPipeline(dry_run=not args.live)
+    main()
 
     # ---------------------------------------------------------
     # DÜZELTME: BORSADAN VEYA SANAL KASADAN BAKİYEYİ ÇEK!

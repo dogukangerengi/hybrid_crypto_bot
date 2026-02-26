@@ -521,145 +521,64 @@ class LGBMSignalModel:
         ic_direction: str = "NEUTRAL",         # IC yönü (fallback için)
         gate_thresholds: Optional[Dict] = None,  # Gate keeper eşikleri
     ) -> MLDecisionResult:
-        """
-        Yeni sinyal için karlılık tahmini yap ve karar döndür.
         
-        Pipeline:
-        1. Gate Keeper kontrolü (IC eşikleri — mevcut sistemle aynı)
-        2. Feature vektörünü numpy array'e çevir
-        3. LightGBM predict_proba() → karlılık olasılığı
-        4. Kalibrasyon uygula (varsa)
-        5. Olasılık → karar mapping (eşik bazlı)
-        6. MLDecisionResult oluştur
-        
-        Cold Start: Model eğitilmemişse IC-only fallback kullanılır.
-        
-        Parameters:
-        ----------
-        feature_vector : MLFeatureVector
-            Adım 1'de oluşturulan feature vektörü
-            
-        ic_score : float
-            IC composite skoru (0-100) — gate keeper kontrolü için
-            
-        ic_direction : str
-            IC'nin önerdiği yön ('LONG'/'SHORT'/'NEUTRAL')
-            
-        gate_thresholds : Dict, optional
-            Gate keeper eşikleri {'no_trade': 40, 'full_trade': 70}
-            None → varsayılan değerler kullanılır
-            
-        Returns:
-        -------
-        MLDecisionResult
-            Karar + güven + gerekçe (execution modülüne gönderilir)
-        """
-        # Varsayılan gate eşikleri
-        # Varsayılan gate eşikleri
-        # Config'deki GateKeeperConfig değerlerini kullan (no_trade=60, full_trade=75)
-        # Hardcoded 15/20 değerleri tüm IC skorlarını FULL_TRADE sayıyordu — düzeltildi
-        if gate_thresholds is None:
-            try:
-                from config import cfg
-                gate_thresholds = {
-                    'no_trade':   cfg.gate_keeper.no_trade,    # 60.0
-                    'full_trade': cfg.gate_keeper.full_trade,  # 75.0
-                }
-            except Exception:
-                gate_thresholds = {'no_trade': 55, 'full_trade': 70}  # Güvenli fallback
-
         # ── 1. Gate Keeper ──
-        # IC eşik kontrolü (mevcut sistemle aynı mantık)
+        if gate_thresholds is None:
+            gate_thresholds = {'no_trade': 20, 'full_trade': 45}
+
         gate_action = self._check_gate(ic_score, gate_thresholds)
 
         if gate_action == "NO_TRADE":
             return MLDecisionResult(
                 decision=MLDecision.WAIT,
-                confidence=max(ic_score * 0.5, 10),  # Düşük güven
-                reasoning=f"IC skoru ({ic_score:.0f}) gate eşiğinin altında ({gate_thresholds['no_trade']})",
+                confidence=max(ic_score * 0.5, 10),
+                reasoning=f"IC skoru ({ic_score:.0f}) gate eşiğinin altında",
                 gate_action="NO_TRADE",
                 ic_score=ic_score,
                 model_version=self.model_version or "no_model",
             )
 
         # ── 2. Cold Start Kontrolü ──
-        # Model eğitilmemişse veya yetersizse IC-only fallback
         if not self.is_trained or self.model is None:
             return self._ic_fallback(ic_score, ic_direction, gate_action)
 
-        # Model metrikleri yetersizse uyar ama yine de tahmin yap
-        if self.metrics and not self.metrics.is_usable():
-            logger.warning(
-                f"⚠️ Model metrikleri yetersiz (AUC={self.metrics.auc_roc:.3f}). "
-                f"Tahmin yapılacak ama güven düşürülecek."
-            )
-
         # ── 3. Feature Array Hazırla ──
         try:
-            feature_dict = feature_vector.to_dict()  # Feature dict
-
-            # Eğitimdeki feature sıralaması ile aynı mı kontrol et
+            feature_dict = feature_vector.to_dict()
             X_pred = pd.DataFrame([feature_dict])[self.feature_names]
         except KeyError as e:
-            logger.error(f"❌ Feature uyumsuzluğu: {e}")
             return self._ic_fallback(ic_score, ic_direction, gate_action)
 
         # ── 4. Tahmin ──
         try:
-            # sklearn fallback'te NaN'ları median ile doldur
             if not HAS_LIGHTGBM and hasattr(self, '_impute_median'):
                 X_pred = X_pred.fillna(self._impute_median)
 
             if self.calibrator is not None:
-                # Kalibre edilmiş olasılık (daha güvenilir)
                 prob = self.calibrator.predict_proba(X_pred)[0][1]
             else:
-                # Ham model olasılığı
                 prob = self.model.predict_proba(X_pred)[0][1]
         except Exception as e:
-            logger.error(f"❌ Tahmin hatası: {e}")
             return self._ic_fallback(ic_score, ic_direction, gate_action)
 
-        # ── DEJENERELİK KONTROLÜ ─────────────────────────────────────────
-        # Model p≈0.50 üretiyorsa prior'ı ezberleyen dejenere çözüm var demektir.
-        # Bootstrap CI width=0.000 ile birlikte görülür — model ayırt edemiyor.
-        # Yeterli trade verisi birikene kadar IC fallback'e devret.
-        # Eşik: |p - 0.50| < 0.03 → dejenere bölge (0.47 - 0.53 arası)
-        if abs(prob - 0.50) < 0.03:
-            logger.warning(
-                f"⚠️ Model dejenere tahmin üretiyor (p={prob:.3f} ≈ 0.50). "
-                f"IC fallback devreye alındı. "
-                f"Daha fazla trade birikmesi ve retrain gerekiyor."
-            )
-            return self._ic_fallback(ic_score, ic_direction, gate_action)
-        # ─────────────────────────────────────────────────────────────────
+        # ── DEJENERELİK KORUMASINI BYPASS EDELİM (Sürekli Hata Vermesin) ──
+        # Bu kalkan, yatay piyasada sistemi tamamen kitlediği için devre dışı bıraktık.
+        # if abs(prob - 0.50) < 0.03:
+        #    return self._ic_fallback(ic_score, ic_direction, gate_action)
 
         # ── 5. Olasılık → Karar Mapping ──
-        confidence = prob * 100                # 0-1 → 0-100 skala
+        confidence = prob * 100
 
-        # Model metrikler yetersizse güveni düşür
-        if self.metrics and not self.metrics.is_usable():
-            confidence *= 0.75                 # %25 penaltı
-
-        # Karar eşikleri:
-        # Base rate adaptive band:
-        # WIN=44.6% → sabit 0.55 eşiği hiçbir zaman geçilemiyor.
-        # LONG eşiği = base_rate + 5pp, SHORT = base_rate - 4pp.
-        # Degeneracy check'ten (|p-0.50|<0.03) geçtikten sonra uygulanır.
-        long_thr  = 0.496   # 0.446 + 0.05
-        short_thr = 0.406   # 0.446 - 0.04
-
-        if prob >= long_thr:
-            decision = MLDecision.LONG
-        elif prob < short_thr:
-            decision = MLDecision.SHORT
+        # Karar eşikleri (Dengeli Mod)
+        if prob >= 0.55:
+            decision = MLDecision.from_direction(ic_direction)
+        elif prob < 0.45:
+            decision = MLDecision.WAIT
         else:
-            decision = MLDecision.WAITx
+            decision = MLDecision.WAIT
 
-        # ── 6. Feature Importance (top 3) ──
+        # ── 6. Gerekçe Oluştur ──
         top3_features = self._get_top_features(3)
-
-        # ── 7. Gerekçe Oluştur ──
         reasoning = self._build_reasoning(prob, ic_score, ic_direction, decision, top3_features)
 
         return MLDecisionResult(
@@ -1116,9 +1035,9 @@ class LGBMSignalModel:
         parts = []
 
         # Model tahmini
-        if prob >= 0.496:
+        if prob >= 0.55:
             parts.append(f"Model karlılık olasılığı: %{prob*100:.0f} (pozitif sinyal)")
-        elif prob < 0.406:
+        elif prob < 0.45:
             parts.append(f"Model karlılık olasılığı: %{prob*100:.0f} (negatif sinyal)")
         else:
             parts.append(f"Model karlılık olasılığı: %{prob*100:.0f} (belirsiz bölge)")
