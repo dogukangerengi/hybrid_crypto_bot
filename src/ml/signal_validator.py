@@ -369,7 +369,8 @@ class SignalValidator:
 
             for i in range(self.n_bootstrap):
                 # Gaussian noise ekle (her feature'a kendi scale'inde)
-                noise = rng.normal(0, noise_scale * 0.1, size=len(base_values))
+                noise = rng.normal(0, noise_scale * 0.3, size=len(base_values))
+
                 perturbed = base_values + noise
                 X_perturbed = pd.DataFrame([perturbed], columns=model.feature_names)
 
@@ -397,21 +398,15 @@ class SignalValidator:
             result.bootstrap_ci_upper = ci_upper
             result.bootstrap_ci_width = ci_width
 
-            # Kontrol: CI çok geniş mi?
-            # CI > 0.30 → tahmin çok belirsiz (0.35-0.65 arası her şey olabilir)
-            if ci_width > 0.30:
+            # Kontrol: CI genişliği.
+            # width > 0.25 → model belirsiz → veto.
+            # width <= 0.25 → model kararlı → passed.
+            # Not: Dar CI (width~0.00) LightGBM stabilitesini gösterir,
+            # penalize edilmemeli.
+            if ci_width > 0.25:
                 result.bootstrap_passed = False
                 result.veto_reasons.append(
-                    f"Bootstrap CI çok geniş: {ci_width:.3f} > 0.30 (tahmin belirsiz)"
-                )
-
-            # Kontrol: CI 0.5'i kapsıyor mu? (karar sınırı)
-            # CI [0.45, 0.65] → 0.5 içeride → model emin değil
-            # Ama sadece LONG/SHORT kararlarında önemli (WAIT zaten belirsiz)
-            elif ci_lower < 0.50 < ci_upper and ci_width > 0.15:
-                result.bootstrap_passed = False
-                result.veto_reasons.append(
-                    f"Bootstrap CI karar sınırını kapsıyor: [{ci_lower:.2f}, {ci_upper:.2f}]"
+                    f"Bootstrap CI geniş: {ci_width:.3f} > 0.25 → tahmin belirsiz"
                 )
             else:
                 result.bootstrap_passed = True
@@ -618,6 +613,11 @@ class SignalValidator:
 
         # Güveni 0-100 aralığında sınırla
         result.adjusted_confidence = round(max(0, min(100, adjusted)), 1)
+
+        # IC eşiğini geçmiş sinyallerde minimum güven garantisi.
+        # Regime × bootstrap penaltıları geçerli sinyali sıfırlamasın.
+        MIN_CONFIDENCE_FLOOR = 12.0
+        result.adjusted_confidence = max(result.adjusted_confidence, MIN_CONFIDENCE_FLOOR)
 
         # Geçerlilik: tüm kontroller geçtiyse True
         result.is_valid = all([

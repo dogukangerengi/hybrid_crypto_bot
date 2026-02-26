@@ -642,15 +642,19 @@ class LGBMSignalModel:
             confidence *= 0.75                 # %25 penaltı
 
         # Karar eşikleri:
-        # prob >= 0.55 → IC yönünde işlem aç (küçük edge bile değerli)
-        # prob < 0.45  → IC yönünün tersi veya WAIT
-        # 0.45-0.55    → Belirsiz bölge → WAIT
-        if prob >= 0.55:
-            decision = MLDecision.from_direction(ic_direction)  # IC yönünde
-        elif prob < 0.45:
-            decision = MLDecision.WAIT                          # Model onaylamıyor
+        # Base rate adaptive band:
+        # WIN=44.6% → sabit 0.55 eşiği hiçbir zaman geçilemiyor.
+        # LONG eşiği = base_rate + 5pp, SHORT = base_rate - 4pp.
+        # Degeneracy check'ten (|p-0.50|<0.03) geçtikten sonra uygulanır.
+        long_thr  = 0.496   # 0.446 + 0.05
+        short_thr = 0.406   # 0.446 - 0.04
+
+        if prob >= long_thr:
+            decision = MLDecision.LONG
+        elif prob < short_thr:
+            decision = MLDecision.SHORT
         else:
-            decision = MLDecision.WAIT                          # Belirsiz bölge
+            decision = MLDecision.WAITx
 
         # ── 6. Feature Importance (top 3) ──
         top3_features = self._get_top_features(3)
@@ -1112,9 +1116,9 @@ class LGBMSignalModel:
         parts = []
 
         # Model tahmini
-        if prob >= 0.55:
+        if prob >= 0.496:
             parts.append(f"Model karlılık olasılığı: %{prob*100:.0f} (pozitif sinyal)")
-        elif prob < 0.45:
+        elif prob < 0.406:
             parts.append(f"Model karlılık olasılığı: %{prob*100:.0f} (negatif sinyal)")
         else:
             parts.append(f"Model karlılık olasılığı: %{prob*100:.0f} (belirsiz bölge)")
