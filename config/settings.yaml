@@ -46,9 +46,9 @@ risk:
 # IC Güven > 45  → Tam işlem (AI + trade)
 # ⚠️ Sadece test için — canlıya geçmeden 50/62/62 veya üstüne çek
 gate_keeper:
-  no_trade_threshold: 50.0      # IC < 50 → kesinlikle trade yapma
-  report_only_threshold: 62.0   # IC 50-62 → sadece izle, giriş yok
-  full_trade_threshold: 70.0    # IC > 70 → trade aç (canlı için bu eşik)
+  no_trade_threshold: 10.0      # avg|IC| < 0.10  → işlem yok (finans standardı alt sınırı)
+  report_only_threshold: 15.0   # avg|IC| 0.10-0.15 → izle
+  full_trade_threshold: 20.0    # avg|IC| > 0.20  → trade aç
 # ANALİZ AYARLARI
 # -----------------------------------------------------------------------------
 analysis:

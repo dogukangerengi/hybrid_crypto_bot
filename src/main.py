@@ -319,20 +319,24 @@ class MLTradingPipeline:
 
         try:
             # ── 1. Veri çek ─────────────────────────────────────────────────
-            all_data = {}
-            for tf, limit in self.timeframes.items():
-                df_raw = self.fetcher.fetch_ohlcv(symbol, tf, limit=limit)
-                if df_raw is None or len(df_raw) < 50:
-                    continue
-                df_clean = self.preprocessor.full_pipeline(df_raw)
-                if df_clean is not None and len(df_clean) > 50:
-                    all_data[tf] = df_clean
+            # TRAIN_LIMIT=1000: 44 feature × 10x rule = 440 minimum sample.
+            # Dead-band ~%30 düşürür → 1000 bar → ~450-500 temiz sample.
+            # Diğer TF'ler analiz için orijinal limitle çekilir.
+            TRAIN_TF    = "1h"
+            TRAIN_LIMIT = 1000
 
-            if not all_data:
-                result.status = "no_data"; return result
+            df_raw = self.fetcher.fetch_ohlcv(symbol, TRAIN_TF, limit=TRAIN_LIMIT)
+            if df_raw is None or len(df_raw) < 200:
+                logger.error("❌ Yeterli veri çekilemedi")
+                return False
 
-            result.price = float(next(iter(all_data.values()))['close'].iloc[-1])
+            df_clean = self.preprocessor.full_pipeline(df_raw)
+            if df_clean is None or len(df_clean) < 100:
+                logger.error("❌ Preprocessing sonrası yetersiz veri")
+                return False
 
+            df_ind = self.calculator.calculate_all(df_clean)
+            df_ind = self.calculator.add_forward_returns(df_ind, periods=[self.fwd_period])
             # ── 2. İndikatörler ──────────────────────────────────────────────
             indicator_data = {}
             for tf, df in all_data.items():
@@ -644,9 +648,121 @@ class MLTradingPipeline:
                     logger.info(f"   ⚠️ {result.coin} atlandı: Canlı borsada max pozisyona ({MAX_OPEN_POSITIONS}) ulaşıldı.")
                     return result
 
+                # ── Sembol bazlı açık pozisyon kontrolü ──────────────────────
+                # MAX_OPEN_POSITIONS toplam sayıya bakar; bu kontrol ise
+                # bu sembolün özelinde pozisyon var mı sorusunu yanıtlar.
+                # Aynı sembol için tekrar giriş yapılmasını engeller.
+                try:
+                    open_symbols = self.executor.get_open_position_symbols()
+                except Exception:
+                    open_symbols = set()        # Hata durumunda güvenli fallback
+
+                # Sembol hem tam eşleşme hem USDT-eklenmiş hali için kontrol
+                candidate_symbols = {
+                    result.coin,
+                    f"{result.coin}USDT",
+                    result.coin.replace('/USDT:USDT', 'USDT'),
+                }
+
+                if open_symbols & candidate_symbols:
+                    result.status = "already_open"
+                    logger.info(
+                        f"   ⏭️  {result.coin} atlandı: Borsada zaten açık "
+                        f"pozisyon mevcut → {open_symbols & candidate_symbols}"
+                    )
+                    return result
+
+                # ── Mevcut SL/TP emir kontrolü ───────────────────────────────
+                # Pozisyon yeni açılmış ama SL/TP gönderilmemiş olabilir
+                # (kısmi başarısızlık senaryosu). Mevcutsa tekrar gönderme.
+                try:
+                    symbol_for_check  = list(candidate_symbols)[0]
+                    has_existing_orders = self.executor.has_tp_sl_orders(
+                        symbol_for_check
+                    )
+                except Exception:
+                    has_existing_orders = False  # Hata → güvenli taraf: gönder
+
+                # Zaten SL/TP varsa skip_sl/skip_tp=True ile atla
                 # BitgetExecutor'a emri SL ve TP'si ile yolla!
-                exec_res = self.executor.execute_trade(trade_calc)
-                result.execution_result = exec_res
+                # ── Sembol bazlı açık pozisyon kontrolü ──────────────────────
+                # MAX_OPEN_POSITIONS toplam sayıya bakar; bu kontrol ise
+                # bu sembolün özelinde pozisyon var mı sorusunu yanıtlar.
+                # Aynı sembol için tekrar giriş yapılmasını engeller.
+                try:
+                    open_symbols = self.executor.get_open_position_symbols()
+                except Exception:
+                    open_symbols = set()        # Hata durumunda güvenli fallback
+
+                # Sembol hem tam eşleşme hem USDT-eklenmiş hali için kontrol
+                candidate_symbols = {
+                    result.coin,
+                    f"{result.coin}USDT",
+                    result.coin.replace('/USDT:USDT', 'USDT'),
+                }
+
+                if open_symbols & candidate_symbols:
+                    result.status = "already_open"
+                    logger.info(
+                        f"   ⏭️  {result.coin} atlandı: Borsada zaten açık "
+                        f"pozisyon mevcut → {open_symbols & candidate_symbols}"
+                    )
+                    return result
+
+                # ── Mevcut SL/TP emir kontrolü ───────────────────────────────
+                # Pozisyon yeni açılmış ama SL/TP gönderilmemiş olabilir
+                # (kısmi başarısızlık senaryosu). Mevcutsa tekrar gönderme.
+                try:
+                    symbol_for_check  = list(candidate_symbols)[0]
+                    has_existing_orders = self.executor.has_tp_sl_orders(
+                        symbol_for_check
+                    )
+                except Exception:
+                    has_existing_orders = False  # Hata → güvenli taraf: gönder
+
+                # Zaten SL/TP varsa skip_sl/skip_tp=True ile atla
+                # ── Sembol bazlı açık pozisyon kontrolü ──────────────────────
+                # MAX_OPEN_POSITIONS toplam sayıya bakar; bu kontrol ise
+                # bu sembolün özelinde pozisyon var mı sorusunu yanıtlar.
+                # Aynı sembol için tekrar giriş yapılmasını engeller.
+                try:
+                    open_symbols = self.executor.get_open_position_symbols()
+                except Exception:
+                    open_symbols = set()        # Hata durumunda güvenli fallback
+
+                # Sembol hem tam eşleşme hem USDT-eklenmiş hali için kontrol
+                candidate_symbols = {
+                    result.coin,
+                    f"{result.coin}USDT",
+                    result.coin.replace('/USDT:USDT', 'USDT'),
+                }
+
+                if open_symbols & candidate_symbols:
+                    result.status = "already_open"
+                    logger.info(
+                        f"   ⏭️  {result.coin} atlandı: Borsada zaten açık "
+                        f"pozisyon mevcut → {open_symbols & candidate_symbols}"
+                    )
+                    return result
+
+                # ── Mevcut SL/TP emir kontrolü ───────────────────────────────
+                # Pozisyon yeni açılmış ama SL/TP gönderilmemiş olabilir
+                # (kısmi başarısızlık senaryosu). Mevcutsa tekrar gönderme.
+                try:
+                    symbol_for_check  = list(candidate_symbols)[0]
+                    has_existing_orders = self.executor.has_tp_sl_orders(
+                        symbol_for_check
+                    )
+                except Exception:
+                    has_existing_orders = False  # Hata → güvenli taraf: gönder
+
+                # Zaten SL/TP varsa skip_sl/skip_tp=True ile atla
+                # BitgetExecutor'a emri SL ve TP'si ile yolla!
+                exec_res = self.executor.execute_trade(
+                    trade_calc,
+                    skip_sl=has_existing_orders,  # Mevcut SL varsa gönderme
+                    skip_tp=has_existing_orders,  # Mevcut TP varsa gönderme
+                )
 
                 if exec_res.success:
                     result.trade_executed = True
@@ -1040,57 +1156,81 @@ class MLTradingPipeline:
         logger.info(f"🎓 İlk eğitim: {symbol} 1h verisi kullanılıyor...")
 
         try:
-            df_raw = self.fetcher.fetch_ohlcv(symbol, "1h", limit=500)
+            # TRAIN_LIMIT=1000: 44 feature × 10x sample/feature ratio = 440 minimum.
+            # Dead-band filtresi ~%30-35 sample düşürür →
+            # 1000 raw bar → ~430-500 temiz eğitim sample'ı.
+            # 1h TF: intraday gürültü-sinyal oranı en düşük periyot.
+            TRAIN_TF    = "1h"
+            TRAIN_LIMIT = 1000
+
+            df_raw = self.fetcher.fetch_ohlcv(symbol, TRAIN_TF, limit=TRAIN_LIMIT)
             if df_raw is None or len(df_raw) < 200:
                 logger.error("❌ Yeterli veri çekilemedi")
                 return False
 
             df_clean = self.preprocessor.full_pipeline(df_raw)
-            df_ind   = self.calculator.calculate_all(df_clean)
-            df_ind   = self.calculator.add_forward_returns(df_ind, periods=[self.fwd_period])
-            
+            if df_clean is None or len(df_clean) < 100:
+                logger.error("❌ Preprocessing sonrası yetersiz veri")
+                return False
+
+            df_ind = self.calculator.calculate_all(df_clean)
+            df_ind = self.calculator.add_forward_returns(df_ind, periods=[self.fwd_period])
+
             target_col = f'fwd_ret_{self.fwd_period}'
+            if target_col not in df_ind.columns:
+                logger.error(f"❌ Target kolon bulunamadı: {target_col}")
+                return False
 
             # FeatureEngineer için simüle edilmiş temel analiz objesi
             class DummyAnalysis:
                 def __init__(self, sym):
-                    self.symbol = sym
-                    self.coin = sym.split('/')[0]
-                    self.price = 0.0
-                    self.change_24h = 0.0
-                    self.volume_24h = 0.0
-                    self.ic_confidence = 65.0
-                    self.ic_direction = 'LONG'
+                    self.symbol          = sym
+                    self.coin            = sym.split('/')[0]
+                    self.price           = 0.0
+                    self.change_24h      = 0.0
+                    self.volume_24h      = 0.0
+                    self.ic_confidence   = 65.0
+                    self.ic_direction    = 'LONG'
                     self.significant_count = 10
-                    self.market_regime = 'trending'
-                    self.category_tops = {}
-                    self.tf_rankings = []
-                    self.atr = 0.0
-                    self.atr_pct = 0.0
-                    self.sl_price = 0.0
-                    self.tp_price = 0.0
-                    self.risk_reward = 0.0
-                    self.position_size = 0.0
-                    self.leverage = 1
+                    self.market_regime   = 'trending'
+                    self.category_tops   = {}
+                    self.tf_rankings     = []
+                    self.atr             = 0.0
+                    self.atr_pct         = 0.0
+                    self.sl_price        = 0.0
+                    self.tp_price        = 0.0
+                    self.risk_reward     = 0.0
+                    self.position_size   = 0.0
+                    self.leverage        = 1
 
             analysis_stub = DummyAnalysis(symbol)
             rows_X = []
             rows_y = []
 
             logger.info("  ⚙️ Feature matrisi oluşturuluyor (zaman yolculuğu simülasyonu)...")
-            
+
             # İlk 100 barı indikatörlerin dolması (warm-up) için atlıyoruz
             start_idx = 100
-            end_idx = len(df_ind) - self.fwd_period
+            end_idx   = len(df_ind) - self.fwd_period
+
+            # Dead-band threshold: |fwd_ret| < MIN_MOVE olan barlar
+            # gürültü bölgesinde → eğitimden çıkar.
+            # %0.8: 1h crypto'da transaction cost'u geçemeyen hareketler.
+            # Recall=1.0 degeneracy'yi önler, label balance düzelir.
+            MIN_MOVE = 0.008
 
             for i in range(start_idx, end_idx):
                 target = df_ind[target_col].iloc[i]
                 if pd.isna(target):
                     continue
-                
-                # Sadece i. bara kadar olan geçmişi veriyoruz (geleceği görmemesi için)
+
+                # Nötr bar filtresi — gürültüyü eğitim setinden çıkar
+                if abs(target) < MIN_MOVE:
+                    continue
+
+                # Sadece i. bara kadar olan geçmişi veriyoruz (look-ahead bias önlemi)
                 df_slice = df_ind.iloc[:i+1]
-                
+
                 # Dinamik güncellemeler
                 analysis_stub.price = float(df_slice['close'].iloc[-1])
                 try:
@@ -1103,7 +1243,8 @@ class MLTradingPipeline:
                     analysis=analysis_stub,
                     ohlcv_df=df_slice
                 )
-                
+
+                # Binary label: pozitif yönlü hareket → 1 (LONG), negatif → 0 (SHORT)
                 rows_X.append(fv.to_dict())
                 rows_y.append(1 if target > 0 else 0)
 
@@ -1111,11 +1252,23 @@ class MLTradingPipeline:
                 logger.error(f"❌ Yetersiz eğitim verisi: {len(rows_X)} < 30")
                 return False
 
+            # Dead-band sonrası class balance raporu
+            # Sağlıklı aralık: WIN rate %40-60 arası.
+            # Dışındaysa → MIN_MOVE kalibrasyonu gerekir.
+            n_total_raw = end_idx - start_idx
+            n_filtered  = n_total_raw - len(rows_X)
+            logger.info(
+                f"  Eğitim Verisi : {len(rows_X)} satır × "
+                f"{len(rows_X[0]) if rows_X else 0} feature | "
+                f"WIN={sum(rows_y)/len(rows_y):.1%} | "
+                f"Dead-band: {n_filtered}/{n_total_raw} bar çıkarıldı "
+                f"({n_filtered/max(n_total_raw,1):.1%}) | "
+                f"MIN_MOVE={MIN_MOVE:.3f}"
+            )
+
             # Modeli eğit
             X = pd.DataFrame(rows_X).replace([np.inf, -np.inf], np.nan)
             y = pd.Series(rows_y)
-
-            logger.info(f"  Eğitim Verisi: {X.shape[0]} satır × {X.shape[1]} feature | WIN={y.mean():.1%}")
 
             metrics = self.lgbm_model.train(X, y)
             # ==========================================

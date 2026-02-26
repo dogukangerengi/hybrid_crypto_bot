@@ -400,12 +400,44 @@ class LGBMSignalModel:
         X_val = X_clean.iloc[train_end + purge_gap:]   # Validasyon feature'ları (purge gap sonrası)
         y_val = y.iloc[train_end + purge_gap:]          # Validasyon hedefi
 
+        y_val = y.iloc[train_end + purge_gap:]          # Validasyon hedefi
+
+        # ── Val set class balance kontrolü ──────────────────────────────
+        # Temporal split trending dönemde tek class val set üretebilir.
+        # roc_auc_score tek class'ta tanımsız → AUC=0.0 sessiz hata.
+        # Çözüm: val set'inde her iki class yoksa window'u genişlet.
+        # MAX_VAL_EXPAND: kaç kat genişletmeye izin ver (bellek/overfitting dengesi).
+        MAX_VAL_EXPAND = 3
+        expand_count   = 0
+        while len(y_val.unique()) < 2 and expand_count < MAX_VAL_EXPAND:
+            expand_count += 1
+            val_size     = val_size + max(5, val_size // 2)  # %50 büyüt
+            train_end    = max(MIN_SAMPLES_TRAIN, n_total - val_size - purge_gap)
+            X_val        = X_clean.iloc[train_end + purge_gap:]
+            y_val        = y.iloc[train_end + purge_gap:]
+            X_train      = X_clean.iloc[:train_end]
+            y_train      = y.iloc[:train_end]
+            logger.warning(
+                f"⚠️ Val set tek class — window genişletildi "
+                f"(expand #{expand_count} | val_size={len(y_val)} | "
+                f"+Rate={y_val.mean():.1%})"
+            )
+
+        # Son kontrol: hâlâ tek class ise train set'ini validation olarak kullan
+        if len(y_val.unique()) < 2:
+            logger.warning(
+                "⚠️ Val set genişletme başarısız — train set ile değerlendirme yapılıyor"
+            )
+            X_val   = X_train.copy()
+            y_val   = y_train.copy()
+
         if self.verbose:
             logger.info(
                 f"  📐 Walk-Forward Split: "
                 f"Train={len(X_train)} | Purge={purge_gap} | Val={len(X_val)} | "
                 f"+Rate: {y_train.mean():.1%} (train) / {y_val.mean():.1%} (val)"
             )
+
 
         # ── 2. Model Eğitimi ──
         params = self._get_params(len(X_train))  # Adaptif hiperparametreler
@@ -437,34 +469,30 @@ class LGBMSignalModel:
             # sklearn'de early stopping yok → n_estimators sabit kalır
             # Validasyon seti kalibrasyon için kullanılacak
 
-        # ── 3. Olasılık Kalibrasyonu (Platt Scaling) ──
-        # LightGBM'in ham olasılıkları genellikle well-calibrated değil
-        # Platt Scaling: sigmoid fit ile kalibre et
-        try:
-            X_val_for_cal = X_val if HAS_LIGHTGBM else X_val.fillna(self._impute_median)
-
-            # sklearn >= 1.6'da 'prefit' kaldırıldı, cv=2 ile çalıştır
-            # prefit destekliyorsa onu kullan (daha doğru), yoksa mini cv
+        # ── 3. Olasılık Kalibrasyonu ────────────────────────────────────
+        # LightGBM: kendi objective fonksiyonu (binary cross-entropy) zaten
+        # iyi kalibre olasılık üretir → Platt Scaling gereksiz, bypass et.
+        # sklearn GradientBoosting: ham skorlar kalibre değil → sigmoid fit.
+        if HAS_LIGHTGBM:
+            # LightGBM için calibrator None — _evaluate() direkt model.predict_proba() kullanır
+            self.calibrator = None
+        else:
+            # sklearn fallback: Platt Scaling ile kalibre et
             try:
+                X_cal          = pd.concat([
+                                     X_train.fillna(self._impute_median),
+                                     X_val.fillna(self._impute_median),
+                                 ], ignore_index=True)
+                y_cal          = pd.concat([y_train, y_val], ignore_index=True)
                 self.calibrator = CalibratedClassifierCV(
-                    self.model, method='sigmoid', cv='prefit',
-                )
-                self.calibrator.fit(X_val_for_cal, y_val)
-            except (ValueError, TypeError):
-                # prefit desteklenmiyorsa → 2-fold CV ile kalibre et
-                # Not: Bu eğitim setinde yeniden fit yapar ama Platt Scaling
-                # sadece sigmoid parametreleri öğreniyor, model ağırlıkları değişmiyor
-                X_cal = pd.concat([X_train if HAS_LIGHTGBM else X_train.fillna(self._impute_median),
-                                   X_val_for_cal], ignore_index=True)
-                y_cal = pd.concat([y_train, y_val], ignore_index=True)
-                self.calibrator = CalibratedClassifierCV(
-                    estimator=GradientBoostingClassifier(**params) if not HAS_LIGHTGBM else lgb.LGBMClassifier(**params),
-                    method='sigmoid', cv=2,
+                    estimator=GradientBoostingClassifier(**params),
+                    method='sigmoid',
+                    cv=2,
                 )
                 self.calibrator.fit(X_cal, y_cal)
-        except Exception as e:
-            logger.warning(f"⚠️ Kalibrasyon başarısız: {e}. Ham olasılıklar kullanılacak.")
-            self.calibrator = None
+            except Exception as e:
+                logger.warning(f"⚠️ Kalibrasyon başarısız: {e}. Ham olasılıklar kullanılacak.")
+                self.calibrator = None
 
         # ── 4. Metrik Hesaplama ──
         metrics = self._evaluate(X_val, y_val, X_train, y_train)
@@ -527,8 +555,18 @@ class LGBMSignalModel:
             Karar + güven + gerekçe (execution modülüne gönderilir)
         """
         # Varsayılan gate eşikleri
+        # Varsayılan gate eşikleri
+        # Config'deki GateKeeperConfig değerlerini kullan (no_trade=60, full_trade=75)
+        # Hardcoded 15/20 değerleri tüm IC skorlarını FULL_TRADE sayıyordu — düzeltildi
         if gate_thresholds is None:
-            gate_thresholds = {'no_trade': 15, 'full_trade': 20}
+            try:
+                from config import cfg
+                gate_thresholds = {
+                    'no_trade':   cfg.gate_keeper.no_trade,    # 60.0
+                    'full_trade': cfg.gate_keeper.full_trade,  # 75.0
+                }
+            except Exception:
+                gate_thresholds = {'no_trade': 55, 'full_trade': 70}  # Güvenli fallback
 
         # ── 1. Gate Keeper ──
         # IC eşik kontrolü (mevcut sistemle aynı mantık)
@@ -581,6 +619,20 @@ class LGBMSignalModel:
         except Exception as e:
             logger.error(f"❌ Tahmin hatası: {e}")
             return self._ic_fallback(ic_score, ic_direction, gate_action)
+
+        # ── DEJENERELİK KONTROLÜ ─────────────────────────────────────────
+        # Model p≈0.50 üretiyorsa prior'ı ezberleyen dejenere çözüm var demektir.
+        # Bootstrap CI width=0.000 ile birlikte görülür — model ayırt edemiyor.
+        # Yeterli trade verisi birikene kadar IC fallback'e devret.
+        # Eşik: |p - 0.50| < 0.03 → dejenere bölge (0.47 - 0.53 arası)
+        if abs(prob - 0.50) < 0.03:
+            logger.warning(
+                f"⚠️ Model dejenere tahmin üretiyor (p={prob:.3f} ≈ 0.50). "
+                f"IC fallback devreye alındı. "
+                f"Daha fazla trade birikmesi ve retrain gerekiyor."
+            )
+            return self._ic_fallback(ic_score, ic_direction, gate_action)
+        # ─────────────────────────────────────────────────────────────────
 
         # ── 5. Olasılık → Karar Mapping ──
         confidence = prob * 100                # 0-1 → 0-100 skala
@@ -884,19 +936,24 @@ class LGBMSignalModel:
         IC >= 70 ve net yön → IC yönünde düşük güvenle karar
         Aksi halde → WAIT
         """
-        if ic_score >= 70 and ic_direction in ['LONG', 'SHORT']:
+        # IC fallback eşiği: config'deki full_trade değerine bağla
+        # Eski sabit 70 → mevcut IC skorları (30-45) bu eşiğe hiç ulaşamıyordu
+        # Yeni eşik: 55 → gerçekçi bir minimum edge seviyesi
+        FALLBACK_IC_MIN = 15                   # IC bu değerin altında → WAIT
+        if ic_score >= FALLBACK_IC_MIN and ic_direction in ['LONG', 'SHORT']:
             decision = MLDecision.from_direction(ic_direction)
             confidence = min(ic_score * 0.65, 60)  # Max %60 güven (fallback sınırı)
             reasoning = (
-                f"⚠️ ML model henüz eğitilmemiş (cold start). "
-                f"IC fallback: {ic_direction} (IC={ic_score:.0f}, güven düşürülmüş)"
+                f"⚠️ ML model dejenere veya eğitilmemiş (IC fallback). "
+                f"IC={ic_score:.0f} ≥ {FALLBACK_IC_MIN} → {ic_direction} yönünde "
+                f"düşük güvenle karar. Retrain bekleniyor."
             )
         else:
             decision = MLDecision.WAIT
             confidence = max(ic_score * 0.3, 10)
             reasoning = (
-                f"ML model eğitilmemiş ve IC skoru yetersiz ({ic_score:.0f}). "
-                f"İşlem yapılmıyor."
+                f"IC skoru yetersiz ({ic_score:.0f} < {FALLBACK_IC_MIN}) "
+                f"veya model dejenere. İşlem yapılmıyor."
             )
 
         return MLDecisionResult(
@@ -917,53 +974,122 @@ class LGBMSignalModel:
         y_train: pd.Series,
     ) -> ModelMetrics:
         """
-        Model performans metriklerini hesapla.
-        
-        Validasyon seti üzerinde değerlendirme yapar.
-        Eğitim seti metrikleri sadece overfitting kontrolü için.
+        Walk-forward validation seti üzerinde model performans metriklerini hesaplar.
+
+        Threshold Stratejisi:
+        - Sabit 0.5 threshold minority class base rate != 0.5 olduğunda
+          tüm tahminleri majority class'a collapsing yapar (Recall=1, F1 aldatıcı).
+        - Çözüm: precision >= (base_rate + 0.05) constraint altında F1-max threshold.
+        - Bu in-sample optimizasyon değil — val set train'den tamamen ayrı.
+
+        AUC Fallback:
+        - Val set tek class içeriyorsa (trending market window) OOF train AUC kullanılır.
+        - Her iki set de tek class ise 0.5 (random baseline) atanır.
         """
+        from sklearn.metrics import precision_recall_curve
+
         metrics = ModelMetrics()
 
-        # Tahmin olasılıkları (NaN handling for sklearn)
+        # ── Tahmin Olasılıkları ──────────────────────────────────────────
+        # LightGBM: calibrator=None, direkt model.predict_proba() kullanılır.
+        # sklearn fallback: NaN imputation gerekli, calibrator üzerinden tahmin.
         X_val_pred = X_val if HAS_LIGHTGBM else X_val.fillna(X_train.median())
+
         if self.calibrator is not None:
             y_prob = self.calibrator.predict_proba(X_val_pred)[:, 1]
         else:
             y_prob = self.model.predict_proba(X_val_pred)[:, 1]
 
-        y_pred = (y_prob >= 0.5).astype(int)   # 0.5 eşik ile sınıflandırma
+        # ── Optimal Threshold (Precision-Constrained F1 Maximization) ───
+        # min_precision = base_rate + 5pp: base rate altında precision
+        # → modelin pozitif tahmin değeri (PPV) random'dan kötü demektir.
+        # valid_mask olmadan F1-max all-ones prediction seçer (Recall=1 tuzağı).
+        precision_curve, recall_curve, thresholds_curve = precision_recall_curve(
+            y_val, y_prob
+        )
+        f1_curve = (
+            2 * precision_curve * recall_curve
+            / (precision_curve + recall_curve + 1e-9)
+        )
 
-        # Metrikler
-        metrics.accuracy = float(accuracy_score(y_val, y_pred))
+        min_precision = float(y_val.mean()) + 0.05  # base rate + 5pp güvenlik marjı
+        valid_mask    = precision_curve[:-1] >= min_precision
+
+        if valid_mask.any():
+            # Precision constraint altında F1 maximize et
+            masked_f1         = np.where(valid_mask, f1_curve[:-1], -1.0)
+            optimal_idx       = int(np.argmax(masked_f1))
+            optimal_threshold = float(thresholds_curve[optimal_idx])
+        else:
+            # Hiçbir threshold yeterli precision sağlamıyorsa base rate kullan
+            # → model sinyal üretemedi, muhtemelen yetersiz veri/feature kalitesi
+            optimal_threshold = float(y_val.mean())
+            logger.warning(
+                f"⚠️ Precision constraint karşılanamadı "
+                f"(min_precision={min_precision:.3f}) — base rate threshold kullanılıyor"
+            )
+
+        # Güvenli sınırlar: çok düşük → FP patlar, çok yüksek → FN patlar
+        optimal_threshold = float(np.clip(optimal_threshold, 0.40, 0.65))
+        y_pred            = (y_prob >= optimal_threshold).astype(int)
+
+        logger.debug(
+            f"  Threshold: {optimal_threshold:.3f} | "
+            f"base_rate: {y_val.mean():.3f} | "
+            f"min_precision_constraint: {min_precision:.3f}"
+        )
+
+        # ── Sınıflandırma Metrikleri ─────────────────────────────────────
+        metrics.accuracy  = float(accuracy_score(y_val, y_pred))
         metrics.precision = float(precision_score(y_val, y_pred, zero_division=0))
-        metrics.recall = float(recall_score(y_val, y_pred, zero_division=0))
-        metrics.f1 = float(f1_score(y_val, y_pred, zero_division=0))
-        metrics.brier_score = float(brier_score_loss(y_val, y_prob))
+        metrics.recall    = float(recall_score(y_val, y_pred, zero_division=0))
+        metrics.f1        = float(f1_score(y_val, y_pred, zero_division=0))
+        metrics.brier_score  = float(brier_score_loss(y_val, y_prob))
         metrics.log_loss_val = float(log_loss(y_val, y_prob, labels=[0, 1]))
 
-        # AUC-ROC (en az 2 sınıf gerekli)
+        # ── AUC-ROC ──────────────────────────────────────────────────────
+        # Val set tek class içeriyorsa (trending window) OOF train AUC fallback.
+        # Train AUC > val AUC ise overfitting sinyali — metrics_history'den takip et.
         if len(y_val.unique()) >= 2:
             metrics.auc_roc = float(roc_auc_score(y_val, y_prob))
         else:
-            metrics.auc_roc = 0.5              # Tek sınıf → anlamsız
+            logger.warning(
+                f"⚠️ Val set tek class içeriyor ({y_val.unique().tolist()}) "
+                f"— train OOF AUC kullanılıyor"
+            )
+            try:
+                X_train_pred = X_train if HAS_LIGHTGBM else X_train.fillna(X_train.median())
+                if self.calibrator is not None:
+                    train_prob = self.calibrator.predict_proba(X_train_pred)[:, 1]
+                else:
+                    train_prob = self.model.predict_proba(X_train_pred)[:, 1]
 
-        # Veri bilgisi
-        metrics.n_train = len(X_train)
-        metrics.n_val = len(X_val)
-        metrics.n_positive = int(y_train.sum() + y_val.sum())
-        metrics.positive_rate = float(y_train.mean())
-        metrics.n_features = len(self.feature_names)
+                if len(y_train.unique()) >= 2:
+                    metrics.auc_roc = float(roc_auc_score(y_train, train_prob))
+                else:
+                    metrics.auc_roc = 0.5  # Tamamen degenerate — random baseline
+            except Exception as e:
+                logger.warning(f"⚠️ Train OOF AUC hesaplanamadı: {e}")
+                metrics.auc_roc = 0.5
 
-        # Best iteration (early stopping — sadece LightGBM'de var)
-        if HAS_LIGHTGBM and hasattr(self.model, 'best_iteration_'):
-            metrics.best_iteration = self.model.best_iteration_ or self.model.n_estimators
-        else:
-            metrics.best_iteration = getattr(self.model, 'n_estimators', 0)
+        # ── Veri & Meta Bilgisi ───────────────────────────────────────────
+        metrics.n_train       = len(y_train)
+        metrics.n_val         = len(y_val)
+        metrics.n_positive    = int(y_train.sum() + y_val.sum())
+        metrics.positive_rate = float(y_val.mean())
+        metrics.n_features    = X_val.shape[1]
 
-        # Feature importance (top 5)
-        fi = self.get_feature_importance()
-        if len(fi) > 0:
-            metrics.feature_importance_top5 = fi['feature'].head(5).tolist()
+        # Top-5 feature importance (LightGBM veya sklearn)
+        try:
+            if self.model is not None and hasattr(self.model, 'feature_importances_'):
+                importance  = self.model.feature_importances_
+                feature_idx = np.argsort(importance)[::-1][:5]
+                metrics.feature_importance_top5 = [
+                    self.feature_names[i] for i in feature_idx
+                    if i < len(self.feature_names)
+                ]
+        except Exception:
+            pass
 
         return metrics
 

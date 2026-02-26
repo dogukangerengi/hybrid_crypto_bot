@@ -24,3 +24,16 @@ cleanup_*.py
 smoke_test_*.py
 main
 main
+
+# Hassas ve türetilmiş dosyalar
+config/secrets.yaml
+config/api_keys.yaml
+*.pkl
+*.pickle
+models/
+logs/
+__pycache__/
+*.pyc
+.DS_Store
+venv/
+.env

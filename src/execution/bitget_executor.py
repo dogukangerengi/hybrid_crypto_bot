@@ -638,6 +638,77 @@ class BitgetExecutor:
     # AÇIK EMİRLERİ İPTAL
     # =========================================================================
 
+    def fetch_open_plan_orders(self, symbol: str) -> List[Dict]:
+        """
+        Sembol için borsada bekleyen trigger emirlerini (plan orders) döndürür.
+
+        Ne yapar : Bitget'in plan-orders endpointini sorgular.
+        Neden    : Her döngüde SL/TP tekrar gönderilmesini önlemek için
+                   mevcut emir var mı kontrol edilebilsin.
+        Döndürür : [{'orderId': ..., 'planType': ..., 'triggerPrice': ...}, ...]
+        """
+        if self.dry_run:
+            return []                           # Dry-run'da borsa sorgusu yok
+
+        exchange = self._get_exchange()
+        try:
+            orders = exchange.fetch_orders(
+                symbol=symbol,
+                params={
+                    'productType': 'USDT-FUTURES',
+                    'marginCoin':  'USDT',
+                    'isPlan':      True,        # Yalnızca trigger/plan emirleri
+                }
+            )
+            # Sadece açık (live/new) durumundaki emirleri filtrele
+            open_plan = [
+                o for o in (orders or [])
+                if o.get('status') in ('open', 'new', 'live', None)
+            ]
+            logger.debug(f"📋 {symbol} açık plan emir sayısı: {len(open_plan)}")
+            return open_plan
+
+        except Exception as e:
+            logger.warning(f"⚠️ fetch_open_plan_orders hatası ({symbol}): {e}")
+            return []                           # Hata durumunda güvenli fallback
+
+
+    def has_tp_sl_orders(self, symbol: str) -> bool:
+        """
+        Sembol için borsada halihazırda SL veya TP emir var mı?
+
+        Ne yapar : fetch_open_plan_orders ile mevcut trigger emirlerini kontrol eder.
+        Neden    : Var olan emirlerin üzerine tekrar emir gönderilmesini önler.
+        Döndürür : True  → zaten emir var, tekrar gönderme
+                   False → emir yok, gönder
+        """
+        plan_orders = self.fetch_open_plan_orders(symbol)
+
+        # normal_plan tipindeki (SL/TP) emirlerini say
+        sl_tp_orders = [
+            o for o in plan_orders
+            if (o.get('info', {}).get('planType') or o.get('type', '')) == 'normal_plan'
+        ]
+        return len(sl_tp_orders) > 0
+
+
+    def get_open_position_symbols(self) -> set:
+        """
+        Borsada açık pozisyon olan sembolleri set olarak döndürür.
+
+        Ne yapar : fetch_positions() ile tüm açık pozisyonları çeker,
+                   sembol isimlerini set'e alır.
+        Neden    : Aynı sembol için tekrar işlem girilmesini önlemek için
+                   sembol bazlı kontrol yapılabilsin.
+        Döndürür : {'DOGEUSDT', 'XRPUSDT', ...}
+        """
+        try:
+            positions = self.fetch_positions()
+            return {p['symbol'] for p in positions if p.get('symbol')}
+        except Exception as e:
+            logger.warning(f"⚠️ get_open_position_symbols hatası: {e}")
+            return set()                        # Hata durumunda boş set döner
+
     def cancel_open_orders(self, symbol: str) -> int:
         """Sembol için tüm açık emirleri iptal eder."""
         if self.dry_run:
