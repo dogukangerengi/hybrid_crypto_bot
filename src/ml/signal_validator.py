@@ -80,6 +80,12 @@ MAX_ANOMALY_RATIO = 0.25                       # Feature'ların %25'inden fazlas
 IC_MODEL_AGREEMENT_BONUS = 1.10                # IC ve model aynı yönde → %10 güven bonusu
 IC_MODEL_DISAGREE_PENALTY = 0.80               # IC ve model farklı yönde → %20 güven penaltisi
 
+# ── COLD START PARAMETRELERİ ──
+# Model henüz yeterli kapalı trade görmemişken bootstrap veto'yu
+# devre dışı bırakır. Bu sayede model ilk trade'leri açabilir,
+# öğrenecek veri biriktirir. Eşiğe ulaşınca veto otomatik devreye girer.
+COLD_START_MIN_TRADES = 20                     # Bu kadar kapalı trade birikene kadar veto devre dışı
+
 
 # =============================================================================
 # DOĞRULAMA SONUÇ DATACLASS
@@ -123,6 +129,9 @@ class ValidationResult:
     # Veto sebepleri
     veto_reasons: List[str] = field(default_factory=list)
 
+    # Cold start bilgisi (log/debug için)
+    cold_start_bypass: bool = False            # True ise veto cold start nedeniyle atlandı
+
     def summary(self) -> str:
         """Telegram / log için okunabilir özet."""
         status = "✅ Geçerli" if self.is_valid else "❌ Reddedildi"
@@ -135,6 +144,8 @@ class ValidationResult:
             f"  Uyum: IC={self.ic_direction} Model={self.model_direction} "
             f"({'✓' if self.directions_agree else '✗'})",
         ]
+        if self.cold_start_bypass:
+            parts.append(f"  ⚡ Cold start: Bootstrap veto atlandı")
         if self.n_anomalies > 0:
             parts.append(f"  Anomali: {self.n_anomalies} feature ({self.anomaly_ratio:.0%})")
         if self.veto_reasons:
@@ -166,6 +177,13 @@ class SignalValidator:
         self._feature_means: Optional[pd.Series] = None
         self._feature_stds: Optional[pd.Series] = None
         self._feature_names: List[str] = []
+
+        # ── Cold Start Sayacı ──
+        # main.py her döngüde trade_memory'den kapalı trade sayısını
+        # bu attribute'a yazar. Validator bunu okuyarak cold start
+        # döneminde bootstrap veto'yu devre dışı bırakır.
+        # 0 = henüz hiç kapalı trade yok (cold start aktif)
+        self._closed_trade_count: int = 0
 
     def fit_train_stats(self, X_train: pd.DataFrame) -> None:
         """Eğitim verisinin feature istatistiklerini hesapla."""
@@ -221,15 +239,45 @@ class SignalValidator:
         feature_vector: MLFeatureVector,
         result: ValidationResult
     ) -> None:
-        """Bootstrap ile tahmin stabilitesini ölçer."""
+        """
+        Bootstrap ile tahmin stabilitesini ölçer.
+        
+        Yöntem:
+        ------
+        1. Feature vektörünü base_values olarak çıkar
+        2. Her iterasyonda her feature'a KENDİ std'si × noise_fraction kadar noise ekle
+        3. Perturbed vektörle model tahmin yap
+        4. 500 tahminin %5-%95 percentile'ını al → CI
+        
+        Neden per-feature noise?
+        → Feature'lar farklı ölçeklerde (IC: 0-100, z-score: -3/+3, sin: -1/+1)
+        → Global std anlamsız; her feature kendi dağılımına göre pertürbe edilmeli
+        → LightGBM tree split'lerini geçebilecek büyüklükte noise gerekli
+        
+        CI Yorumlama:
+        → width < 0.10 → Çok stabil tahmin (güven bonusu)
+        → width 0.10-0.25 → Normal belirsizlik
+        → width > 0.25 → Yüksek belirsizlik (penaltı veya veto)
+        → CI 0.50'yi kapsıyor → Model yön konusunda kararsız (veto)
+        
+        Cold Start:
+        → Kapalı trade sayısı < COLD_START_MIN_TRADES ise
+          "CI 0.50'yi kapsıyor" veto'su ATLANIR (ama loglanır)
+        → Bu sayede model ilk trade'leri açabilir ve öğrenecek veri toplar
+        → Yeterli trade birikince veto otomatik devreye girer
+        """
+        # ── Guard: Model yoksa veya eğitilmemişse atla ──
         if not HAS_LIGHTGBM or model is None or not model.is_trained:
-            result.bootstrap_passed = True
+            result.bootstrap_passed = True     # Kontrol atla, geç
             return
 
         try:
-            base_values = []
+            # ── 1. Base feature vektörünü çıkar ──
+            # Model'in beklediği sırayla feature değerlerini topla
+            base_values = []                   # [float, ...] → model feature sırası
             for col in model.feature_names:
-                val = 0.0
+                val = 0.0                      # Varsayılan: 0 (NaN yerine)
+                # Feature'ı hangi grupta olduğuna göre bul
                 if col in feature_vector.ic_features:
                     val = feature_vector.ic_features[col]
                 elif col in feature_vector.market_features:
@@ -244,49 +292,131 @@ class SignalValidator:
                     val = feature_vector.temporal_features[col]
                 base_values.append(val)
 
-            base_values = np.array(base_values)
-            predictions = np.zeros(self.n_bootstrap)
-            rng = np.random.default_rng(42)
+            base_values = np.array(base_values, dtype=np.float64)
 
-            noise_scale = np.std(base_values) if np.std(base_values) > 0 else 1e-4
+            # ── 2. Per-feature noise ölçeği hesapla ──
+            # Öncelik: fit_train_stats()'den gelen eğitim std'leri
+            # Yoksa: feature'ın mutlak değerinin %20'si (fallback)
+            #
+            # ÖNEMLİ: LightGBM tree-based model olduğu için noise'un
+            # split noktalarını geçebilecek kadar büyük olması ZORUNLU.
+            # Minimum noise floor = 0.05 (tüm feature'lar için)
+            # Bu değer deneysel olarak belirlenmiştir:
+            #   0.01 → çoğu split'i geçemiyor (width=0.000)
+            #   0.05 → split'leri geçiyor ama tahminleri bozmayacak kadar küçük
+            #   0.10 → bazı hassas feature'larda aşırı gürültü riski
+            MIN_NOISE_FLOOR = 0.05             # Minimum noise ölçeği (tüm feature'lar)
 
-            for i in range(self.n_bootstrap):
-                noise = rng.normal(0, noise_scale * 0.1, size=len(base_values))
-                perturbed = base_values + noise
-                X_perturbed = pd.DataFrame([perturbed], columns=model.feature_names)
+            n_features = len(base_values)      # Feature sayısı
+            feature_noise_scales = np.zeros(n_features)  # Her feature için ayrı noise scale
 
-                if not HAS_LIGHTGBM and hasattr(model, '_impute_median'):
-                    X_perturbed = X_perturbed.fillna(model._impute_median)
+            for idx, col in enumerate(model.feature_names):
+                if (self._feature_stds is not None        # Eğitim istatistikleri var mı?
+                    and col in self._feature_stds.index):  # Bu feature eğitimde var mı?
+                    # Eğitim verisindeki std → en güvenilir ölçek
+                    # Ama çok küçük std'leri de floor'la (sabit feature'lar)
+                    train_std = self._feature_stds[col]
+                    feature_noise_scales[idx] = max(train_std, MIN_NOISE_FLOOR)
+                else:
+                    # Fallback: feature'ın mutlak değerinin %20'si
+                    # Sıfır/küçük değerler için MIN_NOISE_FLOOR kullan
+                    feature_noise_scales[idx] = max(abs(base_values[idx]) * 0.20, MIN_NOISE_FLOOR)
 
+
+
+
+            # ── 3. Bootstrap iterasyonları ──
+            # Her iterasyonda: base + noise → predict → probability kaydet
+            n_iter = min(self.n_bootstrap, 200)  # Max 200 iter (hız vs doğruluk dengesi)
+            predictions = np.zeros(n_iter)       # Her iterasyonun olasılık tahmini
+
+            # ÖNEMLİ: Sabit seed YOK → her çağrıda farklı noise pattern
+            rng = np.random.default_rng()        # Entropi-bazlı seed (OS'tan)
+
+            # Noise büyüklüğü: std'nin %25'i
+            # Neden %25? → LightGBM tree split'lerini geçecek kadar büyük
+            #               ama tahmin dağılımını bozmayacak kadar küçük
+            noise_fraction = 0.25
+
+            for i in range(n_iter):
+                # Her feature'a kendi ölçeğinde Gaussian noise ekle
+                noise = rng.normal(
+                    loc=0.0,                           # Ortalama: 0 (unbiased perturbation)
+                    scale=feature_noise_scales * noise_fraction,  # Per-feature std × 0.25
+                    size=n_features                    # Feature sayısı kadar noise
+                )
+                perturbed = base_values + noise        # Pertürbe edilmiş feature vektörü
+
+                # DataFrame'e çevir (LightGBM input formatı)
+                X_perturbed = pd.DataFrame(
+                    [perturbed],                       # Tek satır
+                    columns=model.feature_names        # Feature isimleri
+                )
+
+                # Tahmin: calibrator varsa onu kullan, yoksa raw model
                 if model.calibrator is not None:
                     prob = model.calibrator.predict_proba(X_perturbed)[0][1]
                 else:
                     prob = model.model.predict_proba(X_perturbed)[0][1]
 
-                predictions[i] = prob
+                predictions[i] = prob                  # Olasılık kaydet
 
-            lower_bound = float(np.percentile(predictions, 5))
-            upper_bound = float(np.percentile(predictions, 95))
-            ci_width = upper_bound - lower_bound
+            # ── 4. CI hesapla ──
+            # %5-%95 percentile → %90 güven aralığı
+            lower_bound = float(np.percentile(predictions, 5))    # Alt sınır
+            upper_bound = float(np.percentile(predictions, 95))   # Üst sınır
+            ci_width = upper_bound - lower_bound                  # CI genişliği
 
+            # Bootstrap istatistikleri kaydet
+            result.bootstrap_mean = float(np.mean(predictions))   # Ortalama tahmin
+            result.bootstrap_std = float(np.std(predictions))     # Tahmin std'si
             result.bootstrap_ci_lower = lower_bound
             result.bootstrap_ci_upper = upper_bound
             result.bootstrap_ci_width = ci_width
-            
+
+            # ── 5. Karar: CI kabul edilebilir mi? ──
+            # 0.50 kararsızlık noktası — CI bunu kapsıyorsa model yön seçemiyor
             contains_50 = (lower_bound <= 0.50 <= upper_bound)
-            
-            if ci_width > 0.25 or contains_50:
+
+            # ── Cold Start Kontrolü ──
+            # Yeterli kapalı trade yoksa "contains_50" veto'sunu ATLAYARAK
+            # modelin ilk trade'leri açmasına izin ver.
+            # CI width > 0.25 veto'su her zaman aktif (aşırı belirsizlik koruması).
+            is_cold_start = (self._closed_trade_count < COLD_START_MIN_TRADES)
+
+            if ci_width > 0.25:
+                # Aşırı geniş CI → her zaman veto (cold start'ta bile)
                 result.bootstrap_passed = False
-                if ci_width > 0.25:
-                    result.veto_reasons.append(f"Bootstrap CI geniş: {ci_width:.3f} > 0.25 → tahmin belirsiz")
-                if contains_50:
-                    result.veto_reasons.append(f"Bootstrap CI 0.50'yi kapsıyor: [{lower_bound:.2f}, {upper_bound:.2f}] → kararsız yön")
+                result.veto_reasons.append(
+                    f"Bootstrap CI geniş: {ci_width:.3f} > 0.25 → tahmin belirsiz"
+                )
+            elif contains_50 and not is_cold_start:
+                # Normal mod: CI 0.50'yi kapsıyor → veto
+                result.bootstrap_passed = False
+                result.veto_reasons.append(
+                    f"Bootstrap CI 0.50'yi kapsıyor: [{lower_bound:.2f}, {upper_bound:.2f}] "
+                    f"→ kararsız yön"
+                )
+            elif contains_50 and is_cold_start:
+                # Cold start: CI 0.50'yi kapsıyor AMA veto atlanıyor
+                # Model trade açabilsin, öğrenecek veri biriktirsin
+                result.bootstrap_passed = True
+                result.cold_start_bypass = True
+                logger.info(
+                    f"  ⚡ Cold start bypass: CI [{lower_bound:.2f}, {upper_bound:.2f}] "
+                    f"0.50'yi kapsıyor ama veto atlandı "
+                    f"({self._closed_trade_count}/{COLD_START_MIN_TRADES} trade)"
+                )
             else:
+                # CI 0.50'yi kapsamıyor → geçti
                 result.bootstrap_passed = True
 
         except Exception as e:
             logger.warning(f"⚠️ Bootstrap hatası: {e}. Kontrol atlanıyor.")
-            result.bootstrap_passed = True     
+            result.bootstrap_passed = True             # Hata durumunda geç (fail-open)
+
+
+     
 
     def _check_regime(self, regime: str, result: ValidationResult) -> None:
         """Piyasa rejimine göre güven düzeltmesi."""

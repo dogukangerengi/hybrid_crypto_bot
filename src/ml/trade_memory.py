@@ -63,9 +63,10 @@ class TradeStatus(str, Enum):
 
 class TradeOutcome(str, Enum):
     """Kapanan trade'in sonucu."""
-    WIN     = "WIN"                            # PnL > 0 (kâr)
-    LOSS    = "LOSS"                           # PnL <= 0 (zarar)
-    UNKNOWN = "UNKNOWN"                        # Henüz kapanmadı
+    WIN       = "WIN"                            # PnL > 0 (kâr)
+    LOSS      = "LOSS"                           # PnL < 0 (zarar)
+    BREAKEVEN = "BREAKEVEN"                      # PnL = 0 (başa baş, bug veya gerçek BE)
+    UNKNOWN   = "UNKNOWN"                        # Henüz kapanmadı
 
 
 # =============================================================================
@@ -318,7 +319,14 @@ class TradeMemory:
         record.exit_reason   = exit_reason
         record.status        = TradeStatus.CLOSED
         record.closed_at     = now.isoformat()
-        record.outcome       = TradeOutcome.WIN if pnl > 0 else TradeOutcome.LOSS
+        record.outcome       = (
+            TradeOutcome.WIN if pnl > 0
+            else TradeOutcome.BREAKEVEN if pnl == 0
+            else TradeOutcome.LOSS
+        )
+        # PnL=0 → BREAKEVEN: Model eğitiminde kullanılMAZ.
+        # Fiyat halfway'e kadar gitmiş (doğru yön), breakeven aktifleşmiş,
+        # sonra entry'ye dönmüş. Bu ne başarı ne başarısızlık — nötr veri.
 
         # PnL yüzde hesapla (entry_price sıfır değilse)
         if record.entry_price > 0:
@@ -519,6 +527,19 @@ class TradeMemory:
         """Belirli bir açık trade kaydını döndürür."""
         r = self._records.get(trade_id)
         return r if r and r.status == TradeStatus.OPEN else None
+
+    @property
+    def open_trades(self) -> Dict[str, TradeRecord]:
+        """
+        Tüm açık trade'leri {trade_id: TradeRecord} dict olarak döndürür.
+        
+        main.py'deki close senkronizasyonu bu property üzerinden iterasyon yapar:
+            for mem_id, mem_trade in self.trade_memory.open_trades.items():
+        """
+        return {
+            tid: rec for tid, rec in self._records.items()
+            if rec.status == TradeStatus.OPEN
+        }
 
     def get_all_open(self) -> List[TradeRecord]:
         """Tüm açık trade'leri listeler."""

@@ -104,6 +104,12 @@ class MLDecisionResult:
     feature_importance_top3: List[str] = field(default_factory=list)  # En önemli 3 feature adı
     timestamp: str = ""                        # Karar zamanı (UTC ISO format)
 
+    # Feature vektörü (trade_memory'ye feature_snapshot olarak kaydedilir)
+    # predict() sırasında kullanılan feature'ların kopyası.
+    # Model retrain'de bu snapshot kullanılarak her trade'in "o andaki"
+    # piyasa koşulları yeniden değerlendirilebilir.
+    feature_vector: Optional['MLFeatureVector'] = None
+
     def should_execute(self) -> bool:
         """
         İşlem gönderilmeli mi?

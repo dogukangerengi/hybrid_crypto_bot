@@ -74,7 +74,7 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 VERSION                = "2.1.0"
-MAX_COINS_PER_CYCLE    = 20
+MAX_COINS_PER_CYCLE    = 30
 DEFAULT_FWD_PERIOD     = 6
 MAX_OPEN_POSITIONS     = 10
 MAX_CONSECUTIVE_ERRORS = 5
@@ -409,8 +409,28 @@ class MLTradingPipeline:
             category_tops = {}
             for cat in get_category_names():
                 cat_indicators = {i.name if hasattr(i, 'name') else i['name'] for i in get_indicators_by_category(cat)}
+                
+                # 1. Direkt isim eşleşmesi
                 cat_scores = [s for s in best_scores
                               if s.name in cat_indicators and s.is_significant]
+                
+                # 2. Prefix eşleşme (IC: 'EMA_26' vs Kategori: 'ema')
+                if not cat_scores:
+                    cat_ind_lower = {n.lower() for n in cat_indicators}
+                    matched = []
+                    for s in best_scores:
+                        if not s.is_significant:
+                            continue
+                        s_lower = s.name.lower()
+                        if s_lower in cat_ind_lower:
+                            matched.append(s)
+                            continue
+                        for ci in cat_ind_lower:
+                            if len(ci) >= 3 and (s_lower.startswith(ci + '_') or s_lower.startswith(ci)):
+                                matched.append(s)
+                                break
+                    cat_scores = matched
+                
                 if cat_scores:
                     top = max(cat_scores, key=lambda s: abs(s.ic_mean))
                     category_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
@@ -923,24 +943,12 @@ class MLTradingPipeline:
                         
                         # LONG (Yükseliş) pozisyonu kontrolü
                         if trade.direction == "LONG":
-                            # 🛡️ BREAK-EVEN (Başa Baş) KALKANI
-                            # Hedefe (TP) %50 yaklaşıldıysa ve Stop henüz giriş fiyatına çekilmediyse:
-                            halfway_target = trade.entry_price + (trade.take_profit - trade.entry_price) * 0.5
-                            if max_high >= halfway_target and trade.stop_loss < trade.entry_price:
-                                trade.stop_loss = trade.entry_price
-                                self.paper_trader._save_trades() # Değişikliği anında Excel'e kaydet
-                                logger.info(f"   🛡️ {trade.symbol} için Break-Even kalkanı aktif! İşlem risksiz (Yeni SL: ${trade.entry_price:,.4f})")
-                            
-                            # 📱 TELEGRAM BİLDİRİMİ: BREAK-EVEN
-                                if self.notifier.is_configured():
-                                    self.notifier.send_message_sync(f"🛡️ <b>BREAK-EVEN KALKANI</b>\n━━━━━━━━━━━━━━━━━━━━━\n🪙 <b>Coin:</b> {trade.symbol}\nHedefin yarısına ulaşıldı! İşlem artık risksiz (SL Maliyete çekildi).")
-                        
-
-
+                            # SL kontrolü: Fiyat stop-loss'un altına düştü mü?
                             if min_low <= trade.stop_loss:
                                 close_reason = "SL Hit"
                                 exit_price = trade.stop_loss
                                 status = TradeStatus.CLOSED_SL
+                            # TP kontrolü: Fiyat take-profit'e ulaştı mı?
                             elif max_high >= trade.take_profit:
                                 close_reason = "TP Hit"
                                 exit_price = trade.take_profit
@@ -949,22 +957,12 @@ class MLTradingPipeline:
                                 
                         # SHORT (Düşüş) pozisyonu kontrolü
                         else:
-                            # 🛡️ BREAK-EVEN (Başa Baş) KALKANI
-                            # Hedefe (TP) %50 yaklaşıldıysa ve Stop henüz giriş fiyatına çekilmediyse:
-                            halfway_target = trade.entry_price - (trade.entry_price - trade.take_profit) * 0.5
-                            if min_low <= halfway_target and trade.stop_loss > trade.entry_price:
-                                trade.stop_loss = trade.entry_price
-                                self.paper_trader._save_trades() # Değişikliği anında Excel'e kaydet
-                                logger.info(f"   🛡️ {trade.symbol} için Break-Even kalkanı aktif! İşlem risksiz (Yeni SL: ${trade.entry_price:,.4f})")
-
-                            # 📱 TELEGRAM BİLDİRİMİ: BREAK-EVEN
-                                if self.notifier.is_configured():
-                                    self.notifier.send_message_sync(f"🛡️ <b>BREAK-EVEN KALKANI</b>\n━━━━━━━━━━━━━━━━━━━━━\n🪙 <b>Coin:</b> {trade.symbol}\nHedefin yarısına ulaşıldı! İşlem artık risksiz (SL Maliyete çekildi).")
-
+                            # SL kontrolü: Fiyat stop-loss'un üstüne çıktı mı?
                             if max_high >= trade.stop_loss:
                                 close_reason = "SL Hit"
                                 exit_price = trade.stop_loss
                                 status = TradeStatus.CLOSED_SL
+                            # TP kontrolü: Fiyat take-profit'e düştü mü?
                             elif min_low <= trade.take_profit:
                                 close_reason = "TP Hit"
                                 exit_price = trade.take_profit
@@ -984,8 +982,6 @@ class MLTradingPipeline:
                             # 📱 TELEGRAM BİLDİRİMİ: İŞLEM KAPANDI
                             if self.notifier.is_configured():
                                 pnl_emoji = "✅ KÂR" if trade.net_pnl > 0 else "❌ ZARAR"
-                                if trade.net_pnl > -3 and trade.net_pnl < 3: 
-                                    pnl_emoji = "🛡️ BAŞA BAŞ (BE)"
                                 
                                 msg = (f"{pnl_emoji} <b>({close_reason})</b>\n"
                                        f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -997,17 +993,29 @@ class MLTradingPipeline:
                             
                             # Yapay zekanın kendini eğitmesi için hafızaya bildir
                             try:
-                                for mem_id, mem_trade in self.trade_memory.open_trades.items():
+                                # list() ile kopya al → close_trade dict'i değiştirdiğinde
+                                # RuntimeError: dictionary changed size during iteration hatası önlenir
+                                matched = False
+                                for mem_id, mem_trade in list(self.trade_memory.open_trades.items()):
                                     if mem_trade.symbol == trade.full_symbol or mem_trade.coin == trade.symbol:
+                                        # PnL hesapla: trade.pnl_absolute paper_trader tarafından dolduruldu
+                                        actual_pnl = trade.pnl_absolute if trade.pnl_absolute else 0.0
                                         self.trade_memory.close_trade(
-                                            trade_id=mem_id,
-                                            exit_price=exit_price,
-                                            pnl_pct=trade.pnl_percent if trade.pnl_percent else 0.0,
-                                            is_win=(trade.pnl_absolute > 0 if trade.pnl_absolute else False)
+                                            trade_id=mem_id,             # Memory'deki trade ID
+                                            exit_price=exit_price,       # Kapanış fiyatı ($)
+                                            pnl=actual_pnl,              # Gerçekleşen PnL ($)
+                                            exit_reason=close_reason,    # 'SL Hit' veya 'TP Hit'
                                         )
+                                        matched = True
+                                        logger.info(f"   🧠 Memory güncellendi: {trade.symbol} → {close_reason} | PnL: ${actual_pnl:+.2f}")
                                         break
+                                if not matched:
+                                    logger.warning(f"   ⚠️ Memory'de eşleşen trade bulunamadı: {trade.symbol} "
+                                                   f"(full={trade.full_symbol})")
                             except Exception as em:
-                                logger.debug(f"Memory update atlandı: {em}")
+                                logger.warning(f"   ⚠️ Memory update BAŞARISIZ: {trade.symbol} → {em}")
+                                import traceback
+                                logger.warning(traceback.format_exc())
 
                 except Exception as e:
                     logger.error(f"   ❌ {trade.symbol} pozisyon kontrolünde hata: {e}")
@@ -1047,6 +1055,12 @@ class MLTradingPipeline:
                 report.status = CycleStatus.ERROR
                 return report
             report.total_scanned = len(coins)
+
+            # ── Cold Start: Validator'a kapalı trade sayısını aktar ──
+            # Bootstrap veto'yu yeterli trade birikene kadar devre dışı bırakır
+            self.validator._closed_trade_count = self.trade_memory._count_closed()
+            self.lgbm_model._closed_trade_count = self.trade_memory._count_closed()
+
 
             # Her coin için ML analizi
             logger.info(f"\n🔬 ML analizi ({len(coins)} coin)...")
@@ -1190,10 +1204,10 @@ class MLTradingPipeline:
                     self.change_24h      = 0.0
                     self.volume_24h      = 0.0
                     self.ic_confidence   = 65.0
-                    self.ic_direction    = 'LONG'
+                    self.ic_direction    = 'NEUTRAL'       # BUG FIX: 'LONG' → 'NEUTRAL' (IC analizinden ayarlanır)
                     self.significant_count = 10
                     self.market_regime   = 'trending'
-                    self.category_tops   = {}
+                    self.category_tops   = {}              # IC analizinden doldurulacak
                     self.tf_rankings     = []
                     self.atr             = 0.0
                     self.atr_pct         = 0.0
@@ -1206,6 +1220,103 @@ class MLTradingPipeline:
             analysis_stub = DummyAnalysis(symbol)
             rows_X = []
             rows_y = []
+
+            # ── IC Analizi: Eğitim verisinden kategori bilgilerini çıkar ──
+            # FeatureEngineer'ın ic_cat_trend/momentum/volatility/volume feature'larını
+            # doldurabilmesi için gerçek IC skorlarından category_tops hesaplanır.
+            # Aksi halde bu 8 feature hep NaN olur ve model kategori bilgisini öğrenemez.
+            #
+            # ÖNEMLİ: ic_direction da IC analizinden alınır, target (fwd_ret) DEĞİL!
+            # Target'tan almak = look-ahead bias → AUC=1.0 overfitting yapar.
+            train_cat_tops = {}                                    # Eğitim category_tops'u
+            train_ic_direction = 'NEUTRAL'                         # IC yönü (tüm dataset için)
+            try:
+                target_col_ic = f'fwd_ret_{self.fwd_period}'
+                if target_col_ic in df_ind.columns:
+                    ic_scores = self.selector.evaluate_all_indicators(
+                        df_ind, target_col=target_col_ic
+                    )
+                    if ic_scores:
+                        # ── IC yönünü gerçek IC analizinden belirle ──
+                        # BUG FIX: Önceden hardcoded 'LONG' idi, sonra target'tan ayarlandı
+                        # (look-ahead bias). Şimdi gerçek IC analizinden alınıyor.
+                        sig_sorted = sorted(
+                            [s for s in ic_scores if s.is_significant],
+                            key=lambda s: abs(s.ic_mean), reverse=True
+                        )
+                        if sig_sorted:
+                            train_ic_direction = (
+                                "LONG" if sig_sorted[0].ic_mean > 0
+                                else "SHORT"
+                            )
+                        logger.info(f"  📊 Eğitim IC yönü: {train_ic_direction}")
+
+                        # ── Kategori bazlı top IC'leri hesapla ──
+                        # İSİM EŞLEŞME DÜZELTMESİ:
+                        # IC skorları: 'EMA_26', 'RSI_14', 'MACD_12_26_9' (büyük harf + parametre)
+                        # Kategori isimleri: 'ema', 'rsi', 'macd' (küçük harf, parametresiz)
+                        # Çözüm: IC skor isminin küçük harfle başlayıp başlamadığını kontrol et
+                        from indicators.categories import get_category_names, get_indicators_by_category
+
+                        # Debug logları
+                        ic_score_names = {s.name for s in ic_scores}
+                        logger.info(f"  📋 IC skor isimleri (ilk 10): {sorted(list(ic_score_names))[:10]}")
+
+                        for cat in get_category_names():
+                            cat_indicators_raw = get_indicators_by_category(cat)
+                            cat_indicators = {
+                                (i.name if hasattr(i, 'name') else i['name'])
+                                for i in cat_indicators_raw
+                            }
+
+                            if cat == 'trend':
+                                logger.info(f"  📋 Kategori '{cat}' isimleri: {sorted(list(cat_indicators))[:8]}")
+
+                            # ── İsim eşleştirme stratejisi ──
+                            # 1. Önce direkt eşleşme dene (IC_name == cat_name)
+                            cat_scores = [
+                                s for s in ic_scores
+                                if s.name in cat_indicators and s.is_significant
+                            ]
+
+                            # 2. Eşleşme yoksa: IC isminin başlangıcını kategori ismiyle karşılaştır
+                            #    Örn: 'EMA_26'.lower().startswith('ema') → True
+                            #    Örn: 'RSI_14'.lower().startswith('rsi') → True
+                            #    Örn: 'MACD_12_26_9'.lower().startswith('macd') → True
+                            if not cat_scores:
+                                cat_ind_lower = {n.lower() for n in cat_indicators}
+                                matched = []
+                                for s in ic_scores:
+                                    if not s.is_significant:
+                                        continue
+                                    s_lower = s.name.lower()
+                                    # Tam eşleşme (case-insensitive)
+                                    if s_lower in cat_ind_lower:
+                                        matched.append(s)
+                                        continue
+                                    # Prefix eşleşme: IC ismi kategori isminin prefix'iyle başlıyor mu?
+                                    # Örn: 'ema_26' startswith 'ema' → True
+                                    for ci in cat_ind_lower:
+                                        if s_lower.startswith(ci + '_') or s_lower.startswith(ci):
+                                            # Ek güvenlik: ci en az 3 karakter olsun (kısa isim çakışması önle)
+                                            if len(ci) >= 3:
+                                                matched.append(s)
+                                                break
+                                cat_scores = matched
+
+                            if cat_scores:
+                                top = max(cat_scores, key=lambda s: abs(s.ic_mean))
+                                train_cat_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
+
+                        if train_cat_tops:
+                            tops_str = ', '.join(
+                                f'{k}={v["name"]}({v["ic"]:.4f})' for k, v in train_cat_tops.items()
+                            )
+                            logger.info(f"  📊 Eğitim IC kategori tops: {tops_str}")
+                        else:
+                            logger.warning(f"  ⚠️ Eğitim IC kategori tops BOŞ! İsim eşleşme sorunu.")
+            except Exception as e:
+                logger.warning(f"  ⚠️ Eğitim IC analizi yapılamadı (devam ediliyor): {e}")
 
             logger.info("  ⚙️ Feature matrisi oluşturuluyor (zaman yolculuğu simülasyonu)...")
 
@@ -1237,6 +1348,16 @@ class MLTradingPipeline:
                     analysis_stub.market_regime = self._detect_regime(df_slice)
                 except Exception:
                     pass
+
+                # ── ic_direction: IC analizinin gerçek sonucundan al ──
+                # ÖNCEKİ BUG V1: Hardcoded 'LONG' → model hep +1 gördü
+                # ÖNCEKİ BUG V2: target > 0 → 'LONG' → look-ahead bias (AUC=1.0)
+                # ŞİMDİ: Dataset-seviyesinde IC analizi sonucu kullanılıyor
+                # Bu canlıdaki IC direction ile aynı kaynaktan geliyor → bias yok
+                analysis_stub.ic_direction = train_ic_direction  # IC analizinden (sabit)
+                
+                # ── category_tops: IC analizinden ──
+                analysis_stub.category_tops = train_cat_tops
 
                 # Feature vektörünü üret
                 fv = self.feature_eng.build_features(
@@ -1406,7 +1527,7 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 75) -> No
 def main():
     parser = argparse.ArgumentParser(description="ML Crypto Bot")
     parser.add_argument("--live",     action="store_true", help="Canlı trade")
-    parser.add_argument("--top",      type=int, default=15, help="Top N coin") # BURAYA DİKKAT
+    parser.add_argument("--top",      type=int, default=15, help="Top N coin")
     parser.add_argument("--schedule", action="store_true", help="Scheduler modu")
     parser.add_argument("-i","--interval", type=int, default=75, help="Aralık")
     parser.add_argument("--report",   action="store_true", help="Performans raporu")
@@ -1419,79 +1540,33 @@ def main():
 
     pipeline = MLTradingPipeline(dry_run=not args.live, top_n=args.top)
 
+    # ── Sadece rapor modu ──
     if args.report:
-        pipeline.print_performance(); return
+        pipeline.print_performance()
+        return
 
+    # ── Sadece eğitim modu ──
     if args.train:
-        pipeline.initial_train(); return
+        pipeline.initial_train()
+        return
 
+    # ── Bakiye başlat (paper: $1000 sabit, canlı: Bitget API) ──
     if not pipeline._init_balance():
         sys.exit(1)
 
+    # ── Model eğitilmemişse warm-up yap ──
     if not pipeline.lgbm_model.is_trained:
         logger.info("🎓 Model eğitilmemiş — ilk eğitim başlıyor...")
         pipeline.initial_train()
 
+    # ── Scheduler modu: sürekli döngü ──
     if args.schedule:
         run_scheduler(pipeline, args.interval)
     else:
+        # ── Tek döngü: bir cycle çalıştır ve çık ──
         report = pipeline.run_cycle()
         logger.info(f"Döngü: {report.status.value}")
 
+
 if __name__ == "__main__":
     main()
-
-    # ---------------------------------------------------------
-    # DÜZELTME: BORSADAN VEYA SANAL KASADAN BAKİYEYİ ÇEK!
-    # ---------------------------------------------------------
-    if __name__ == "__main__":
-     import sys
-    import argparse
-    import time
-    import schedule
-    
-    parser = argparse.ArgumentParser(description="ML Trading Bot")
-    parser.add_argument('--train', action='store_true', help='İlk modeli manuel eğitir')
-    parser.add_argument('--schedule', action='store_true', help='Botu 15 dakikada bir döngüye sokar')
-    parser.add_argument('--live', action='store_true', help='Canlı (Gerçek Para) modu')
-    args = parser.parse_args()
-
-    pipeline = MLTradingPipeline(dry_run=not args.live)
-
-    # ---------------------------------------------------------
-    # DÜZELTME: BORSADAN VEYA SANAL KASADAN BAKİYEYİ ÇEK!
-    # ---------------------------------------------------------
-    if not pipeline._init_balance():
-        sys.exit(1)
-
-    if args.train:
-        pipeline.initial_train()
-        
-    elif args.schedule:
-        logger.info("⏳ Bot zamanlanmış moda alındı. Piyasaya çıkmadan önce hazırlık yapılıyor...")
-        
-        # EĞER MODEL EĞİTİLMEMİŞSE ÖNCE ONU EĞİT
-        if not pipeline.lgbm_model.is_trained:
-            logger.info("🧠 Modelin boş olduğu tespit edildi. İlk eğitim (Warm-Up) başlatılıyor...")
-            pipeline.initial_train()
-            
-        logger.info("✅ Hazırlık tamam. İlk döngü başlıyor ve ardından 5 dakikalık periyotlara geçiliyor.")
-        
-        # İlk turu hemen at
-        try:
-            pipeline.run_cycle()
-        except Exception as e:
-            logger.error(f"Döngü hatası: {e}")
-            
-        # Sonrakileri 5 dakikaya bağla
-        schedule.every(5).minutes.do(pipeline.run_cycle)
-        
-        try:
-            while True:
-                schedule.run_pending()
-                time.sleep(1) 
-        except KeyboardInterrupt:
-            logger.info("🛑 Bot kullanıcı tarafından manuel olarak durduruldu.")
-            
-    else:
-        pipeline.run_cycle()

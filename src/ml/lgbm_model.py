@@ -222,6 +222,9 @@ class LGBMSignalModel:
         # Eğitim geçmişi (model degradation takibi)
         self.metrics_history: List[ModelMetrics] = []  # Tüm eğitimlerin metrikleri
 
+        # ── Cold Start Sayacı ──
+        self._closed_trade_count: int = 0
+
         # Model dizinini oluştur
         self.model_dir.mkdir(parents=True, exist_ok=True)
 
@@ -536,18 +539,27 @@ class LGBMSignalModel:
                 gate_action="NO_TRADE",
                 ic_score=ic_score,
                 model_version=self.model_version or "no_model",
+                feature_vector=feature_vector,      # 🧬 Feature snapshot
             )
 
         # ── 2. Cold Start Kontrolü ──
         if not self.is_trained or self.model is None:
-            return self._ic_fallback(ic_score, ic_direction, gate_action)
+            return self._ic_fallback(ic_score, ic_direction, gate_action, feature_vector)
+        
+        # ── Cold Start: Model henüz gerçek trade görmedi → IC fallback ──
+        # Kapalı trade < 20 iken model tahminleri anlamsız (0 gerçek feedback).
+        # IC yönünü kullanarak trade aç, veri topla, 20 trade sonrası model devreye girer.
+        COLD_START_THRESHOLD = 20
+        if self._closed_trade_count < COLD_START_THRESHOLD:
+            logger.info(f"  ⚡ Cold start ({self._closed_trade_count}/{COLD_START_THRESHOLD}) → IC fallback")
+            return self._ic_fallback(ic_score, ic_direction, gate_action, feature_vector)
 
         # ── 3. Feature Array Hazırla ──
         try:
             feature_dict = feature_vector.to_dict()
             X_pred = pd.DataFrame([feature_dict])[self.feature_names]
         except KeyError as e:
-            return self._ic_fallback(ic_score, ic_direction, gate_action)
+            return self._ic_fallback(ic_score, ic_direction, gate_action, feature_vector)
 
         # ── 4. Tahmin ──
         try:
@@ -559,7 +571,7 @@ class LGBMSignalModel:
             else:
                 prob = self.model.predict_proba(X_pred)[0][1]
         except Exception as e:
-            return self._ic_fallback(ic_score, ic_direction, gate_action)
+            return self._ic_fallback(ic_score, ic_direction, gate_action, feature_vector)
 
         # ── DEJENERELİK KORUMASINI BYPASS EDELİM (Sürekli Hata Vermesin) ──
         # Bu kalkan, yatay piyasada sistemi tamamen kitlediği için devre dışı bıraktık.
@@ -567,14 +579,38 @@ class LGBMSignalModel:
         #    return self._ic_fallback(ic_score, ic_direction, gate_action)
 
         # ── 5. Olasılık → Karar Mapping ──
+        # prob = P(label=1) = P(fiyat YUKARI gidecek) = P(LONG karlı)
+        # prob yüksek → LONG, prob düşük → SHORT, ortada → WAIT
+        #
+        # ÖNCEKİ BUG: prob >= threshold → ic_direction kullanılıyordu
+        # IC hep SHORT verdiği için model "yukarı" dese bile SHORT açılıyordu!
+        # ŞİMDİ: Modelin kendi olasılık tahminine göre yön belirleniyor.
         confidence = prob * 100
 
-        # Karar eşikleri (Dengeli Mod)
-        if prob >= 0.55:
-            decision = MLDecision.from_direction(ic_direction)
-        elif prob < 0.45:
-            decision = MLDecision.WAIT
+        # Cold Start: eşikleri gevşet (0.52/0.48 vs normal 0.55/0.45)
+        COLD_START_THRESHOLD = 20
+        is_cold = (self._closed_trade_count < COLD_START_THRESHOLD)
+
+        if is_cold:
+            long_threshold  = 0.52             # Gevşek: trade açarak veri topla
+            short_threshold = 0.48             # Simetrik: 1 - 0.52 = 0.48
         else:
+            long_threshold  = 0.55             # Normal: güçlü sinyal gerekli
+            short_threshold = 0.45             # Simetrik: 1 - 0.55 = 0.45
+
+        if prob >= long_threshold:
+            # Model fiyatın yukarı gideceğini tahmin ediyor → LONG
+            decision = MLDecision.LONG
+            if is_cold:
+                logger.info(f"  ⚡ Cold start: prob={prob:.3f} >= {long_threshold} → LONG")
+        elif prob <= short_threshold:
+            # Model fiyatın aşağı gideceğini tahmin ediyor → SHORT
+            decision = MLDecision.SHORT
+            confidence = (1 - prob) * 100      # SHORT güveni: P(aşağı) bazlı
+            if is_cold:
+                logger.info(f"  ⚡ Cold start: prob={prob:.3f} <= {short_threshold} → SHORT")
+        else:
+            # Belirsiz bölge → işlem yapma
             decision = MLDecision.WAIT
 
         # ── 6. Gerekçe Oluştur ──
@@ -590,6 +626,7 @@ class LGBMSignalModel:
             model_version=self.model_version,
             feature_importance_top3=top3_features,
             timestamp=datetime.now(timezone.utc).isoformat(),
+            feature_vector=feature_vector,          # 🧬 Feature snapshot: trade_memory'ye kaydedilecek
         )
 
     # =========================================================================
@@ -851,6 +888,7 @@ class LGBMSignalModel:
         ic_score: float,
         ic_direction: str,
         gate_action: str,
+        feature_vector: 'MLFeatureVector' = None,   # 🧬 Feature snapshot (varsa trade_memory'ye kaydedilir)
     ) -> MLDecisionResult:
         """
         Model eğitilmemişken IC-only fallback karar.
@@ -887,6 +925,7 @@ class LGBMSignalModel:
             ic_score=ic_score,
             model_version="ic_fallback",
             timestamp=datetime.now(timezone.utc).isoformat(),
+            feature_vector=feature_vector,          # 🧬 Feature snapshot
         )
 
     def _evaluate(
