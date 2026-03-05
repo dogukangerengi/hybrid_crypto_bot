@@ -207,9 +207,9 @@ class RiskManager:
     # Aggressive: 1.0x (sıkı stop ama daha çok false trigger)
     # Default: 1.5x (denge noktası)
     
-    DEFAULT_ATR_MULTIPLIER = 1.5               # Varsayılan SL ATR çarpanı
-    MIN_ATR_MULTIPLIER = 1.0                   # Minimum ATR çarpanı
-    MAX_ATR_MULTIPLIER = 3.0                   # Maksimum ATR çarpanı
+    DEFAULT_ATR_MULTIPLIER = 3.0               # Varsayılan SL ATR çarpanı
+    MIN_ATR_MULTIPLIER = 2.0                   # Minimum ATR çarpanı
+    MAX_ATR_MULTIPLIER = 5.0                   # Maksimum ATR çarpanı
     
     def __init__(
         self,
@@ -408,8 +408,13 @@ class RiskManager:
             TP fiyatı, mesafe ($), mesafe (%), RR oranı
         """
         # RR oranı (config minimum'dan düşük olamaz)
-        rr = risk_reward or self.risk_cfg.min_risk_reward_ratio
-        rr = max(rr, self.risk_cfg.min_risk_reward_ratio)
+        # Yüksek Stop-Loss mesafesinde Take-Profit'i erişilebilir kılmak için RR esnetildi
+        config_rr = self.risk_cfg.min_risk_reward_ratio
+        # SL mesafesi genişse Win Rate'i korumak için 1:1 (1.0) risk ödül oranını kabul et
+        dynamic_rr = 1.0 if (sl_distance / entry_price * 100) > 2.0 else config_rr
+        
+        rr = risk_reward or dynamic_rr
+        rr = max(rr, 1.0) # En az 1'e 1 kâr-zarar dengesini sağla
         
         # TP mesafesi ($)
         tp_distance = sl_distance * rr
@@ -485,9 +490,17 @@ class RiskManager:
             margin_used = ideal_pos_value / leverage
             
         # 6. Borsa Küsurat Kurallarına Göre Yuvarla
-        final_size = round(final_size / contract_size) * contract_size
+        # Eğer API'den contract_size gelmemiş (1.0 kalmış) ve coin fiyatı yüksekse (BTC/ETH),
+        # 1'e yuvarlama yaparsak lot 0 olur. Bu durumu önlemek için doğrudan hassasiyeti (precision) kullanıyoruz.
+        if contract_size == 1.0 and ideal_size < 1.0:
+            final_size = ideal_size
+        else:
+            # Riski aşmamak adına aşağı yuvarlama (floor) kullanmak daha güvenlidir
+            final_size = math.floor(final_size / contract_size) * contract_size
+            
         final_size = round(final_size, amount_precision)
         
+        # En kötü senaryoda borsa minimumunun altında kalmamak için
         if final_size < min_amount:
             final_size = min_amount
 
@@ -611,16 +624,17 @@ class RiskManager:
         Risk/Reward oranını kontrol eder.
         
         RR = TP_distance / SL_distance
-        RR < min_rr → işlem reddedilir
+        Dinamik TP mesafelerine izin vermek için minimum sınırı 1.0'a indirdik.
         """
         if sl_distance <= 0:
             return False, "SL distance <= 0"
         
         rr = tp_distance / sl_distance
+        min_allowed_rr = 1.0  # Eskiden self.risk_cfg.min_risk_reward_ratio (1.5) idi, dinamik yapı için 1.0'a çektik.
         
-        if rr < self.risk_cfg.min_risk_reward_ratio - 0.001:  # Float tolerance
+        if rr < min_allowed_rr - 0.001:  # Float tolerance
             return False, (
-                f"RR ({rr:.2f}) < min ({self.risk_cfg.min_risk_reward_ratio})"
+                f"RR ({rr:.2f}) < min ({min_allowed_rr})"
             )
         
         return True, "OK"

@@ -1342,22 +1342,96 @@ class MLTradingPipeline:
                 # Sadece i. bara kadar olan geçmişi veriyoruz (look-ahead bias önlemi)
                 df_slice = df_ind.iloc[:i+1]
 
-                # Dinamik güncellemeler
+                # Dinamik güncellemeler (fiyat ve piyasa rejimi)
                 analysis_stub.price = float(df_slice['close'].iloc[-1])
                 try:
                     analysis_stub.market_regime = self._detect_regime(df_slice)
                 except Exception:
                     pass
 
-                # ── ic_direction: IC analizinin gerçek sonucundan al ──
-                # ÖNCEKİ BUG V1: Hardcoded 'LONG' → model hep +1 gördü
-                # ÖNCEKİ BUG V2: target > 0 → 'LONG' → look-ahead bias (AUC=1.0)
-                # ŞİMDİ: Dataset-seviyesinde IC analizi sonucu kullanılıyor
-                # Bu canlıdaki IC direction ile aynı kaynaktan geliyor → bias yok
-                analysis_stub.ic_direction = train_ic_direction  # IC analizinden (sabit)
+                # ==========================================================
+                # ADIM 1 DÜZELTMESİ: DİNAMİK IC HESAPLAMASI
+                # ==========================================================
+                try:
+                    # O ana kadar olan verilerle IC skorlarını hesapla (geleceği görmeden)
+                    ic_scores = self.selector.evaluate_all_indicators(df_slice, target_col=target_col)
+                    
+                    if ic_scores:
+                        # Anlamlı indikatörleri filtrele (p < 0.05 vb.)
+                        significant = [s for s in ic_scores if s.is_significant]
+                        analysis_stub.significant_count = len(significant)
+                        
+                        if significant:
+                            # 1. IC Güven Skoru: Anlamlı IC skorlarının mutlak ortalaması
+                            ic_mean = np.mean([abs(s.ic_mean) for s in significant]) * 100
+                            analysis_stub.ic_confidence = round(ic_mean, 2)
+                            
+                            # 2. IC Yönü ve En İyi Skor: En güçlü indikatörün yönüne göre belirle
+                            sig_sorted = sorted(significant, key=lambda s: abs(s.ic_mean), reverse=True)
+                            analysis_stub.top_ic = sig_sorted[0].ic_mean
+                            analysis_stub.ic_direction = "LONG" if sig_sorted[0].ic_mean > 0 else "SHORT"
+                            
+                        else:
+                            # Anlamlı indikatör yoksa nötr kabul et
+                            analysis_stub.ic_confidence = 0.0
+                            analysis_stub.ic_direction = "NEUTRAL"
+                            analysis_stub.top_ic = 0.0
+                    else:
+                        analysis_stub.significant_count = 0
+                        analysis_stub.ic_confidence = 0.0
+                        analysis_stub.ic_direction = "NEUTRAL"
+                        analysis_stub.top_ic = 0.0
+                except Exception as e:
+                    # Olası hesaplama hatalarında (yetersiz veri vs.) güvenli değerlere dön
+                    analysis_stub.significant_count = 0
+                    analysis_stub.ic_confidence = 0.0
+                    analysis_stub.ic_direction = "NEUTRAL"
+                    analysis_stub.top_ic = 0.0
+                # ==========================================================
                 
-                # ── category_tops: IC analizinden ──
-                analysis_stub.category_tops = train_cat_tops
+                # ==========================================================
+                # ADIM 2 DÜZELTMESİ: DİNAMİK KATEGORİ IC HESAPLAMASI
+                # ==========================================================
+                dynamic_cat_tops = {}
+                
+                # ic_scores değişkenini bir önceki adımda hesaplamıştık, burada kullanıyoruz
+                if 'ic_scores' in locals() and ic_scores:
+                    from indicators.categories import get_category_names, get_indicators_by_category
+                    
+                    # 1. Tüm kategorileri (trend, momentum, volatilite, hacim) dön
+                    for cat in get_category_names():
+                        cat_indicators_raw = get_indicators_by_category(cat)
+                        cat_indicators = {(i.name if hasattr(i, 'name') else i['name']) for i in cat_indicators_raw}
+                        
+                        # 2. O anki mum için anlamlı olan indikatörlerden bu kategoriye ait olanları bul
+                        cat_scores = [s for s in ic_scores if s.name in cat_indicators and s.is_significant]
+                        
+                        # 3. İsimler tam eşleşmezse (örneğin RSI_14 vs rsi), prefix (başlangıç) eşleşmesi yap
+                        if not cat_scores:
+                            cat_ind_lower = {n.lower() for n in cat_indicators}
+                            matched = []
+                            for s in ic_scores:
+                                if not s.is_significant:
+                                    continue
+                                s_lower = s.name.lower()
+                                if s_lower in cat_ind_lower:
+                                    matched.append(s)
+                                    continue
+                                for ci in cat_ind_lower:
+                                    if s_lower.startswith(ci + '_') or s_lower.startswith(ci):
+                                        if len(ci) >= 3:
+                                            matched.append(s)
+                                            break
+                            cat_scores = matched
+                            
+                        # 4. Kategori içinde en yüksek IC'ye sahip indikatörü seç ve kaydet
+                        if cat_scores:
+                            top = max(cat_scores, key=lambda s: abs(s.ic_mean))
+                            dynamic_cat_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
+                
+                # Dinamik olarak hesaplanan kategorik skorları modele veriyoruz
+                analysis_stub.category_tops = dynamic_cat_tops
+                # ==========================================================
 
                 # Feature vektörünü üret
                 fv = self.feature_eng.build_features(
@@ -1527,7 +1601,7 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 75) -> No
 def main():
     parser = argparse.ArgumentParser(description="ML Crypto Bot")
     parser.add_argument("--live",     action="store_true", help="Canlı trade")
-    parser.add_argument("--top",      type=int, default=15, help="Top N coin")
+    parser.add_argument("--top",      type=int, default=20, help="Top N coin")
     parser.add_argument("--schedule", action="store_true", help="Scheduler modu")
     parser.add_argument("-i","--interval", type=int, default=75, help="Aralık")
     parser.add_argument("--report",   action="store_true", help="Performans raporu")
