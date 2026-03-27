@@ -55,7 +55,8 @@ from performance_analyzer import PerformanceAnalyzer
 
 # ── ML modülleri (v2.0) ───────────────────────────────────────────────────────
 from ml.feature_engineer import FeatureEngineer, MLFeatureVector
-from ml.lgbm_model import LGBMSignalModel, MLDecisionResult
+# from ml.lgbm_model import LGBMSignalModel, MLDecisionResult
+from ml.ensemble_model import EnsemblePredictor as LGBMSignalModel, MLDecisionResult
 from ml.signal_validator import SignalValidator, ValidationResult
 from ml.trade_memory import TradeMemory, TradeOutcome
 
@@ -233,7 +234,42 @@ class MLTradingPipeline:
         self._consecutive_errors = 0
         self.cooldowns         = {}  # ❄️ SL olan coinler için bekleme hafızası
 
+        self._restore_cooldowns()  # YENİ EKLENEN SATIR: Kapanan işlemleri RAM'e geri yükler
+
         logger.info(f"🚀 ML Trading Pipeline v{VERSION} (dry_run={dry_run})")
+
+    def _restore_cooldowns(self):
+        """Bot yeniden başlatıldığında (RAM sıfırlandığında), son 2 saat içinde SL olmuş coinleri diskten okuyup hafızaya alır."""
+        try:
+            now = datetime.now()
+            
+            # Paper Trader geçmişindeki kapalı işlemleri kontrol et
+            if hasattr(self.paper_trader, 'closed_trades'):
+                for trade in self.paper_trader.closed_trades:
+                    # Kapalı işlemin yapısına göre verileri güvenli şekilde çek
+                    exit_reason = getattr(trade, 'exit_reason', None) or (trade.get('exit_reason') if isinstance(trade, dict) else None)
+                    closed_at = getattr(trade, 'closed_at', None) or (trade.get('closed_at') if isinstance(trade, dict) else None)
+                    symbol = getattr(trade, 'symbol', None) or (trade.get('symbol') if isinstance(trade, dict) else None)
+
+                    # Eğer işlem Stop-Loss ile kapandıysa
+                    if exit_reason == "SL Hit" and closed_at and symbol:
+                        # Tarih string formatındaysa zaman nesnesine (datetime) çevir
+                        if isinstance(closed_at, str):
+                            try:
+                                closed_time = datetime.fromisoformat(closed_at)
+                            except ValueError:
+                                continue
+                        else:
+                            closed_time = closed_at
+                        
+                        # Kapanışın üzerinden 2 saat (7200 saniye) geçmemişse
+                        if (now - closed_time).total_seconds() < 7200:
+                            kalan_sure = closed_time + timedelta(hours=2)
+                            self.cooldowns[symbol] = kalan_sure
+                            logger.info(f"   ❄️ HAFIZA GERİ YÜKLENDİ: {symbol} (Ceza bitişi: {kalan_sure.strftime('%H:%M:%S')})")
+                            
+        except Exception as e:
+            logger.error(f"Cooldown hafıza yükleme hatası: {e}")
 
     # =========================================================================
     # BAKIYE
