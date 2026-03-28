@@ -1,13 +1,13 @@
 # =============================================================================
-# EMİR YÖNETİMİ MODÜLÜ (EXECUTION)
+# EMİR YÖNETİMİ MODÜLÜ (EXECUTION) - BINANCE FUTURES
 # =============================================================================
 # Risk yönetimi, pozisyon sizing, emir gönderme ve izleme.
 #
 # Kullanım:
-#   from execution import RiskManager, BitgetExecutor
+#   from execution import RiskManager, BinanceExecutor
 #   rm = RiskManager(balance=75.0)
 #   trade = rm.calculate_trade(entry=185, direction='SHORT', atr=3.7)
-#   executor = BitgetExecutor(dry_run=True)
+#   executor = BinanceExecutor(dry_run=True)
 #   result = executor.execute_trade(trade)
 # =============================================================================
 
@@ -21,8 +21,8 @@ from .risk_manager import (
     TradeDirection,
 )
 
-from .bitget_executor import (
-    BitgetExecutor,
+from .binance_executor import (
+    BinanceExecutor,
     ExecutionResult,
     OrderResult,
 )
@@ -37,9 +37,9 @@ __all__ = [
     'RiskCheckStatus',
     'TradeDirection',
     # Emir yönetimi
-    'BitgetExecutor',
+    'BinanceExecutor',
     'ExecutionResult',
     'OrderResult',
 ]
 
-__version__ = '1.1.0'
+__version__ = '2.0.0'

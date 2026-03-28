@@ -101,10 +101,17 @@ class EnsemblePredictor:
         rf_val_preds = self.rf_model.predict(X_val)
         lgbm_val_preds = self.lgbm_model.predict(X_val)
         
-        ensemble_preds = (rf_val_preds == 1) & (lgbm_val_preds == 1)
-
-        isleme_girilen = sum(ensemble_preds == 1)
-        kazanc = sum((ensemble_preds == 1) & (y_val == 1))
+        # LONG (1) işlemlere girme ve kazanma durumu
+        long_islem = (rf_val_preds == 1) & (lgbm_val_preds == 1)
+        long_kazanc = (long_islem) & (y_val == 1)
+        
+        # SHORT (0) işlemlere girme ve kazanma durumu
+        short_islem = (rf_val_preds == 0) & (lgbm_val_preds == 0)
+        short_kazanc = (short_islem) & (y_val == 0)
+        
+        # Toplam istatistiklerin hesaplanması
+        isleme_girilen = sum(long_islem) + sum(short_islem)
+        kazanc = sum(long_kazanc) + sum(short_kazanc)
         win_rate = (kazanc / isleme_girilen) if isleme_girilen > 0 else 0.0
 
         self.is_trained = True
@@ -112,8 +119,8 @@ class EnsemblePredictor:
         logger.info("\n" + "="*50)
         logger.info("🎯 ENSEMBLE (SNIPER) MODEL EĞİTİLDİ")
         logger.info("="*50)
-        logger.info(f"🌲 RF İşleme Girme    : {sum(rf_val_preds == 1)} işlem")
-        logger.info(f"⚡ LGBM İşleme Girme  : {sum(lgbm_val_preds == 1)} işlem")
+        logger.info(f"🌲 RF İşleme Girme    : {sum(rf_val_preds == 1)} LONG, {sum(rf_val_preds == 0)} SHORT")
+        logger.info(f"⚡ LGBM İşleme Girme  : {sum(lgbm_val_preds == 1)} LONG, {sum(lgbm_val_preds == 0)} SHORT")
         logger.info(f"🤝 ORTAK İşleme Girme : {isleme_girilen} işlem -> Kazanç: {kazanc}")
         logger.info(f"🏆 GÜNCEL WIN RATE   : %{win_rate*100:.1f}")
         logger.info("="*50)
@@ -138,17 +145,24 @@ class EnsemblePredictor:
             rf_pred = self.rf_model.predict(X_live)[0]
             lgbm_pred = self.lgbm_model.predict(X_live)[0]
             
-            rf_prob = self.rf_model.predict_proba(X_live)[0][1]
-            lgbm_prob = self.lgbm_model.predict_proba(X_live)[0][1]
+            # predict_proba, Sınıf 1 (LONG) olma olasılığını döndürür
+            rf_prob_long = self.rf_model.predict_proba(X_live)[0][1]
+            lgbm_prob_long = self.lgbm_model.predict_proba(X_live)[0][1]
 
+            # 1. Senaryo: İki model de 1 (Yükseliş) diyorsa (Pusuladan bağımsız özgür karar)
             if rf_pred == 1 and lgbm_pred == 1:
-                ortak_guven = ((rf_prob + lgbm_prob) / 2) * 100
-                
-                if ic_direction == "LONG":
-                    return MLDecisionResult(decision=MLDecision.LONG, confidence=ortak_guven, feature_vector=feature_vector)
-                elif ic_direction == "SHORT":
-                    return MLDecisionResult(decision=MLDecision.SHORT, confidence=ortak_guven, feature_vector=feature_vector)
+                ortak_guven = ((rf_prob_long + lgbm_prob_long) / 2) * 100
+                return MLDecisionResult(decision=MLDecision.LONG, confidence=ortak_guven, feature_vector=feature_vector)
 
+            # 2. Senaryo: İki model de 0 (Düşüş) diyorsa (Pusuladan bağımsız özgür karar)
+            elif rf_pred == 0 and lgbm_pred == 0:
+                # Sınıf 0 (SHORT) olasılığı, 1 - LONG olasılığı formülüyle hesaplanır
+                rf_prob_short = 1 - rf_prob_long
+                lgbm_prob_short = 1 - lgbm_prob_long
+                ortak_guven = ((rf_prob_short + lgbm_prob_short) / 2) * 100
+                return MLDecisionResult(decision=MLDecision.SHORT, confidence=ortak_guven, feature_vector=feature_vector)
+
+            # 3. Senaryo: Modeller arası anlaşmazlık varsa beklemeye geç
             return MLDecisionResult(decision=MLDecision.WAIT, confidence=0.0, feature_vector=feature_vector)
 
         except Exception as e:

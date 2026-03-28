@@ -1,12 +1,12 @@
 # =============================================================================
-# BİTGET EXECUTION ENGİNE (EMİR YÖNETİMİ) — v1.3 FULL FIX
+# BINANCE EXECUTION ENGİNE (EMİR YÖNETİMİ) — v2.0 FULL BINANCE
 # =============================================================================
-# Düzeltmeler v1.3:
-# - place_market_order: indent hatası giderildi, tradeSide='open'/'close' eklendi
-# - place_stop_loss: planType, mark_price, triggerPrice precision fix (kod 48001)
-# - place_take_profit: planType, mark_price, triggerPrice precision fix
-# - execute_trade: SL/TP başarısız ise pozisyon otomatik kapatılır
-# - fetch_balance: total döndürür (free değil) — kill switch için doğru bakiye
+# Düzeltmeler v2.0:
+# - Tamamen Binance USDT-M Futures (ccxt 'future' tipi) uyumlu hale getirildi.
+# - Bitget'e özel 'planType' ve 'productType' parametreleri temizlendi.
+# - Sembol yapısı Binance formatına uyarlandı (Örn: BTC/USDT).
+# - Binance'in yerleşik STOP_MARKET ve TAKE_PROFIT_MARKET emir tipleri entegre edildi.
+# - Margin Type (Isolated) ayarı Binance standartlarına uygun olarak güncellendi.
 # =============================================================================
 
 import sys
@@ -84,9 +84,7 @@ class ExecutionResult:
 
 def _format_trigger_price(price: float) -> float:
     """
-    Bitget'in triggerPrice için beklediği precision'a göre yuvarlar.
-    Düşük fiyatlı coinlerde (örn. AZTEC $0.027) Bitget hata kodu 48001'i önler.
-    Mantık: Fiyat büyüklüğüne göre anlamlı ondalık basamak sayısı seçilir.
+    Binance'in stop emirleri için beklediği precision'a göre yuvarlar.
     """
     if price >= 1000:
         return round(price, 2)      # BTC, ETH seviyesi → 2 decimal
@@ -106,24 +104,24 @@ def _format_trigger_price(price: float) -> float:
 # ANA EXECUTOR SINIFI
 # =============================================================================
 
-class BitgetExecutor:
+class BinanceExecutor:
     """
-    Bitget USDT-M Perpetual Futures emir yönetimi.
+    Binance USDT-M Perpetual Futures emir yönetimi.
     DRY RUN (varsayılan): Gerçek emir göndermez, API key gerekmez.
     CANLI: Gerçek emir gönderir — dikkatli kullanın!
     """
 
     DEFAULT_MARKET_INFO: Dict[str, Dict] = {
-        'BTC/USDT:USDT':   {'price': 2, 'amount': 3, 'min_amount': 0.001,  'min_cost': 5.0, 'max_lev': 125},
-        'ETH/USDT:USDT':   {'price': 2, 'amount': 2, 'min_amount': 0.01,   'min_cost': 5.0, 'max_lev': 125},
-        'SOL/USDT:USDT':   {'price': 2, 'amount': 1, 'min_amount': 0.1,    'min_cost': 5.0, 'max_lev': 75},
-        'XRP/USDT:USDT':   {'price': 4, 'amount': 1, 'min_amount': 1.0,    'min_cost': 5.0, 'max_lev': 75},
-        'DOGE/USDT:USDT':  {'price': 5, 'amount': 0, 'min_amount': 10.0,   'min_cost': 5.0, 'max_lev': 75},
-        'ADA/USDT:USDT':   {'price': 4, 'amount': 1, 'min_amount': 1.0,    'min_cost': 5.0, 'max_lev': 50},
-        'AVAX/USDT:USDT':  {'price': 2, 'amount': 1, 'min_amount': 0.1,    'min_cost': 5.0, 'max_lev': 50},
-        'LINK/USDT:USDT':  {'price': 3, 'amount': 1, 'min_amount': 0.1,    'min_cost': 5.0, 'max_lev': 50},
-        'DOT/USDT:USDT':   {'price': 3, 'amount': 1, 'min_amount': 0.1,    'min_cost': 5.0, 'max_lev': 50},
-        'MATIC/USDT:USDT': {'price': 4, 'amount': 0, 'min_amount': 10.0,   'min_cost': 5.0, 'max_lev': 50},
+        'BTC/USDT':   {'price': 2, 'amount': 3, 'min_amount': 0.001,  'min_cost': 5.0, 'max_lev': 125},
+        'ETH/USDT':   {'price': 2, 'amount': 2, 'min_amount': 0.01,   'min_cost': 5.0, 'max_lev': 125},
+        'SOL/USDT':   {'price': 2, 'amount': 1, 'min_amount': 0.1,    'min_cost': 5.0, 'max_lev': 75},
+        'XRP/USDT':   {'price': 4, 'amount': 1, 'min_amount': 1.0,    'min_cost': 5.0, 'max_lev': 75},
+        'DOGE/USDT':  {'price': 5, 'amount': 0, 'min_amount': 10.0,   'min_cost': 5.0, 'max_lev': 75},
+        'ADA/USDT':   {'price': 4, 'amount': 1, 'min_amount': 1.0,    'min_cost': 5.0, 'max_lev': 50},
+        'AVAX/USDT':  {'price': 2, 'amount': 1, 'min_amount': 0.1,    'min_cost': 5.0, 'max_lev': 50},
+        'LINK/USDT':  {'price': 3, 'amount': 1, 'min_amount': 0.1,    'min_cost': 5.0, 'max_lev': 50},
+        'DOT/USDT':   {'price': 3, 'amount': 1, 'min_amount': 0.1,    'min_cost': 5.0, 'max_lev': 50},
+        'MATIC/USDT': {'price': 4, 'amount': 0, 'min_amount': 10.0,   'min_cost': 5.0, 'max_lev': 50},
     }
 
     FALLBACK_MARKET_INFO: Dict = {
@@ -135,37 +133,41 @@ class BitgetExecutor:
         self._exchange = None
         self._market_cache: Dict = {}
         mode = "🧪 DRY RUN (simülasyon)" if dry_run else "🔴 CANLI (gerçek emir)"
-        logger.info(f"BitgetExecutor başlatıldı | Mod: {mode}")
+        logger.info(f"BinanceExecutor başlatıldı | Mod: {mode}")
 
     # =========================================================================
     # EXCHANGE INIT
     # =========================================================================
 
-    def _get_exchange(self) -> ccxt.bitget:
-        """Authenticated Bitget exchange (lazy init, sadece canlı modda çağrılır)."""
+    def _get_exchange(self) -> ccxt.binance:
+        """Authenticated Binance exchange (lazy init, sadece canlı modda çağrılır)."""
         if self._exchange is None:
             if not cfg.exchange.is_configured():
                 raise ValueError(
-                    "Bitget API key'leri ayarlanmamış! "
-                    ".env dosyasına BITGET_API_KEY, BITGET_API_SECRET, "
-                    "BITGET_PASSPHRASE ekleyin."
+                    "Binance API key'leri ayarlanmamış! "
+                    ".env dosyasına BINANCE_API_KEY, BINANCE_API_SECRET "
+                    "ekleyin."
                 )
-            self._exchange = ccxt.bitget({
+            self._exchange = ccxt.binance({
                 'apiKey': cfg.exchange.api_key,
                 'secret': cfg.exchange.api_secret,
-                'password': cfg.exchange.passphrase,
                 'enableRateLimit': True,
                 'options': {
-                    'defaultType': 'swap',
-                    'positionMode': True, # ✅ CCXT One-way (Tek Yönlü) Mod
+                    'defaultType': 'future', # ✅ Binance USDT-M Futures
+                    'positionMode': True,    # ✅ CCXT One-way (Tek Yönlü) Mod
                 },
                 'sandbox': cfg.exchange.sandbox,
             })
-            # ✅ Garantilemek için One-Way mod parametresini ekliyoruz:
-            self._exchange.options['positionMode'] = 'oneway'
             
+            # ✅ Garantilemek için One-Way mod parametresini ekliyoruz:
+            try:
+                self._exchange.fapiPrivatePostPositionSideDual({'dualSidePosition': 'false'})
+            except Exception as e:
+                # Zaten false ise hata verebilir, yoksayıyoruz.
+                pass
+                
             self._exchange.load_markets()
-            logger.info(f"Bitget exchange başlatıldı (sandbox={cfg.exchange.sandbox})")
+            logger.info(f"Binance exchange başlatıldı (sandbox={cfg.exchange.sandbox})")
         return self._exchange
 
     # =========================================================================
@@ -176,7 +178,7 @@ class BitgetExecutor:
         """
         Sembol için market precision/limits bilgisi.
         DRY RUN: DEFAULT_MARKET_INFO tablosundan (API çağrısı yok).
-        CANLI: Bitget API'den gerçek değerler.
+        CANLI: Binance API'den gerçek değerler.
         """
         if symbol in self._market_cache:
             return self._market_cache[symbol]
@@ -195,7 +197,7 @@ class BitgetExecutor:
 
         exchange = self._get_exchange()
         if symbol not in exchange.markets:
-            raise ValueError(f"'{symbol}' Bitget Futures'da bulunamadı")
+            raise ValueError(f"'{symbol}' Binance Futures'da bulunamadı")
         market = exchange.markets[symbol]
         info = {
             'symbol': symbol,
@@ -208,7 +210,8 @@ class BitgetExecutor:
                 'min_cost': market.get('limits', {}).get('cost', {}).get('min', 5.0),
             },
             'contract_size': float(market.get('contractSize', 1.0)),
-            'max_leverage': int(market.get('info', {}).get('maxLever', 125)),
+            # Binance'de leverage bilgisi genelde limits altındadır
+            'max_leverage': int(market.get('limits', {}).get('leverage', {}).get('max', 125)),
         }
         self._market_cache[symbol] = info
         return info
@@ -221,8 +224,6 @@ class BitgetExecutor:
         """
         USDT bakiyesi.
         ✅ total döndürür (free değil).
-        total = free + margin'de kilitli para → gerçek net worth'u yansıtır.
-        Kill switch hesaplaması için total kullanılmalıdır.
         """
         if self.dry_run:
             logger.info("🧪 DRY RUN: Bakiye sorgusu (simülasyon)")
@@ -230,10 +231,10 @@ class BitgetExecutor:
 
         exchange = self._get_exchange()
         try:
-            balance = exchange.fetch_balance({'type': 'swap'})
+            balance = exchange.fetch_balance({'type': 'future'})
             usdt = balance.get('USDT', {})
             result = {
-                'total': float(usdt.get('total', 0) or 0),  # ✅ free + margin
+                'total': float(usdt.get('total', 0) or 0),  
                 'free':  float(usdt.get('free', 0) or 0),
                 'used':  float(usdt.get('used', 0) or 0),
             }
@@ -286,29 +287,31 @@ class BitgetExecutor:
             return True
         exchange = self._get_exchange()
         try:
-            exchange.set_leverage(leverage, symbol, params={'productType': 'USDT-FUTURES'})
+            exchange.set_leverage(leverage, symbol)
             logger.info(f"⚡ Kaldıraç ayarlandı: {symbol} → {leverage}x")
             return True
         except Exception as e:
-            if 'not modified' in str(e).lower() or 'same' in str(e).lower():
+            if 'No need to change' in str(e) or 'already' in str(e).lower():
                 logger.info(f"⚡ Kaldıraç zaten {leverage}x: {symbol}")
                 return True
             logger.error(f"Kaldıraç hatası ({symbol}, {leverage}x): {e}")
             return False
 
     def set_margin_mode(self, symbol: str, mode: str = 'isolated') -> bool:
-        """Margin mode ayarla. DRY RUN: log + True döner."""
+        """Margin mode ayarla (ISOLATED or CROSSED). DRY RUN: log + True döner."""
         if self.dry_run:
-            logger.info(f"🧪 DRY RUN: Margin mode {symbol} → {mode}")
+            logger.info(f"🧪 DRY RUN: Margin mode {symbol} → {mode.upper()}")
             return True
         exchange = self._get_exchange()
         try:
-            exchange.set_margin_mode(mode, symbol, params={'productType': 'USDT-FUTURES'})
-            logger.info(f"📋 Margin mode: {symbol} → {mode}")
+            # CCXT'de mode küçük harf beklenir, ancak bazı borsalarda ISOLATED büyük olabilir.
+            # ccxt binance implementation'ı genellikle bunu otomatik halleder.
+            exchange.set_margin_mode(mode, symbol)
+            logger.info(f"📋 Margin mode: {symbol} → {mode.upper()}")
             return True
         except Exception as e:
-            if 'already' in str(e).lower() or 'not modified' in str(e).lower():
-                logger.info(f"📋 Margin mode zaten {mode}: {symbol}")
+            if 'No need to change' in str(e) or 'already' in str(e).lower():
+                logger.info(f"📋 Margin mode zaten {mode.upper()}: {symbol}")
                 return True
             logger.error(f"Margin mode hatası ({symbol}, {mode}): {e}")
             return False
@@ -318,16 +321,14 @@ class BitgetExecutor:
     # =========================================================================
 
     def round_price(self, price: float, symbol: str) -> float:
-        """Fiyatı, coinin izin verdiği tick size (fiyat adımı) kuralına göre uydurur."""
+        """Fiyatı, coinin izin verdiği tick size kuralına göre uydurur."""
         try:
             info = self.get_market_info(symbol)
             if info and 'precision' in info and 'price' in info['precision']:
                 precision = info['precision']['price']
                 if precision:
-                    # Decimal modülü veya ccxt'nin kendi formatter'ı ile güvenli yuvarlama
                     return float(self._exchange.price_to_precision(symbol, price))
             
-            # Eğer borsa bilgisi çekilemezse, fiyata bakarak akıllı yuvarlama yap
             if price >= 100:
                 return round(price, 2)
             elif price >= 1:
@@ -353,8 +354,8 @@ class BitgetExecutor:
 
     def place_market_order(self, symbol: str, side: str, amount: float,
                            reduce_only: bool = False,
-                           preset_sl: float = None,  # ✅ YENİ: Önceden ayarlanmış SL fiyatı
-                           preset_tp: float = None) -> OrderResult: # ✅ YENİ: Önceden ayarlanmış TP fiyatı
+                           preset_sl: float = None,  
+                           preset_tp: float = None) -> OrderResult: 
         result = OrderResult(symbol=symbol, side=side, order_type='market', amount=amount)
         amount = self.round_amount(amount, symbol)
         result.amount = amount
@@ -376,23 +377,14 @@ class BitgetExecutor:
 
         exchange = self._get_exchange()
         try:
-            # One-Way Mode (Tek Yönlü) için temel parametreler
-            params = {
-                'productType': 'USDT-FUTURES', 
-                'marginCoin': 'USDT',
-                'marginMode': 'isolated',
-            }
+            params = {}
             if reduce_only:
                 params['reduceOnly'] = True
 
-            # ✅ YENİ: Eğer SL veya TP verildiyse, bunları Bitget'in anlayacağı "Preset" 
-            # (Önceden Ayarlanmış) parametrelere dönüştürerek ana emrin içine gömüyoruz.
-            if preset_sl:
-                params['presetStopLossPrice'] = str(self.round_price(preset_sl, symbol))
-            if preset_tp:
-                params['presetTakeProfitPrice'] = str(self.round_price(preset_tp, symbol))
+            # Binance'te ana emre doğrudan SL/TP parametresi gömülemez.
+            # O yüzden önce ana emir açılır, başarılıysa execution tarafında SL/TP çağrılır.
+            # (execute_trade metodunda bunu zincirleme olarak çözeceğiz).
 
-            # CCXT'de One-Way modda 'side' sadece 'buy' veya 'sell' olur.
             order = exchange.create_order(
                 symbol=symbol, 
                 type='market', 
@@ -408,7 +400,7 @@ class BitgetExecutor:
             result.success = True if result.order_id else False
             result.raw = order
             
-            logger.info(f"✅ Market Emir İletildi (Preset SL/TP ile): {side.upper()} {amount} {symbol} | ID: {result.order_id}")
+            logger.info(f"✅ Market Emir İletildi: {side.upper()} {amount} {symbol} | ID: {result.order_id}")
             return result
             
         except Exception as e:
@@ -417,21 +409,14 @@ class BitgetExecutor:
             return result
 
     # =========================================================================
-    # SL/TP EMİRLERİ (ONE-WAY MODE UYUMLU TRIGGER)
+    # SL/TP EMİRLERİ (BINANCE UYUMLU TRIGGER)
     # =========================================================================
 
     def place_stop_loss(self, symbol: str, side: str, amount: float,
                         trigger_price: float) -> OrderResult:
-        result = OrderResult(symbol=symbol, side=side, order_type='stop_loss',
+        result = OrderResult(symbol=symbol, side=side, order_type='stop_market',
                              amount=amount, price=trigger_price)
 
-        if trigger_price >= 1:
-           trigger_price = round(trigger_price, 4)
-        elif trigger_price >= 0.01:
-            trigger_price = round(trigger_price, 6)
-        else:
-            trigger_price = round(trigger_price, 8)
-            
         trigger_price = self.round_price(trigger_price, symbol)
         amount = self.round_amount(amount, symbol)
         result.price = trigger_price
@@ -444,17 +429,16 @@ class BitgetExecutor:
 
         exchange = self._get_exchange()
         try:
-            # DÜZELTME: One-Way Mod için 'normal_plan' kullanıyoruz, 'reduceOnly' ekliyoruz
+            # ✅ Binance'te Stop Loss Market Emri
             order = exchange.create_order(
-                symbol=symbol, type='market', side=side, amount=amount,
+                symbol=symbol, 
+                type='STOP_MARKET', 
+                side=side, 
+                amount=amount,
                 params={
-                    'productType': 'USDT-FUTURES',
-                    'marginCoin': 'USDT',
-                    'planType': 'normal_plan', # Bitget V2 One-Way modda bunu istiyor
-                    'triggerPrice': str(trigger_price),
-                    'triggerType': 'mark_price',
-                    'reduceOnly': True,
-                    'oneWayMode': True
+                    'stopPrice': str(trigger_price), # Tetiklenme fiyatı
+                    'reduceOnly': True,              # Sadece pozisyonu kapatmak için
+                    'workingType': 'MARK_PRICE'      # İğnelerden korunmak için Mark fiyatını baz al
                 }
             )
             result.order_id = str(order.get('id', ''))
@@ -470,7 +454,7 @@ class BitgetExecutor:
 
     def place_take_profit(self, symbol: str, side: str, amount: float,
                           trigger_price: float) -> OrderResult:
-        result = OrderResult(symbol=symbol, side=side, order_type='take_profit',
+        result = OrderResult(symbol=symbol, side=side, order_type='take_profit_market',
                              amount=amount, price=trigger_price)
 
         trigger_price = self.round_price(trigger_price, symbol)
@@ -485,17 +469,16 @@ class BitgetExecutor:
 
         exchange = self._get_exchange()
         try:
-            # DÜZELTME: One-Way Mod için 'normal_plan' kullanıyoruz, 'reduceOnly' ekliyoruz
+            # ✅ Binance'te Take Profit Market Emri
             order = exchange.create_order(
-                symbol=symbol, type='market', side=side, amount=amount,
+                symbol=symbol, 
+                type='TAKE_PROFIT_MARKET', 
+                side=side, 
+                amount=amount,
                 params={
-                    'productType': 'USDT-FUTURES',
-                    'marginCoin': 'USDT',
-                    'planType': 'normal_plan', # Bitget V2 One-Way modda bunu istiyor
-                    'triggerPrice': str(trigger_price),
-                    'triggerType': 'mark_price',
+                    'stopPrice': str(trigger_price),
                     'reduceOnly': True,
-                    'oneWayMode': True
+                    'workingType': 'MARK_PRICE'
                 }
             )
             result.order_id = str(order.get('id', ''))
@@ -537,11 +520,12 @@ class BitgetExecutor:
     def execute_trade(self, trade_calc, skip_sl: bool = False,
                       skip_tp: bool = False) -> ExecutionResult:
         """
-        Tam trade execution pipeline (Preset SL/TP ile Atomik Yapı):
+        Tam trade execution pipeline (Binance için zincirleme yapı):
         1. Margin mode ayarla (isolated)
         2. Kaldıraç ayarla
-        3. ✅ Ana market emrini, içine SL ve TP'yi GÖMEREK tek seferde (atomik) gönder.
-        Bu sayede emir reddedilirse hepsi birden reddedilir, korumasız pozisyon riski sıfırlanır.
+        3. Ana market emrini gönder
+        4. Başarılıysa SL ve TP emirlerini gönder. Herhangi biri başarısız olursa
+           ana pozisyonu geri kapat (güvenlik ağı).
         """
         timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
         exec_result = ExecutionResult(
@@ -560,11 +544,11 @@ class BitgetExecutor:
         direction = trade_calc.direction
         pos = trade_calc.position
         
-        # Fiyatları ayarla (Skip edilmişse None geç)
         sl_price  = trade_calc.stop_loss.price if not skip_sl else None
         tp_price  = trade_calc.take_profit.price if not skip_tp else None
         
         open_side  = 'buy'  if direction == 'LONG' else 'sell'
+        close_side = 'sell' if direction == 'LONG' else 'buy'
 
         logger.info(
             f"{'🧪' if self.dry_run else '🔴'} Trade Başlıyor: {direction} {symbol} | "
@@ -578,30 +562,34 @@ class BitgetExecutor:
             # 2. Kaldıraç
             self.set_leverage(symbol, pos.leverage)
 
-            # 3. ✅ Ana market emri (SL ve TP'yi doğrudan preset parametresi olarak veriyoruz)
-            main_order = self.place_market_order(
-                symbol=symbol, 
-                side=open_side, 
-                amount=pos.size,
-                preset_sl=sl_price,   # Ana emre SL'yi göm
-                preset_tp=tp_price    # Ana emre TP'yi göm
-            )
+            # 3. Ana market emri
+            main_order = self.place_market_order(symbol=symbol, side=open_side, amount=pos.size)
             exec_result.main_order = main_order
 
             if not main_order.success:
                 exec_result.error = f"Ana emir başarısız: {main_order.error}"
                 return exec_result
 
-            # İşlem başarılı. Kayıtları ve metrikleri işliyoruz
             exec_result.actual_entry  = main_order.price or trade_calc.entry_price
             exec_result.actual_amount = main_order.filled or pos.size
             exec_result.actual_cost   = main_order.cost or (pos.size * trade_calc.entry_price)
 
-            # Özet loglarda gözükmesi için sanal OrderResult objeleri dolduruyoruz
+            # 4. Binance'te SL/TP zincirleme gönderilir (Ana emirden ayrı)
             if sl_price:
-                exec_result.sl_order = OrderResult(success=True, price=sl_price)
+                sl_order = self.place_stop_loss(symbol, close_side, exec_result.actual_amount, sl_price)
+                exec_result.sl_order = sl_order
+                
+                # Güvenlik ağı: SL koyulamazsa ana pozisyonu anında kapat!
+                if not sl_order.success and not self.dry_run:
+                    logger.error("🛑 ACİL: SL emri girilemedi! Korumasız kalmamak için pozisyon kapatılıyor.")
+                    self.close_position(symbol, direction, exec_result.actual_amount)
+                    exec_result.error = f"SL girilemediği için pozisyon iptal edildi. Hata: {sl_order.error}"
+                    exec_result.success = False
+                    return exec_result
+
             if tp_price:
-                exec_result.tp_order = OrderResult(success=True, price=tp_price)
+                tp_order = self.place_take_profit(symbol, close_side, exec_result.actual_amount, tp_price)
+                exec_result.tp_order = tp_order
 
             exec_result.success = True
             logger.info(f"✅ Trade GÜVENLİ ŞEKİLDE ONAYLANDI: {direction} {exec_result.actual_amount} {symbol}")
@@ -618,74 +606,42 @@ class BitgetExecutor:
 
     def fetch_open_plan_orders(self, symbol: str) -> List[Dict]:
         """
-        Sembol için borsada bekleyen trigger emirlerini (plan orders) döndürür.
-
-        Ne yapar : Bitget'in plan-orders endpointini sorgular.
-        Neden    : Her döngüde SL/TP tekrar gönderilmesini önlemek için
-                   mevcut emir var mı kontrol edilebilsin.
-        Döndürür : [{'orderId': ..., 'planType': ..., 'triggerPrice': ...}, ...]
+        Sembol için borsada bekleyen trigger emirlerini (STOP/TAKE_PROFIT) döndürür.
         """
         if self.dry_run:
-            return []                           # Dry-run'da borsa sorgusu yok
+            return []                           
 
         exchange = self._get_exchange()
         try:
-            orders = exchange.fetch_orders(
-                symbol=symbol,
-                params={
-                    'productType': 'USDT-FUTURES',
-                    'marginCoin':  'USDT',
-                    'isPlan':      True,        # Yalnızca trigger/plan emirleri
-                }
-            )
-            # Sadece açık (live/new) durumundaki emirleri filtrele
-            open_plan = [
-                o for o in (orders or [])
-                if o.get('status') in ('open', 'new', 'live', None)
+            # Binance'te doğrudan açık emirleri çekmek yeterlidir
+            open_orders = exchange.fetch_open_orders(symbol)
+            
+            # Sadece STOP_MARKET ve TAKE_PROFIT_MARKET tiplerini filtrele
+            plan_orders = [
+                o for o in open_orders
+                if o.get('type') in ('STOP_MARKET', 'TAKE_PROFIT_MARKET', 'stop_market', 'take_profit_market')
             ]
-            logger.debug(f"📋 {symbol} açık plan emir sayısı: {len(open_plan)}")
-            return open_plan
+            logger.debug(f"📋 {symbol} açık stop/tp emir sayısı: {len(plan_orders)}")
+            return plan_orders
 
         except Exception as e:
             logger.warning(f"⚠️ fetch_open_plan_orders hatası ({symbol}): {e}")
-            return []                           # Hata durumunda güvenli fallback
+            return []                           
 
 
     def has_tp_sl_orders(self, symbol: str) -> bool:
-        """
-        Sembol için borsada halihazırda SL veya TP emir var mı?
-
-        Ne yapar : fetch_open_plan_orders ile mevcut trigger emirlerini kontrol eder.
-        Neden    : Var olan emirlerin üzerine tekrar emir gönderilmesini önler.
-        Döndürür : True  → zaten emir var, tekrar gönderme
-                   False → emir yok, gönder
-        """
+        """Sembol için borsada halihazırda SL veya TP emir var mı?"""
         plan_orders = self.fetch_open_plan_orders(symbol)
-
-        # normal_plan tipindeki (SL/TP) emirlerini say
-        sl_tp_orders = [
-            o for o in plan_orders
-            if (o.get('info', {}).get('planType') or o.get('type', '')) == 'normal_plan'
-        ]
-        return len(sl_tp_orders) > 0
-
+        return len(plan_orders) > 0
 
     def get_open_position_symbols(self) -> set:
-        """
-        Borsada açık pozisyon olan sembolleri set olarak döndürür.
-
-        Ne yapar : fetch_positions() ile tüm açık pozisyonları çeker,
-                   sembol isimlerini set'e alır.
-        Neden    : Aynı sembol için tekrar işlem girilmesini önlemek için
-                   sembol bazlı kontrol yapılabilsin.
-        Döndürür : {'DOGEUSDT', 'XRPUSDT', ...}
-        """
+        """Borsada açık pozisyon olan sembolleri set olarak döndürür."""
         try:
             positions = self.fetch_positions()
             return {p['symbol'] for p in positions if p.get('symbol')}
         except Exception as e:
             logger.warning(f"⚠️ get_open_position_symbols hatası: {e}")
-            return set()                        # Hata durumunda boş set döner
+            return set()                        
 
     def cancel_open_orders(self, symbol: str) -> int:
         """Sembol için tüm açık emirleri iptal eder."""
@@ -720,24 +676,18 @@ if __name__ == "__main__":
         datefmt='%H:%M:%S'
     )
     print("=" * 65)
-    print("  📡 BİTGET EXECUTION ENGİNE v1.3 — BAĞIMSIZ TEST")
+    print("  📡 BINANCE EXECUTION ENGİNE v2.0 — BAĞIMSIZ TEST")
     print(f"  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 65)
 
-    executor = BitgetExecutor(dry_run=True)
+    executor = BinanceExecutor(dry_run=True)
     balance = executor.fetch_balance()
     print(f"\n  💰 Bakiye: ${balance['total']:,.2f}")
 
-    info = executor.get_market_info('SOL/USDT:USDT')
+    info = executor.get_market_info('SOL/USDT')
     print(f"  📋 SOL precision: price={info['precision']['price']}, amount={info['precision']['amount']}")
 
-    # TriggerPrice precision testi
-    test_prices = [84260.0, 84.26, 1.7564, 0.027120, 0.00123]
-    print(f"\n  🔧 TriggerPrice Precision Testi:")
-    for p in test_prices:
-        print(f"     {p} → {_format_trigger_price(p)}")
-
-    order = executor.place_market_order('SOL/USDT:USDT', 'sell', 0.405)
+    order = executor.place_market_order('SOL/USDT', 'sell', 0.405)
     print(f"\n  📤 Market: {order.side.upper()} {order.amount} → {order.status} ✅")
 
     print(f"\n{'=' * 65}")

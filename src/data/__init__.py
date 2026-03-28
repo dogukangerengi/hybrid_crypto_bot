@@ -1,23 +1,23 @@
 # =============================================================================
-# VERİ MODÜLÜ (DATA MODULE) — Bitget Futures
+# VERİ MODÜLÜ (DATA MODULE) — Binance Futures
 # =============================================================================
-# Bitget USDT-M Perpetual Futures veri çekme ve ön işleme.
+# Binance USDT-M Perpetual Futures veri çekme ve ön işleme.
 #
 # Kullanım:
-#   from data import BitgetFetcher, DataPreprocessor
+#   from data import BinanceFetcher, DataPreprocessor
 #   # veya geriye uyumluluk için:
-#   from data import DataFetcher  # → BitgetFetcher alias'ı
+#   from data import DataFetcher  # → BinanceFetcher alias'ı
 # =============================================================================
 
-from .fetcher import BitgetFetcher
+from .fetcher import BinanceFetcher
 from .preprocessor import DataPreprocessor
 
 # Geriye uyumluluk alias'ı — eski modüller DataFetcher bekliyor
 # main.py, telegram_bot.py, app.py hepsi DataFetcher import eder
-DataFetcher = BitgetFetcher
+DataFetcher = BinanceFetcher
 
 __all__ = [
-    'BitgetFetcher',       # Yeni isim (Bitget Futures)
+    'BinanceFetcher',      # Yeni isim (Binance Futures)
     'DataFetcher',         # Eski isim (alias, geriye uyumlu)
     'DataPreprocessor',    # Veri ön işleme
 ]
