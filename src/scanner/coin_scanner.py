@@ -39,8 +39,8 @@ from datetime import datetime, timezone        # Zaman damgası (cache için)
 sys.path.insert(0, str(Path(__file__).parent.parent))  # → src/
 from config import cfg, get_setting            # Merkezi config + yaml okuyucu
 
-# Data modülü import (BitgetFetcher)
-from data.fetcher import BitgetFetcher         # CCXT üzerinden Bitget API
+# Data modülü import (BinanceFetcher)
+from data.fetcher import BinanceFetcher         # CCXT üzerinden Binance API
 
 # Logger
 logger = logging.getLogger(__name__)
@@ -155,7 +155,7 @@ class CoinScanner:
     
     def __init__(
         self,
-        fetcher: Optional[BitgetFetcher] = None,
+        fetcher: Optional[BinanceFetcher] = None,
         weights: Optional[Dict[str, float]] = None,
         verbose: bool = True
     ):
@@ -176,7 +176,7 @@ class CoinScanner:
         verbose : bool
             True → tarama adımları ve istatistikler loglanır
         """
-        self.fetcher = fetcher or BitgetFetcher()
+        self.fetcher = fetcher or BinanceFetcher()
         self.weights = weights or self.DEFAULT_WEIGHTS
         self.verbose = verbose
         

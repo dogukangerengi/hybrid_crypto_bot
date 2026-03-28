@@ -16,13 +16,13 @@ system:
   timezone: "UTC"
 
 # -----------------------------------------------------------------------------
-# BORSA AYARLARI (Bitget USDT-M Perpetual Futures)
+# BORSA AYARLARI (Binance USDT-M Perpetual Futures)
 # -----------------------------------------------------------------------------
 exchange:
-  id: "bitget"                               # CCXT borsa ID
-  market_type: "swap"                        # swap = USDT-M Perpetual
+  id: "binance"                              # CCXT borsa ID
+  market_type: "future"                      # future = Binance USDT-M
   sandbox: false                             # true = demo hesap
-
+  
 # -----------------------------------------------------------------------------
 # RİSK YÖNETİMİ
 # -----------------------------------------------------------------------------
