@@ -51,7 +51,7 @@ class ExchangeConfig:
     """Borsa bağlantı yapılandırması (Binance Futures)"""
     id: str = "binance"                      # CCXT borsa ID'si
     market_type: str = "future"              # future = USDT-M Perpetual (Binance)
-    default_symbol: str = "BTC/USDT"         # Binance futures formatı
+    default_symbol: str = "BTC/USDT:USDT"    # Binance futures formatı
     sandbox: bool = False                    
     
     api_key: str = ""

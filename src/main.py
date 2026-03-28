@@ -1087,7 +1087,7 @@ class MLTradingPipeline:
             logger.error(f"❌ Tecrübeden öğrenme (Retrain) hatası: {e}", exc_info=True)
             return False
     
-    def initial_train(self, symbol: str = "BTC/USDT") -> bool:
+    def initial_train(self, symbol: str = "BTC/USDT:USDT") -> bool:
         """
         Pipeline ilk başladığında LightGBM'i tarihsel veri ile eğitir.
         """
