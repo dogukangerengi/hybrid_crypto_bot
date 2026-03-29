@@ -61,6 +61,7 @@ class ExecutionResult:
     dry_run: bool = False
     error: str = ""
     timestamp: str = ""
+    order_id: str = ""  
 
     def summary(self) -> str:
         mode = "🧪 DRY RUN" if self.dry_run else "🔴 CANLI"
@@ -517,88 +518,104 @@ class BinanceExecutor:
     # ANA TRADE EXECUTION
     # =========================================================================
 
-    def execute_trade(self, trade_calc, skip_sl: bool = False,
-                      skip_tp: bool = False) -> ExecutionResult:
-        """
-        Tam trade execution pipeline (Binance için zincirleme yapı):
-        1. Margin mode ayarla (isolated)
-        2. Kaldıraç ayarla
-        3. Ana market emrini gönder
-        4. Başarılıysa SL ve TP emirlerini gönder. Herhangi biri başarısız olursa
-           ana pozisyonu geri kapat (güvenlik ağı).
-        """
-        timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-        exec_result = ExecutionResult(
-            symbol=trade_calc.symbol,
-            direction=trade_calc.direction,
-            dry_run=self.dry_run,
-            timestamp=timestamp
-        )
+    def execute_trade(self, trade_calc, skip_sl: bool = False, skip_tp: bool = False):
+        if self.dry_run:
+            return ExecutionResult(success=True, actual_entry=trade_calc.entry_price)
 
-        if not trade_calc.is_approved():
-            exec_result.error = f"Trade onaylı değil: {trade_calc.rejection_reasons}"
-            logger.warning(exec_result.error)
-            return exec_result
+        symbol = trade_calc.symbol
+        direction = trade_calc.direction if isinstance(trade_calc.direction, str) else trade_calc.direction.value
+        amount = trade_calc.position.size
+        leverage = trade_calc.position.leverage
 
-        symbol    = trade_calc.symbol
-        direction = trade_calc.direction
-        pos = trade_calc.position
-        
-        sl_price  = trade_calc.stop_loss.price if not skip_sl else None
-        tp_price  = trade_calc.take_profit.price if not skip_tp else None
-        
-        open_side  = 'buy'  if direction == 'LONG' else 'sell'
-        close_side = 'sell' if direction == 'LONG' else 'buy'
-
-        logger.info(
-            f"{'🧪' if self.dry_run else '🔴'} Trade Başlıyor: {direction} {symbol} | "
-            f"Size: {pos.size} | Lev: {pos.leverage}x"
-        )
+        logger.info(f"🔴 Trade Başlıyor: {direction} {symbol} | Size: {amount} | Lev: {leverage}x")
 
         try:
-            # 1. Margin mode
-            self.set_margin_mode(symbol, 'isolated')
+            exchange = self._get_exchange()
 
-            # 2. Kaldıraç
-            self.set_leverage(symbol, pos.leverage)
+            # 1. Margin ve Kaldıraç Ayarları
+            try:
+                exchange.set_margin_mode('isolated', symbol)
+                logger.info(f"📋 Margin mode: {symbol} → ISOLATED")
+            except Exception:
+                pass  # Zaten isolated ise hata verir, atlıyoruz
 
-            # 3. Ana market emri
-            main_order = self.place_market_order(symbol=symbol, side=open_side, amount=pos.size)
-            exec_result.main_order = main_order
+            exchange.set_leverage(leverage, symbol)
+            logger.info(f"⚡ Kaldıraç ayarlandı: {symbol} → {leverage}x")
 
-            if not main_order.success:
-                exec_result.error = f"Ana emir başarısız: {main_order.error}"
-                return exec_result
+            # 2. Miktarı Binance Precision Formatına Uyarla
+            amount_formatted = float(exchange.amount_to_precision(symbol, amount))
 
-            exec_result.actual_entry  = main_order.price or trade_calc.entry_price
-            exec_result.actual_amount = main_order.filled or pos.size
-            exec_result.actual_cost   = main_order.cost or (pos.size * trade_calc.entry_price)
+            # 3. Ana İşlem (Market Order Girişi)
+            side = 'buy' if direction == 'LONG' else 'sell'
+            
+            main_order = exchange.create_order(
+                symbol=symbol,
+                type='market',
+                side=side,
+                amount=amount_formatted
+            )
+            
+            actual_entry = main_order.get('average')
+            if not actual_entry:
+                actual_entry = main_order.get('price') or trade_calc.entry_price
+            actual_entry = float(actual_entry)
 
-            # 4. Binance'te SL/TP zincirleme gönderilir (Ana emirden ayrı)
-            if sl_price:
-                sl_order = self.place_stop_loss(symbol, close_side, exec_result.actual_amount, sl_price)
-                exec_result.sl_order = sl_order
-                
-                # Güvenlik ağı: SL koyulamazsa ana pozisyonu anında kapat!
-                if not sl_order.success and not self.dry_run:
-                    logger.error("🛑 ACİL: SL emri girilemedi! Korumasız kalmamak için pozisyon kapatılıyor.")
-                    self.close_position(symbol, direction, exec_result.actual_amount)
-                    exec_result.error = f"SL girilemediği için pozisyon iptal edildi. Hata: {sl_order.error}"
-                    exec_result.success = False
-                    return exec_result
+            # 4. TP / SL Emirleri (Binance Futures formatı)
+            exit_side = 'sell' if direction == 'LONG' else 'buy'
 
-            if tp_price:
-                tp_order = self.place_take_profit(symbol, close_side, exec_result.actual_amount, tp_price)
-                exec_result.tp_order = tp_order
+            if not skip_sl and trade_calc.stop_loss.price > 0:
+                sl_price_fmt = float(exchange.price_to_precision(symbol, trade_calc.stop_loss.price))
+                try:
+                    exchange.create_order(
+                        symbol=symbol,
+                        type='STOP_MARKET',
+                        side=exit_side,
+                        amount=amount_formatted,
+                        params={'stopPrice': sl_price_fmt, 'reduceOnly': True}
+                    )
+                    logger.info(f"🛡️ Stop-Loss ayarlandı: ${sl_price_fmt}")
+                except Exception as e:
+                    logger.info(f"⚠️ SL ayarlanamadı: {e}")
 
-            exec_result.success = True
-            logger.info(f"✅ Trade GÜVENLİ ŞEKİLDE ONAYLANDI: {direction} {exec_result.actual_amount} {symbol}")
+            if not skip_tp and trade_calc.take_profit.price > 0:
+                tp_price_fmt = float(exchange.price_to_precision(symbol, trade_calc.take_profit.price))
+                try:
+                    exchange.create_order(
+                        symbol=symbol,
+                        type='TAKE_PROFIT_MARKET',
+                        side=exit_side,
+                        amount=amount_formatted,
+                        params={'stopPrice': tp_price_fmt, 'reduceOnly': True}
+                    )
+                    logger.info(f"🎯 Take-Profit ayarlandı: ${tp_price_fmt}")
+                except Exception as e:
+                    logger.info(f"⚠️ TP ayarlanamadı: {e}")
+
+            return ExecutionResult(success=True, actual_entry=actual_entry, order_id=main_order.get('id', ''))
 
         except Exception as e:
-            exec_result.error = str(e)
-            logger.error(f"❌ Trade hatası: {e}")
+            return ExecutionResult(success=False, error=str(e))
+        
 
-        return exec_result
+    def cancel_all_orders(self, symbol: str):
+        """
+        Açıkta kalan tüm emirleri (SL/TP dahil) bulup kesin olarak iptal eder.
+        """
+        if self.dry_run:
+            return
+        try:
+            exchange = self._get_exchange()
+            # O coin'e ait bekleyen tüm emirleri listele
+            open_orders = exchange.fetch_open_orders(symbol)
+            # Listelenen tüm emirleri tek tek zorla sil
+            for order in open_orders:
+                try:
+                    exchange.cancel_order(order['id'], symbol)
+                except Exception:
+                    pass
+            logger.info(f"🧹 {symbol} için {len(open_orders)} adet eski emir başarıyla temizlendi.")
+        except Exception as e:
+            logger.info(f"⚠️ {symbol} eski emirleri temizlenirken uyarı: {e}")
 
     # =========================================================================
     # AÇIK EMİRLERİ İPTAL

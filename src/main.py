@@ -56,7 +56,6 @@ from performance_analyzer import PerformanceAnalyzer
 
 # ── ML modülleri (v2.0) ───────────────────────────────────────────────────────
 from ml.feature_engineer import FeatureEngineer, MLFeatureVector
-# from ml.lgbm_model import LGBMSignalModel, MLDecisionResult
 from ml.ensemble_model import EnsemblePredictor as LGBMSignalModel, MLDecisionResult
 from ml.signal_validator import SignalValidator, ValidationResult
 from ml.trade_memory import TradeMemory, TradeOutcome
@@ -78,7 +77,7 @@ logger = logging.getLogger(__name__)
 VERSION                = "2.1.0"
 MAX_COINS_PER_CYCLE    = 30
 DEFAULT_FWD_PERIOD     = 6
-MAX_OPEN_POSITIONS     = 10
+MAX_OPEN_POSITIONS     = 5
 MAX_CONSECUTIVE_ERRORS = 5
 ERROR_COOLDOWN_SECONDS = 300
 
@@ -121,11 +120,11 @@ class CoinAnalysisResult:
     volume_24h:       float = 0.0              # 24h USDT hacim
 
     # ── IC Analiz (FeatureEngineer bu alanları okur) ──
-    best_timeframe:   str   = ""              # En yüksek IC skorlu TF
-    ic_confidence:    float = 0.0             # Composite IC skoru (0-100)
-    ic_direction:     str   = ""              # 'LONG' / 'SHORT' / 'NEUTRAL'
-    significant_count: int  = 0               # İstatistiksel anlamlı indikatör sayısı
-    market_regime:    str   = ""              # 'trending' / 'ranging' / 'volatile'
+    best_timeframe:   str   = ""               # En yüksek IC skorlu TF
+    ic_confidence:    float = 0.0              # Composite IC skoru (0-100)
+    ic_direction:     str   = ""               # 'LONG' / 'SHORT' / 'NEUTRAL'
+    significant_count: int  = 0                # İstatistiksel anlamlı indikatör sayısı
+    market_regime:    str   = ""               # 'trending' / 'ranging' / 'volatile'
 
     # ── FeatureEngineer için ek alanlar ──
     category_tops:    Dict  = field(default_factory=dict)
@@ -143,7 +142,7 @@ class CoinAnalysisResult:
     # ── ML Karar ──
     ml_result:        Optional[MLDecisionResult] = None
     val_result:       Optional[ValidationResult] = None
-    ml_skipped:       bool  = False           # Model henüz eğitilmediyse True
+    ml_skipped:       bool  = False            # Model henüz eğitilmediyse True
 
     # ── Execution ──
     trade_executed:   bool  = False
@@ -610,12 +609,12 @@ class MLTradingPipeline:
                     return result
 
                 paper_id = self.paper_trader.open_trade(
-                    symbol        = result.coin,           
-                    full_symbol   = result.full_symbol,    
+                    symbol        = result.coin,             
+                    full_symbol   = result.full_symbol,      
                     direction     = direction,
                     entry_price   = result.price,          
-                    stop_loss     = result.sl_price,       
-                    take_profit   = result.tp_price,       
+                    stop_loss     = result.sl_price,        
+                    take_profit   = result.tp_price,        
                     position_size = result.position_size,  
                     leverage      = result.leverage,
                     ic_confidence = result.ic_confidence,
@@ -671,7 +670,7 @@ class MLTradingPipeline:
                     return result
 
                 try:
-                    symbol_for_check  = list(candidate_symbols)[0]
+                    symbol_for_check  = result.full_symbol
                     has_existing_orders = self.executor.has_tp_sl_orders(
                         symbol_for_check
                     )
@@ -902,6 +901,94 @@ class MLTradingPipeline:
             
             if closed_count > 0:
                 logger.info(f"   Mevcut Bakiye: ${self.paper_trader.balance:.2f}")
+
+        else:
+            # --- CANLI BORSA (BINANCE) POZİSYON KONTROLÜ VE TEMİZLİK ---
+            try:
+                active_symbols = set()
+                try:
+                    active_symbols = self.executor.get_open_position_symbols()
+                except Exception:
+                    pass
+                    
+                # Hafızadaki (TradeMemory) açık canlı işlemleri kontrol et
+                closed_count = 0
+                for mem_id, mem_trade in list(self.trade_memory.open_trades.items()):
+                    is_active = False
+                    for act_sym in active_symbols:
+                        if mem_trade.coin in act_sym or mem_trade.symbol == act_sym:
+                            is_active = True
+                            break
+                            
+                    if not is_active:
+                        # 1. Kapanış Nedenini (SL/TP) Tahmin Et ve Soğuma Süresini Uygula
+                        close_reason = "Closed on Binance"
+                        exit_price = 0.0
+                        pnl_val = 0.0
+                        try:
+                            ticker = self.executor._get_exchange().fetch_ticker(mem_trade.symbol)
+                            current_price = ticker['last']
+                            exit_price = current_price
+                            
+                            # Fiyat SL'ye mi daha yakın, TP'ye mi hesapla
+                            dist_sl = abs(current_price - mem_trade.sl_price)
+                            dist_tp = abs(current_price - mem_trade.tp_price)
+                            
+                            if dist_sl < dist_tp:
+                                close_reason = "SL Hit"
+                                pnl_val = -1.0 # Negatif PnL belirtteci
+                                # COOLDOWN (SOĞUMA) DEVREYE GİRİYOR
+                                self.cooldowns[mem_trade.coin] = datetime.now() + timedelta(hours=2)
+                                logger.info(f"   ❄️ {mem_trade.coin} SL oldu! 2 saat soğuma süresine alındı.")
+                            else:
+                                close_reason = "TP Hit"
+                                pnl_val = 1.0 # Pozitif PnL belirtteci
+                                logger.info(f"   🎯 {mem_trade.coin} TP oldu! Hedefe ulaşıldı.")
+                        except Exception:
+                            pass
+
+                        logger.info(f"   ✅ CANLI İŞLEM KAPANDI: {mem_trade.symbol} ({close_reason})")
+                        
+                        # 2. TEMİZLİK: Geriye kalan SL veya TP emirlerini kesin olarak çöpe at
+                        if hasattr(self.executor, 'cancel_all_orders'):
+                            self.executor.cancel_all_orders(mem_trade.symbol)
+                        
+                        # 3. Hafızaya (Tecrübeye) ekle
+                        self.trade_memory.close_trade(
+                            trade_id=mem_id,
+                            exit_price=exit_price,
+                            pnl=pnl_val,
+                            exit_reason=close_reason
+                        )
+
+                        # 4. EXCEL GÜNCELLEMESİ
+                        try:
+                            import pandas as pd
+                            from pathlib import Path
+                            from datetime import datetime
+                            
+                            excel_path = Path("logs") / "live_trades.xlsx"
+                            if excel_path.exists():
+                                df = pd.read_excel(excel_path)
+                                mask = (df['Coin'] == mem_trade.coin) & (df['Durum'] == 'open')
+                                if mask.any():
+                                    idx = df[mask].index[-1]
+                                    df.at[idx, 'Tarih (Kapanış)'] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")
+                                    df.at[idx, 'Çıkış ($)'] = exit_price
+                                    df.at[idx, 'Çıkış Nedeni'] = close_reason
+                                    df.at[idx, 'Durum'] = "closed"
+                                    df.to_excel(excel_path, index=False)
+                                    logger.info(f"   📊 Excel güncellendi: {mem_trade.coin} kapalı olarak işaretlendi.")
+                        except Exception as e:
+                            logger.error(f"   ❌ Excel güncelleme hatası: {e}")
+
+                        closed_count += 1
+                        
+                if closed_count > 0:
+                    logger.info(f"   🧹 {closed_count} işlemin kontrolü ve temizliği tamamlandı.")
+                    
+            except Exception as e:
+                logger.error(f"   ❌ Canlı pozisyon kontrol/temizlik hatası: {e}")
 
     # =========================================================================
     # ANA DÖNGÜ
@@ -1140,7 +1227,7 @@ class MLTradingPipeline:
             rows_X = []
             rows_y = []
 
-            train_cat_tops = {}                                   
+            train_cat_tops = {}                                    
             train_ic_direction = 'NEUTRAL'                         
             try:
                 target_col_ic = f'fwd_ret_{self.fwd_period}'
@@ -1195,7 +1282,7 @@ class MLTradingPipeline:
                                             if len(ci) >= 3:
                                                 matched.append(s)
                                                 break
-                                    cat_scores = matched
+                                cat_scores = matched
 
                             if cat_scores:
                                 top = max(cat_scores, key=lambda s: abs(s.ic_mean))

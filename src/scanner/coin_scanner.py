@@ -421,7 +421,7 @@ class CoinScanner:
                 if bid > 0 and ask > 0:
                     spread_pct = ((ask - bid) / last) * 100
                 else:
-                    spread_pct = 999.0                     # Geçersiz → filtrele
+                    spread_pct = 0.05  # Binance toplu istekte bid/ask yollamazsa varsayılan uygun değeri ata
                 
                 # 24h volatilite: (high - low) / midprice × 100
                 # → IC'nin yakalayabileceği sinyal büyüklüğünün proxy'si
