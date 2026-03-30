@@ -599,23 +599,52 @@ class BinanceExecutor:
 
     def cancel_all_orders(self, symbol: str):
         """
-        Açıkta kalan tüm emirleri (SL/TP dahil) bulup kesin olarak iptal eder.
+        Binance üzerindeki normal limit emirleri ve ÖZELLİKLE
+        STOP_MARKET / TAKE_PROFIT_MARKET gibi tüm koşullu emirleri bulur ve kesin olarak iptal eder.
         """
         if self.dry_run:
             return
+            
+        logger.info(f"   🧹 {symbol} için emir iptal prosedürü başlatılıyor...")
         try:
             exchange = self._get_exchange()
-            # O coin'e ait bekleyen tüm emirleri listele
-            open_orders = exchange.fetch_open_orders(symbol)
-            # Listelenen tüm emirleri tek tek zorla sil
-            for order in open_orders:
+            
+            # 1. YÖNTEM: Normal Limit Emirlerini Sil
+            try:
+                exchange.cancel_all_orders(symbol)
+            except Exception as e:
+                pass # Hata verse de sessizce geç, asıl işimiz stop'larla
+
+            # 2. YÖNTEM: Açık olan tüm NORMAL emirleri çek
+            try:
+                normal_orders = exchange.fetch_open_orders(symbol)
+            except Exception:
+                normal_orders = []
+
+            # 3. YÖNTEM: Açık olan tüm KOŞULLU (SL/TP) emirleri çek
+            # Binance USDT-M Futures API'sinde stop/take_profit emirlerini çekmek için params={'stop': True} ZORUNLUDUR!
+            try:
+                conditional_orders = exchange.fetch_open_orders(symbol, params={'stop': True})
+            except Exception:
+                conditional_orders = []
+
+            all_orders = normal_orders + conditional_orders
+            
+            count = 0
+            for order in all_orders:
                 try:
                     exchange.cancel_order(order['id'], symbol)
-                except Exception:
-                    pass
-            logger.info(f"🧹 {symbol} için {len(open_orders)} adet eski emir başarıyla temizlendi.")
+                    count += 1
+                except Exception as ex:
+                    logger.error(f"      ❌ Emir silinemedi (ID: {order.get('id')}): {ex}")
+                    
+            if count > 0:
+                logger.info(f"   ✅ {symbol} için {count} adet bekleyen emir (SL/TP) başarıyla temizlendi.")
+            else:
+                logger.info(f"   ℹ️ {symbol} için tahtada silinecek aktif emir bulunamadı.")
+                
         except Exception as e:
-            logger.info(f"⚠️ {symbol} eski emirleri temizlenirken uyarı: {e}")
+            logger.error(f"   ❌ {symbol} genel iptal prosedürü hatası: {e}")
 
     # =========================================================================
     # AÇIK EMİRLERİ İPTAL

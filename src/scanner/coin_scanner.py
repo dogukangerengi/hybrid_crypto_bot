@@ -150,7 +150,10 @@ class CoinScanner:
         'USDC', 'USDT', 'BUSD', 'DAI', 'TUSD', 'FDUSD',  # Stablecoinler
         'UP', 'DOWN', 'BULL', 'BEAR',                       # Leveraged token kısaltmaları
         '3L', '3S', '5L', '5S',                             # Leveraged token varyantları
-        'BTTC',                                               # Bilinen sorunlu coin
+        'BTTC', 'A2Z'
+                                                      
+                                                      
+                                                                                                    # Bilinen sorunlu coin
     ]
     
     def __init__(
@@ -182,7 +185,7 @@ class CoinScanner:
         
         # settings.yaml'dan filtre parametrelerini oku
         # get_setting(): config modülündeki yaml okuyucu (nokta-ayrımlı key path)
-        self.min_volume = get_setting('scanner.min_24h_volume_usdt', 1_000_000)
+        self.min_volume = get_setting('scanner.min_24h_volume_usdt', 5_000_000)
         self.max_spread_pct = get_setting('scanner.max_spread_pct', 0.20)
         self.top_n = get_setting('scanner.top_n_coins', 20)
         self.min_price = 0.0001                # Min fiyat eşiği ($0.0001)

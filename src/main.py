@@ -553,6 +553,27 @@ class MLTradingPipeline:
     # =========================================================================
 
     def _execute_trade(self, result: CoinAnalysisResult) -> CoinAnalysisResult:
+        
+        # --- 1. SOĞUMA SÜRESİ (COOLDOWN) KESİN KONTROLÜ ---
+        if hasattr(self, 'cooldowns') and result.coin in self.cooldowns:
+            if datetime.now() < self.cooldowns[result.coin]:
+                kalan_dk = int((self.cooldowns[result.coin] - datetime.now()).total_seconds() / 60)
+                logger.info(f"   ❄️ {result.coin} işlemi REDDEDİLDİ: Soğuma süresinde (Kalan: {kalan_dk} dk)")
+                result.status = "cooldown"
+                return result
+            else:
+                del self.cooldowns[result.coin] # Süre dolmuşsa kilidi kaldır
+
+        # --- 2. BAŞARISIZ İŞLEMLERİ (A2Z GİBİ) TEKRAR DENEMEYİ ENGELLEME ---
+        # Eğer bir coin daha önce 'api_error' veya 'execution_error' aldıysa ve blacklist'te yoksa, onu da soğutalım
+        if result.status in ["api_error", "execution_error", "live_price_error"]:
+            logger.info(f"   🚫 {result.coin} API tarafından daha önce reddedildi. 1 saat soğumaya alınıyor.")
+            if not hasattr(self, 'cooldowns'):
+                 self.cooldowns = {}
+            self.cooldowns[result.coin] = datetime.now() + timedelta(hours=1)
+            return result
+
+        # --- 3. MEVCUT DURUM KONTROLLERİ ---
         if result.status != "ready" or result.ml_result is None:
             return result
 
@@ -638,20 +659,21 @@ class MLTradingPipeline:
 
             else:
                 # --- GERÇEK BORSA (BINANCE) MANTIĞI ---
+                
+                # ÇÖZÜM 2: Binance API yanıt vermezse kör işlem açmayı engelle
                 try:
-                    open_count = len(self.executor.fetch_positions())
-                except Exception:
-                    open_count = 0
+                    current_positions = self.executor.fetch_positions()
+                    open_count = len(current_positions)
+                    open_symbols = {p['symbol'] for p in current_positions if p.get('symbol')}
+                except Exception as e:
+                    result.status = "api_error"
+                    logger.warning(f"   ⚠️ Binance API'ye ulaşılamadı ({e}). Risk almamak için işlem atlanıyor.")
+                    return result
 
                 if open_count >= MAX_OPEN_POSITIONS:
                     result.status = "position_limit"
                     logger.info(f"   ⚠️ {result.coin} atlandı: Canlı borsada max pozisyona ({MAX_OPEN_POSITIONS}) ulaşıldı.")
                     return result
-
-                try:
-                    open_symbols = self.executor.get_open_position_symbols()
-                except Exception:
-                    open_symbols = set()        
 
                 # Binance symbol format 'BTC/USDT' vs 'BTC'
                 candidate_symbols = {
@@ -758,6 +780,11 @@ class MLTradingPipeline:
                     result.status = "execution_error"
                     result.error  = exec_res.error
                     logger.error(f"   ❌ Canlı işlem açılamadı: {exec_res.error}")
+                    # İşlem Binance tarafında hata aldıysa (A2Z gibi) soğuma süresine sok:
+                    if not hasattr(self, 'cooldowns'):
+                        self.cooldowns = {}
+                    self.cooldowns[result.coin] = datetime.now() + timedelta(hours=1)
+                    logger.info(f"   🚫 {result.coin} API tarafından reddedildiği için 1 saat soğumaya alındı.")
 
             # ---------------------------------------------------------
             # HAFIZAYA KAYDET (TRADE MEMORY)
@@ -923,12 +950,11 @@ class MLTradingPipeline:
                     if not is_active:
                         # 1. Kapanış Nedenini (SL/TP) Tahmin Et ve Soğuma Süresini Uygula
                         close_reason = "Closed on Binance"
-                        exit_price = 0.0
+                        exit_price = mem_trade.entry_price # Hata olursa 0.0 yazmaması için varsayılan olarak giriş fiyatını al
                         pnl_val = 0.0
                         try:
                             ticker = self.executor._get_exchange().fetch_ticker(mem_trade.symbol)
                             current_price = ticker['last']
-                            exit_price = current_price
                             
                             # Fiyat SL'ye mi daha yakın, TP'ye mi hesapla
                             dist_sl = abs(current_price - mem_trade.sl_price)
@@ -937,17 +963,19 @@ class MLTradingPipeline:
                             if dist_sl < dist_tp:
                                 close_reason = "SL Hit"
                                 pnl_val = -1.0 # Negatif PnL belirtteci
+                                exit_price = mem_trade.sl_price # Stop fiyatını çıkış olarak kabul et
                                 # COOLDOWN (SOĞUMA) DEVREYE GİRİYOR
                                 self.cooldowns[mem_trade.coin] = datetime.now() + timedelta(hours=2)
                                 logger.info(f"   ❄️ {mem_trade.coin} SL oldu! 2 saat soğuma süresine alındı.")
                             else:
                                 close_reason = "TP Hit"
                                 pnl_val = 1.0 # Pozitif PnL belirtteci
+                                exit_price = mem_trade.tp_price # TP fiyatını çıkış olarak kabul et
                                 logger.info(f"   🎯 {mem_trade.coin} TP oldu! Hedefe ulaşıldı.")
                         except Exception:
+                            # Borsa anlık yanıt vermezse ML verisini bozmamak adına en mantıklı tahmini yap
+                            logger.warning(f"   ⚠️ {mem_trade.coin} için anlık fiyat çekilemedi, çıkış fiyatı tahmin ediliyor.")
                             pass
-
-                        logger.info(f"   ✅ CANLI İŞLEM KAPANDI: {mem_trade.symbol} ({close_reason})")
                         
                         # 2. TEMİZLİK: Geriye kalan SL veya TP emirlerini kesin olarak çöpe at
                         if hasattr(self.executor, 'cancel_all_orders'):
@@ -970,25 +998,62 @@ class MLTradingPipeline:
                             excel_path = Path("logs") / "live_trades.xlsx"
                             if excel_path.exists():
                                 df = pd.read_excel(excel_path)
+                                
+                                # ÇÖZÜM 1: Metin yazacağımız sütunların veri tipini güvenli 'object' tipine çeviriyoruz
+                                for col in ['Tarih (Kapanış)', 'Çıkış Nedeni', 'Durum']:
+                                    if col in df.columns:
+                                        df[col] = df[col].astype(object)
+                                        
+                                # ÇÖZÜM 2: Ondalıklı sayı (float) yazacağımız sütunların tipini 'float' olarak zorluyoruz
+                                # Bu sayede Pandas'ın baştaki sıfırları görüp int64 (tam sayı) dayatması yapmasını engelliyoruz
+                                for col in ['Çıkış ($)', 'PnL ($)', 'PnL (%)']:
+                                    if col in df.columns:
+                                        df[col] = df[col].astype(float)
+                                
+                                # Durumu 'open' olan ve coin adı eşleşen son işlemi bul
                                 mask = (df['Coin'] == mem_trade.coin) & (df['Durum'] == 'open')
+                                
                                 if mask.any():
-                                    idx = df[mask].index[-1]
-                                    df.at[idx, 'Tarih (Kapanış)'] = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")
-                                    df.at[idx, 'Çıkış ($)'] = exit_price
+                                    idx = df[mask].index[-1] # En güncel açık işlemi seç
+                                    
+                                    # Olası numpy/ccxt tiplerini standart Python float'ına çeviriyoruz
+                                    safe_exit = float(exit_price)
+                                    safe_entry = float(mem_trade.entry_price)
+                                    safe_size = float(mem_trade.position_size)
+                                    
+                                    # Yön bilgisine göre Dolar Bazlı ve Yüzdelik Kâr/Zarar Hesaplama
+                                    if mem_trade.direction == "LONG":
+                                        pnl_val = (safe_exit - safe_entry) * safe_size
+                                    else:
+                                        pnl_val = (safe_entry - safe_exit) * safe_size
+                                        
+                                    pnl_pct = (pnl_val / (safe_entry * safe_size)) * 100 * mem_trade.leverage
+                                    
+                                    # Excel tablosundaki değerleri güncelle
+                                    df.at[idx, 'Tarih (Kapanış)'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                    df.at[idx, 'Çıkış ($)'] = safe_exit
                                     df.at[idx, 'Çıkış Nedeni'] = close_reason
-                                    df.at[idx, 'Durum'] = "closed"
+                                    df.at[idx, 'PnL ($)'] = round(pnl_val, 4)
+                                    df.at[idx, 'PnL (%)'] = round(pnl_pct, 2)
+                                    df.at[idx, 'Durum'] = "closed" # İşlemi kapalı olarak işaretle
+                                    
                                     df.to_excel(excel_path, index=False)
-                                    logger.info(f"   📊 Excel güncellendi: {mem_trade.coin} kapalı olarak işaretlendi.")
+                                    logger.info(f"   📊 Excel güncellendi: {mem_trade.coin} ({close_reason}) | PnL: ${pnl_val:.2f}")
+                                else:
+                                    logger.warning(f"   ⚠️ Excel'de kapatılacak 'open' statüsünde {mem_trade.coin} kaydı bulunamadı!")
                         except Exception as e:
-                            logger.error(f"   ❌ Excel güncelleme hatası: {e}")
-
+                            logger.error(f"   ❌ Excel güncelleme hatası: {e}", exc_info=True)
+                            
+                        # Sayaç artırımı (İşlemlerin kontrol edildiğini anlamak için gerekli)
                         closed_count += 1
                         
+                # Açık canlı işlemlerin kontrol döngüsü bittikten sonra:
                 if closed_count > 0:
                     logger.info(f"   🧹 {closed_count} işlemin kontrolü ve temizliği tamamlandı.")
                     
             except Exception as e:
-                logger.error(f"   ❌ Canlı pozisyon kontrol/temizlik hatası: {e}")
+                # EN DIŞTAKİ TRY BLOĞUNUN EKSİK OLAN EXCEPT KISMI BURASI
+                logger.error(f"   ❌ Canlı pozisyon kontrol/temizlik hatası: {e}", exc_info=True)
 
     # =========================================================================
     # ANA DÖNGÜ
@@ -1027,7 +1092,11 @@ class MLTradingPipeline:
             logger.info(f"\n🔬 ML analizi ({len(coins)} coin)...")
             results = []
             
-            open_coins = [trade.symbol for trade in self.paper_trader.open_trades.values()] if self.dry_run else []
+            # ÇÖZÜM 1: Canlı modda Binance'e sormadan önce kendi hafızasındaki (RAM) açık işlemleri kontrol et
+            if self.dry_run:
+                open_coins = [trade.symbol for trade in self.paper_trader.open_trades.values()]
+            else:
+                open_coins = [mem_trade.coin for mem_trade in self.trade_memory.open_trades.values()]
 
             for c in coins:
                 if c.coin in open_coins:
