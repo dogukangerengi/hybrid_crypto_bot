@@ -1,26 +1,10 @@
 # =============================================================================
-# MAIN.PY — ML-DRIVEN TRADING PIPELINE v2.1.1 (BINANCE VADELİ İŞLEMLER)
+# MAIN.PY — ML-DRIVEN TRADING PIPELINE v2.1.3 (BINANCE VADELİ İŞLEMLER)
 # =============================================================================
-# v2.1.1 Düzeltmeler:
-#   ✅ Cooldown mekanizması standardize edildi (hem kısa hem uzun sembol)
-#   ✅ TP/SL otomatik iptal düzeltildi (canlı modda cancel_all_orders çağrısı eklendi)
-#   ✅ Cooldown hafıza yüklemesi iyileştirildi
-#   ✅ Canlı mod optimizasyonu
-#
-# Gemini tamamen kaldırıldı → LightGBM pipeline entegre edildi.
-#
-# Gerçek API:
-#   FeatureEngineer.build_features(analysis, ohlcv_df, all_tf_analyses) → MLFeatureVector
-#   LGBMSignalModel.predict(fv, ic_score, ic_direction) → MLDecisionResult
-#   SignalValidator.validate(fv, model, decision, confidence, ...) → ValidationResult
-#   LGBMSignalModel.train(X, y) → ModelMetrics
-#
-# Çalıştırma:
-#   python main.py             ← paper trade (varsayılan)
-#   python main.py --live      ← canlı trade (ÖNERİLEN)
-#   python main.py --train     ← sadece eğitim
-#   python main.py --report    ← performans raporu
-#   python main.py --schedule  ← 75dk scheduler
+# v2.1.3 Düzeltmeler:
+#   ✅ Tarama süresi 10 dakikaya düşürüldü.
+#   ✅ Cooldown için UTC saat dilimi hataları düzeltildi.
+#   ✅ Scheduler uyku modundayken 30 saniyede bir açık emir takibi eklendi.
 # =============================================================================
 
 import sys
@@ -52,7 +36,6 @@ sys.path.insert(0, str(_src_dir))
 # ── Mevcut modüller ───────────────────────────────────────────────────────────
 from config import cfg
 from scanner import CoinScanner
-# BİTGET YERİNE BİNANCE İMPORTLARI EKLENDİ
 from data import BinanceFetcher, DataPreprocessor
 from indicators import IndicatorCalculator, IndicatorSelector
 from execution import RiskManager, BinanceExecutor
@@ -80,7 +63,7 @@ logger = logging.getLogger(__name__)
 # SABİTLER
 # =============================================================================
 
-VERSION                = "2.1.1"  # ← Versiyon güncellendi
+VERSION                = "2.1.3"
 MAX_COINS_PER_CYCLE    = 30
 DEFAULT_FWD_PERIOD     = 6
 MAX_OPEN_POSITIONS     = 5
@@ -94,8 +77,8 @@ DEFAULT_TIMEFRAMES = {
     '2h' : 200,
 }
 
-IC_NO_TRADE = 12.0   # IC < bu → analizi atla, işlem yapma
-IC_TRADE    = 16.0   # IC >= bu → ML pipeline'a gönder
+IC_NO_TRADE = 12.0
+IC_TRADE    = 16.0
 
 # =============================================================================
 # ENUM'LAR
@@ -114,29 +97,21 @@ class CycleStatus(Enum):
 
 @dataclass
 class CoinAnalysisResult:
-    """
-    Tek bir coin'in tüm analiz sonuçlarını tutan veri yapısı.
-    FeatureEngineer bu nesneyi doğrudan kullanır.
-    """
-    # ── Kimlik ──
-    coin:             str   = ""               # Kısa sembol: 'BTC'
-    full_symbol:      str   = ""               # Tam sembol: 'BTC/USDT' (Binance Formatı)
-    price:            float = 0.0              # Son fiyat ($)
-    change_24h:       float = 0.0              # 24h % değişim
-    volume_24h:       float = 0.0              # 24h USDT hacim
+    coin:             str   = ""               
+    full_symbol:      str   = ""               
+    price:            float = 0.0              
+    change_24h:       float = 0.0              
+    volume_24h:       float = 0.0              
 
-    # ── IC Analiz (FeatureEngineer bu alanları okur) ──
-    best_timeframe:   str   = ""               # En yüksek IC skorlu TF
-    ic_confidence:    float = 0.0              # Composite IC skoru (0-100)
-    ic_direction:     str   = ""               # 'LONG' / 'SHORT' / 'NEUTRAL'
-    significant_count: int  = 0                # İstatistiksel anlamlı indikatör sayısı
-    market_regime:    str   = ""               # 'trending' / 'ranging' / 'volatile'
+    best_timeframe:   str   = ""               
+    ic_confidence:    float = 0.0              
+    ic_direction:     str   = ""               
+    significant_count: int  = 0                
+    market_regime:    str   = ""               
 
-    # ── FeatureEngineer için ek alanlar ──
     category_tops:    Dict  = field(default_factory=dict)
     tf_rankings:      List  = field(default_factory=list)
 
-    # ── Risk ──
     atr:              float = 0.0
     atr_pct:          float = 0.0
     sl_price:         float = 0.0
@@ -145,12 +120,10 @@ class CoinAnalysisResult:
     leverage:         int   = 1
     risk_reward:      float = 0.0
 
-    # ── ML Karar ──
     ml_result:        Optional[MLDecisionResult] = None
     val_result:       Optional[ValidationResult] = None
-    ml_skipped:       bool  = False            # Model henüz eğitilmediyse True
+    ml_skipped:       bool  = False            
 
-    # ── Execution ──
     trade_executed:   bool  = False
     status:           str   = "pending"
     error:            str   = ""
@@ -160,7 +133,6 @@ class CoinAnalysisResult:
 
 @dataclass
 class CycleReport:
-    """Bir tarama döngüsünün özet raporu."""
     timestamp:        str         = ""
     status:           CycleStatus = CycleStatus.NO_SIGNAL
     total_scanned:    int         = 0
@@ -180,10 +152,6 @@ class CycleReport:
 # =============================================================================
 
 class MLTradingPipeline:
-    """
-    LightGBM tabanlı trading pipeline.
-    """
-
     def __init__(
         self,
         dry_run:    bool = True,
@@ -198,56 +166,37 @@ class MLTradingPipeline:
         self.fwd_period = fwd_period
         self.verbose    = verbose
 
-        # ── Mevcut modüller ──
         self.scanner      = CoinScanner()
-        self.fetcher      = BinanceFetcher() # BINANCE OLDU
+        self.fetcher      = BinanceFetcher()
         self.preprocessor = DataPreprocessor()
         self.calculator   = IndicatorCalculator()
         self.selector     = IndicatorSelector(alpha=0.05)
         self.risk_manager = RiskManager()
-        self.executor     = BinanceExecutor(dry_run=dry_run) # BINANCE OLDU
+        self.executor     = BinanceExecutor(dry_run=dry_run)
         self.notifier     = TelegramNotifier()
         self.paper_trader = PaperTrader()
 
-        # ── ML modülleri ──
-        self.feature_eng  = FeatureEngineer()      # IC + context → MLFeatureVector
-        self.lgbm_model   = LGBMSignalModel()      # LightGBM model (train + predict)
-        self.validator    = SignalValidator()      # Bootstrap CI + regime filter
-        self.trade_memory = TradeMemory(
-            log_dir = _root_dir / "logs"
-        )                                          # Kalıcı trade hafızası
+        self.feature_eng  = FeatureEngineer()
+        self.lgbm_model   = LGBMSignalModel()
+        self.validator    = SignalValidator()
+        self.trade_memory = TradeMemory(log_dir = _root_dir / "logs")
 
-        # ── State ──
         self._balance          = 0.0
         self._initial_balance  = 0.0
         self._kill_switch      = False
         self._is_running       = False
         self._consecutive_errors = 0
-        self.cooldowns         = {}  # ❄️ SL olan coinler için bekleme hafızası
+        self.cooldowns         = {}
 
-        # ═══ DÜZELTME 1: Cooldown hafıza yüklemesi ═══
-        # Bot başladığında son 2 saat içinde SL olan coinleri hafızaya alır
         self._restore_cooldowns()
 
         logger.info(f"🚀 ML Trading Pipeline v{VERSION} (dry_run={dry_run})")
 
     def _restore_cooldowns(self):
-        """
-        Bot yeniden başlatıldığında, son 2 saat içinde SL olmuş coinleri hafızaya alır.
-        
-        Ne işe yarar:
-        - Bot çökse bile SL olan coinler 2 saat soğumaya devam eder
-        - Cooldown'lar kaybolmaz
-        """
         try:
-            now = datetime.now()
-            
-            # ═══ DÜZELTME: Hem Trade Memory hem Paper Trader kontrol et ═══
-            # Canlı modda: Trade Memory'den oku
-            # Paper modda: Paper Trader'dan oku
+            now = datetime.now(timezone.utc) # UTC olarak güncellendi
             
             if not self.dry_run:
-                # CANLI MOD: Trade Memory'den hafıza yükle
                 memory_file = self.trade_memory.log_dir / "ml_trade_memory.json"
                 if memory_file.exists():
                     import json
@@ -264,11 +213,12 @@ class MLTradingPipeline:
                             if exit_reason == "SL Hit" and closed_at_str and coin:
                                 try:
                                     closed_time = datetime.fromisoformat(closed_at_str)
+                                    # Zaman dilimi yoksa UTC ekle
+                                    if closed_time.tzinfo is None:
+                                        closed_time = closed_time.replace(tzinfo=timezone.utc)
                                     
-                                    # 2 saat geçmemişse cooldown ekle
                                     if (now - closed_time).total_seconds() < 7200:
                                         kalan_sure = closed_time + timedelta(hours=2)
-                                        # ═══ DÜZELTME: HEM KISA HEM UZUN SEMBOLİ EKLE ═══
                                         self.cooldowns[coin] = kalan_sure
                                         if symbol:
                                             self.cooldowns[symbol] = kalan_sure
@@ -278,7 +228,6 @@ class MLTradingPipeline:
                     except Exception as e:
                         logger.warning(f"Trade memory cooldown yükleme hatası: {e}")
             else:
-                # PAPER MOD: Paper Trader'dan hafıza yükle
                 if hasattr(self.paper_trader, 'closed_trades'):
                     for trade in self.paper_trader.closed_trades:
                         exit_reason = getattr(trade, 'exit_reason', None) or (trade.get('exit_reason') if isinstance(trade, dict) else None)
@@ -290,14 +239,17 @@ class MLTradingPipeline:
                             if isinstance(closed_at, str):
                                 try:
                                     closed_time = datetime.fromisoformat(closed_at)
+                                    if closed_time.tzinfo is None:
+                                        closed_time = closed_time.replace(tzinfo=timezone.utc)
                                 except ValueError:
                                     continue
                             else:
                                 closed_time = closed_at
+                                if closed_time.tzinfo is None:
+                                    closed_time = closed_time.replace(tzinfo=timezone.utc)
                             
                             if (now - closed_time).total_seconds() < 7200:
                                 kalan_sure = closed_time + timedelta(hours=2)
-                                # ═══ DÜZELTME: HEM KISA HEM UZUN SEMBOLİ EKLE ═══
                                 self.cooldowns[symbol] = kalan_sure
                                 if full_symbol:
                                     self.cooldowns[full_symbol] = kalan_sure
@@ -306,19 +258,13 @@ class MLTradingPipeline:
         except Exception as e:
             logger.error(f"Cooldown hafıza yükleme hatası: {e}")
 
-    # =========================================================================
-    # BAKIYE
-    # =========================================================================
-
     def _init_balance(self) -> bool:
-        """Başlangıç bakiyesini başlatır. Paper trade'de sabit değer kullanır."""
         try:
             if self.dry_run:
                 self._balance = self._initial_balance = 1000.0
                 logger.info(f"💰 Paper bakiye: ${self._balance:.2f}")
             else:
                 b = self.executor.fetch_balance()
-                # DÜZELTME: Gelen veri bir sözlük (dict) ise 'total' değerini alıyoruz
                 if isinstance(b, dict):
                     self._balance = self._initial_balance = b.get('total', 0.0)
                 else:
@@ -330,12 +276,7 @@ class MLTradingPipeline:
             logger.error(f"❌ Bakiye hatası: {e}")
             return False
 
-    # =========================================================================
-    # KILL SWITCH
-    # =========================================================================
-
     def _check_kill_switch(self) -> bool:
-        """Drawdown >= eşik ise tüm işlemleri durdurur."""
         if self._kill_switch:
             return True
         if self._initial_balance <= 0:
@@ -353,31 +294,31 @@ class MLTradingPipeline:
             return True
         return False
 
-    # =========================================================================
-    # REJİM TESPİTİ
-    # =========================================================================
-
     def _detect_regime(self, df: pd.DataFrame) -> str:
         """ADX bazlı piyasa rejimi: 'trending' / 'ranging' / 'volatile'"""
         try:
-            if 'ADX_14' in df.columns:
-                adx = df['ADX_14'].iloc[-1]
-                if adx > 25: return 'trending'
-                if adx > 15: return 'ranging'
-                return 'volatile'
+            # Sütun adlarında içinde 'ADX' geçen ilk kolonu bulur
+            adx_col = next((col for col in df.columns if 'ADX' in col.upper()), None)
+            
+            if adx_col:
+                # Sütundaki NaN (boş) olan değerleri atlayarak sadece geçerli rakamları filtreler
+                adx_series = df[adx_col].dropna()
+                
+                # Eğer seri tamamen boş değilse son geçerli rakamı alır
+                if not adx_series.empty:
+                    adx = float(adx_series.iloc[-1]) # Son geçerli rakamı ondalıklı sayıya çevir
+                    
+                    if adx > 25: return 'trending'
+                    if adx > 15: return 'ranging'
+                    return 'volatile'
         except Exception:
             pass
         return 'unknown'
-
-    # =========================================================================
-    # TEK COİN ANALİZİ
-    # =========================================================================
 
     def _analyze_coin(self, symbol: str, coin: str) -> CoinAnalysisResult:
         result = CoinAnalysisResult(coin=coin, full_symbol=symbol)
 
         try:
-            # ── 1. Veri çek (Multi-Timeframe) ────────────────────────────────
             all_data = {}
             for tf, limit in self.timeframes.items():
                 df_raw = self.fetcher.fetch_ohlcv(symbol, tf, limit=limit)
@@ -392,7 +333,6 @@ class MLTradingPipeline:
 
             result.price = float(next(iter(all_data.values()))['close'].iloc[-1])
 
-            # ── 2. İndikatörler ──────────────────────────────────────────────
             indicator_data = {}
             for tf, df in all_data.items():
                 df_ind = self.calculator.calculate_all(df)
@@ -405,7 +345,6 @@ class MLTradingPipeline:
             if not indicator_data:
                 result.status = "indicator_error"; return result
 
-            # ── 3. IC Analizi ────────────────────────────────────────────────
             target_col = f'fwd_ret_{self.fwd_period}'
             best_tf    = None
             best_ic    = -1.0
@@ -440,7 +379,6 @@ class MLTradingPipeline:
             result.best_timeframe = best_tf
             result.tf_rankings    = sorted(tf_rankings, key=lambda x: x['avg_ic'], reverse=True)
 
-            # ── 4. IC skoru hesapla ───────────────────────────────────────────
             ic_scores = [s.ic_mean for s in best_scores]
             ic_signal_dir = "NEUTRAL"
             if ic_scores:
@@ -453,16 +391,13 @@ class MLTradingPipeline:
                 result.ic_direction    = ic_signal_dir
                 result.significant_count = len(best_scores)
 
-            # IC Gate
             if result.ic_confidence < IC_NO_TRADE:
                 result.status = "ic_too_low"; return result
             if result.ic_confidence < IC_TRADE:
                 result.status = "below_gate"; return result
 
-            # ── 5. Piyasa rejimi ──────────────────────────────────────────────
             result.market_regime = self._detect_regime(indicator_data[best_tf])
 
-            # ── 6. Category Tops (FeatureEngineer için) ──────────────────────
             CATEGORIES = {
                 'volume':  ['OBV', 'CMF', 'VPT', 'FI', 'EOM', 'ADI', 'NVI'],
                 'momentum':['RSI', 'Stoch', 'MFI', 'UO', 'MACD', 'PPO', 'ROC',
@@ -496,25 +431,21 @@ class MLTradingPipeline:
 
             result.category_tops = dynamic_cat_tops
 
-            # ── 7. ATR hesapla (Risk için) ────────────────────────────────────
             df_best = indicator_data[best_tf]
             if 'ATR_14' in df_best.columns:
                 result.atr     = float(df_best['ATR_14'].iloc[-1])
                 result.atr_pct = (result.atr / result.price) * 100
 
-            # ── 8. ML Pipeline ────────────────────────────────────────────────
             if not self.lgbm_model.is_trained:
                 result.ml_skipped = True
                 result.status = "model_not_trained"
                 return result
 
-            # Feature vector
             fv = self.feature_eng.build_features(
                 analysis   = result,
                 ohlcv_df   = df_best
             )
 
-            # LightGBM predict
             ml_result = self.lgbm_model.predict(
                 fv, result.ic_confidence, result.ic_direction
             )
@@ -523,14 +454,17 @@ class MLTradingPipeline:
             if ml_result.decision.value == "WAIT":
                 result.status = "wait"; return result
 
-            # Validator
             val_result = self.validator.validate(
                 fv, self.lgbm_model, ml_result.decision, ml_result.confidence,
                 result.ic_direction, result.market_regime
             )
             result.val_result = val_result
 
-            if not val_result.is_approved():
+            # Validator sonucunun is_valid veya is_approved özelliğini güvenli şekilde alıyoruz
+            is_ok = getattr(val_result, 'is_valid', False) or getattr(val_result, 'is_approved', False)
+            
+            # Eğer onay çıkmadıysa işlemi reddet
+            if not is_ok:
                 result.status = "rejected_by_validator"
                 return result
 
@@ -543,43 +477,30 @@ class MLTradingPipeline:
 
         return result
 
-    # =========================================================================
-    # TRADE EXECUTION
-    # =========================================================================
-
     def _execute_trade(self, result: CoinAnalysisResult) -> CoinAnalysisResult:
-        """ML sinyali varsa trade açar (paper veya canlı)."""
-
-        # ── 1. SOĞUMA SÜRESİ (COOLDOWN) KESİN KONTROLÜ ──────────────────────
-        # ═══ DÜZELTME 2: Hem kısa hem uzun sembol kontrolü ═══
+        # UTC kontrolü eklendi
         if hasattr(self, 'cooldowns'):
-            # Hem c.coin hem c.symbol kontrolü
             if result.coin in self.cooldowns or result.full_symbol in self.cooldowns:
                 cooldown_key = result.coin if result.coin in self.cooldowns else result.full_symbol
-                if datetime.now() < self.cooldowns[cooldown_key]:
-                    kalan_dk = int((self.cooldowns[cooldown_key] - datetime.now()).total_seconds() / 60)
+                if datetime.now(timezone.utc) < self.cooldowns[cooldown_key]:
+                    kalan_dk = int((self.cooldowns[cooldown_key] - datetime.now(timezone.utc)).total_seconds() / 60)
                     logger.info(f"   ❄️ {result.coin} işlemi REDDEDİLDİ: Soğuma süresinde (Kalan: {kalan_dk} dk)")
                     result.status = "cooldown"
                     return result
                 else:
-                    # Süre dolmuşsa cooldown'ı kaldır (her iki formatı da temizle)
                     if result.coin in self.cooldowns:
                         del self.cooldowns[result.coin]
                     if result.full_symbol in self.cooldowns:
                         del self.cooldowns[result.full_symbol]
 
-        # ── 2. BAŞARISIZ İŞLEMLERİ (A2Z GİBİ) TEKRAR DENEMEYİ ENGELLEME ───────
-        # Eğer bir coin daha önce 'api_error' veya 'execution_error' aldıysa ve blacklist'te yoksa, onu da soğutalım
         if result.status in ["api_error", "execution_error", "live_price_error"]:
             logger.info(f"   🚫 {result.coin} API tarafından daha önce reddedildi. 1 saat soğumaya alınıyor.")
             if not hasattr(self, 'cooldowns'):
                  self.cooldowns = {}
-            # ═══ DÜZELTME: Her iki formatı da ekle ═══
-            self.cooldowns[result.coin] = datetime.now() + timedelta(hours=1)
-            self.cooldowns[result.full_symbol] = datetime.now() + timedelta(hours=1)
+            self.cooldowns[result.coin] = datetime.now(timezone.utc) + timedelta(hours=1)
+            self.cooldowns[result.full_symbol] = datetime.now(timezone.utc) + timedelta(hours=1)
             return result
 
-        # ── 3. MEVCUT DURUM KONTROLLERİ ───────────────────────────────────────
         if result.status != "ready" or result.ml_result is None:
             return result
 
@@ -588,9 +509,6 @@ class MLTradingPipeline:
             return result
 
         try:
-            # ---------------------------------------------------------
-            # DÜZELTME: CANLI FİYAT ÇEKİLMESİ VE YENİDEN HESAPLAMA
-            # ---------------------------------------------------------
             try:
                 exchange = self.executor._get_exchange() 
                 ticker = exchange.fetch_ticker(result.full_symbol)
@@ -633,11 +551,7 @@ class MLTradingPipeline:
                 f"Size: {result.position_size:.4f} | Lev: {result.leverage}x"
             )
 
-            # ---------------------------------------------------------
-            # PAPER TRADE vs CANLI TRADE AYRIMI
-            # ---------------------------------------------------------
             if self.dry_run:
-                # --- PAPER TRADE (SANAL İŞLEM) MANTIĞI ---
                 t = self.paper_trader.open_trade(
                     symbol        = result.coin,
                     full_symbol   = result.full_symbol,
@@ -667,9 +581,6 @@ class MLTradingPipeline:
                     self.notifier.send_message_sync(msg)
 
             else:
-                # --- GERÇEK BORSA (BINANCE) MANTIĞI ---
-                
-                # ÇÖZÜM 2: Binance API yanıt vermezse kör işlem açmayı engelle
                 try:
                     current_positions = self.executor.fetch_positions()
                     open_count = len(current_positions)
@@ -684,7 +595,6 @@ class MLTradingPipeline:
                     logger.info(f"   ⚠️ {result.coin} atlandı: Canlı borsada max pozisyona ({MAX_OPEN_POSITIONS}) ulaşıldı.")
                     return result
 
-                # Binance symbol format 'BTC/USDT' vs 'BTC'
                 candidate_symbols = {
                     result.coin,
                     f"{result.coin}USDT",
@@ -729,9 +639,6 @@ class MLTradingPipeline:
                                f"📊 <b>Kaldıraç:</b> {result.leverage}x")
                         self.notifier.send_message_sync(msg)
 
-                    # ==============================================================
-                    # CANLI İŞLEMLERİ EXCEL'E (live_trades.xlsx) KAYDET
-                    # ==============================================================
                     try:
                         import pandas as pd
                         from pathlib import Path
@@ -784,22 +691,16 @@ class MLTradingPipeline:
                         logger.info(f"📊 Canlı işlem Paper formatında Excel'e eklendi: {result.coin}")
                     except Exception as e:
                         logger.error(f"❌ Excel kayıt hatası: {e}")
-                    # ==============================================================
                 else:
                     result.status = "execution_error"
                     result.error  = exec_res.error
                     logger.error(f"   ❌ Canlı işlem açılamadı: {exec_res.error}")
-                    # İşlem Binance tarafında hata aldıysa (A2Z gibi) soğuma süresine sok:
                     if not hasattr(self, 'cooldowns'):
                         self.cooldowns = {}
-                    # ═══ DÜZELTME: Her iki formatı da ekle ═══
-                    self.cooldowns[result.coin] = datetime.now() + timedelta(hours=1)
-                    self.cooldowns[result.full_symbol] = datetime.now() + timedelta(hours=1)
+                    self.cooldowns[result.coin] = datetime.now(timezone.utc) + timedelta(hours=1)
+                    self.cooldowns[result.full_symbol] = datetime.now(timezone.utc) + timedelta(hours=1)
                     logger.info(f"   🚫 {result.coin} API tarafından reddedildiği için 1 saat soğumaya alındı.")
 
-            # ---------------------------------------------------------
-            # HAFIZAYA KAYDET (TRADE MEMORY)
-            # ---------------------------------------------------------
             if result.trade_executed:
                 fv_dict = {}
                 if result.ml_result and hasattr(result.ml_result, 'feature_vector'):
@@ -838,30 +739,15 @@ class MLTradingPipeline:
 
         return result
 
-    # =========================================================================
-    # AÇIK POZİSYON KONTROLÜ
-    # =========================================================================
-
     def _check_open_positions(self):
-        """
-        Açık pozisyonların OHLCV (Mum) verisini çekerek aradaki iğneleri (SL/TP) yakalar.
-        
-        ═══ DÜZELTMELER (v2.1.1) ═══
-        1. ✅ Cooldown standardizasyonu (hem kısa hem uzun sembol)
-        2. ✅ Canlı modda TP/SL otomatik iptal (cancel_all_orders)
-        3. ✅ Orphan emir temizliği
-        """
-        logger.info("\n🔍 Açık pozisyonlar kontrol ediliyor...")
+        # Arka planda 30 saniyede bir kontrol yapılacağı için terminal kalabalığı yaratmaması adına log seviyesi debug yapıldı
+        logger.debug("\n🔍 Açık pozisyonlar kontrol ediliyor...")
         
         if self.dry_run:
-            # =================================================================
-            # PAPER TRADE MODU
-            # =================================================================
             from paper_trader import TradeStatus  
             open_trades_dict = self.paper_trader.open_trades 
             
             if not open_trades_dict:
-                logger.info("   Açık pozisyon yok.")
                 return
 
             closed_count = 0
@@ -869,9 +755,7 @@ class MLTradingPipeline:
             
             for trade in trades_to_check:
                 try:
-                    # Sembolü Binance formatına getir
                     fetch_symbol = trade.symbol if "USDT" in trade.symbol else f"{trade.symbol}/USDT"
-                    
                     ohlcv = self.fetcher.fetch_ohlcv(fetch_symbol, timeframe="15m", limit=3)
                     
                     if ohlcv is not None and not ohlcv.empty:
@@ -903,17 +787,13 @@ class MLTradingPipeline:
                                 status = TradeStatus.CLOSED_TP
                         
                         if close_reason:
-                            # ═══ DÜZELTME 3: Cooldown standardizasyonu ═══
                             if close_reason == "SL Hit":
-                                # Hem kısa hem uzun sembol için cooldown ayarla
-                                self.cooldowns[trade.symbol] = datetime.now() + timedelta(hours=2)
-                                self.cooldowns[trade.full_symbol] = datetime.now() + timedelta(hours=2)
+                                self.cooldowns[trade.symbol] = datetime.now(timezone.utc) + timedelta(hours=2)
+                                self.cooldowns[trade.full_symbol] = datetime.now(timezone.utc) + timedelta(hours=2)
                                 logger.info(f"   ❄️ {trade.symbol} SL oldu! 2 saat soğuma süresine alındı.")
                             else:
                                 logger.info(f"   🎯 {trade.symbol} {close_reason}! Hedefe ulaşıldı.")
                             
-                            # ═══ DÜZELTME 4: Paper trade'de de emir iptal işlemi ═══
-                            # TP olduysa kalan SL, SL olduysa kalan TP emrini iptal et
                             try:
                                 if hasattr(self.executor, 'cancel_all_orders'):
                                     self.executor.cancel_all_orders(trade.full_symbol)
@@ -951,8 +831,7 @@ class MLTradingPipeline:
                                         logger.info(f"   🧠 Memory güncellendi: {trade.symbol} → {close_reason} | PnL: ${actual_pnl:+.2f}")
                                         break
                                 if not matched:
-                                    logger.warning(f"   ⚠️ Memory'de eşleşen trade bulunamadı: {trade.symbol} "
-                                                   f"(full={trade.full_symbol})")
+                                    logger.warning(f"   ⚠️ Memory'de eşleşen trade bulunamadı: {trade.symbol} (full={trade.full_symbol})")
                             except Exception as em:
                                 logger.warning(f"   ⚠️ Memory update BAŞARISIZ: {trade.symbol} → {em}")
 
@@ -963,55 +842,30 @@ class MLTradingPipeline:
                 logger.info(f"   Mevcut Bakiye: ${self.paper_trader.balance:.2f}")
 
         else:
-            # =================================================================
-            # CANLI BORSA (BINANCE) POZİSYON KONTROLÜ VE TEMİZLİK
-            # =================================================================
-            # ═══ v2.1.1 Düzeltmeler ═══
-            #   1. ✅ Cooldown standardizasyonu (hem kısa hem uzun sembol)
-            #   2. ✅ TP/SL otomatik iptal (cancel_all_orders çağrısı)
-            #   3. ✅ Telegram kapanış bildirimi
-            #   4. ✅ Gerçek PnL hesaplanıyor
-            #   5. ✅ Orphan emir temizliği
-            # =================================================================
             try:
                 closed_count = 0
                 
-                # ── RAM'deki hafızayı oku ──
-                # Trade Memory'de açık işlemleri kontrol et
                 if not hasattr(self.trade_memory, 'open_trades'):
-                    logger.info("   Trade Memory henüz yüklenmemiş.")
                     return
-                
                 if not self.trade_memory.open_trades:
-                    logger.info("   Açık pozisyon yok.")
                     return
                 
-                # ── Binance'ten gerçek pozisyonları çek ──
                 try:
                     real_positions = self.executor.fetch_positions()
                 except Exception as e:
                     logger.error(f"   ❌ Binance pozisyon çekme hatası: {e}")
                     return
                 
-                # Sadece gerçekten aktif pozisyonların sembollerini al
                 active_symbols = {p['symbol'] for p in real_positions if p.get('contracts', 0) != 0}
                 
-                # ── Hafızadaki her bir açık işlemi kontrol et ──
                 for mem_id, mem_trade in list(self.trade_memory.open_trades.items()):
-                    # Bu trade Binance'de hala açık mı?
-                    # mem_trade.symbol: 'BTC/USDT:USDT'
-                    # active_symbols: {'BTC/USDT:USDT', 'ETH/USDT:USDT', ...}
-                    
                     if mem_trade.symbol not in active_symbols:
-                        # Pozisyon kapanmış!
                         logger.info(f"   🔍 {mem_trade.coin} pozisyonu kapalı bulundu → kapanış nedeni araştırılıyor...")
                         
-                        # Kapanış nedenini bul (OHLCV ile SL/TP kontrolü)
-                        close_reason = "Manuel / API"  # Varsayılan
-                        exit_price = mem_trade.entry_price  # Bilinmiyorsa giriş fiyatını kullan
+                        close_reason = "Manuel / API"  
+                        exit_price = mem_trade.entry_price  
                         
                         try:
-                            # Son 5 mumu çek (15dk TF)
                             ohlcv = self.fetcher.fetch_ohlcv(mem_trade.symbol, timeframe="15m", limit=5)
                             
                             if ohlcv is not None and not ohlcv.empty:
@@ -1019,7 +873,6 @@ class MLTradingPipeline:
                                 min_low = float(ohlcv['low'].min())
                                 current_price = float(ohlcv['close'].iloc[-1])
                                 
-                                # LONG pozisyon muydu?
                                 if mem_trade.direction == "LONG":
                                     if min_low <= mem_trade.sl_price:
                                         close_reason = "SL Hit"
@@ -1028,10 +881,8 @@ class MLTradingPipeline:
                                         close_reason = "TP Hit"
                                         exit_price = mem_trade.tp_price
                                     else:
-                                        # SL/TP değil, muhtemelen manuel
                                         exit_price = current_price
                                 
-                                # SHORT pozisyon muydu?
                                 elif mem_trade.direction == "SHORT":
                                     if max_high >= mem_trade.sl_price:
                                         close_reason = "SL Hit"
@@ -1045,7 +896,6 @@ class MLTradingPipeline:
                         except Exception as ohlcv_err:
                             logger.warning(f"   ⚠️ {mem_trade.coin} OHLCV kontrol hatası: {ohlcv_err}")
                         
-                        # ── GERÇEK PnL HESAPLA ──────────────────────────────
                         safe_entry = float(mem_trade.entry_price or 0)
                         safe_exit = float(exit_price or safe_entry)
                         safe_size = float(mem_trade.position_size or 0)
@@ -1058,18 +908,13 @@ class MLTradingPipeline:
                         
                         pnl_pct = (pnl_val / (safe_entry * safe_size)) * 100 * safe_leverage if (safe_entry * safe_size) > 0 else 0.0
                         
-                        # ── COOLDOWN (SOĞUMA SÜRESİ) ────────────────────────
-                        # ═══ DÜZELTME 5: Hem kısa hem uzun sembol için cooldown ═══
                         if close_reason == "SL Hit":
-                            self.cooldowns[mem_trade.coin] = datetime.now() + timedelta(hours=2)
-                            self.cooldowns[mem_trade.symbol] = datetime.now() + timedelta(hours=2)
+                            self.cooldowns[mem_trade.coin] = datetime.now(timezone.utc) + timedelta(hours=2)
+                            self.cooldowns[mem_trade.symbol] = datetime.now(timezone.utc) + timedelta(hours=2)
                             logger.info(f"   ❄️ {mem_trade.coin} SL oldu! 2 saat soğuma süresine alındı.")
                         else:
                             logger.info(f"   🎯 {mem_trade.coin} {close_reason}! Hedefe ulaşıldı.")
                         
-                        # ── KARŞI EMİRLERİ TEMİZLE ──────────────────────────
-                        # ═══ DÜZELTME 6: Canlı modda da emir iptal işlemi ═══
-                        # TP olduysa kalan SL emrini sil, SL olduysa kalan TP emrini sil
                         try:
                             if hasattr(self.executor, 'cancel_all_orders'):
                                 self.executor.cancel_all_orders(mem_trade.symbol)
@@ -1077,7 +922,6 @@ class MLTradingPipeline:
                         except Exception as cancel_err:
                             logger.warning(f"   ⚠️ {mem_trade.coin} emir temizleme hatası: {cancel_err}")
                         
-                        # ── TRADE MEMORY GÜNCELLE ────────────────────────────
                         try:
                             self.trade_memory.close_trade(
                                 trade_id    = mem_id,
@@ -1089,7 +933,6 @@ class MLTradingPipeline:
                         except Exception as mem_err:
                             logger.error(f"   ❌ Memory güncelleme hatası: {mem_trade.coin} → {mem_err}")
 
-                        # ── TELEGRAM BİLDİRİMİ ────────────────────────────────
                         try:
                             if self.notifier.is_configured():
                                 pnl_emoji = "✅ KÂR" if pnl_val > 0 else "❌ ZARAR"
@@ -1103,7 +946,6 @@ class MLTradingPipeline:
                         except Exception as tg_err:
                             logger.warning(f"   ⚠️ Telegram bildirimi gönderilemedi: {tg_err}")
                         
-                        # ── EXCEL'E KAYDET ────────────────────────────────────
                         try:
                             from pathlib import Path
                             import pandas as pd
@@ -1114,7 +956,6 @@ class MLTradingPipeline:
                             if excel_path.exists():
                                 df = pd.read_excel(excel_path)
                                 
-                                # Veri tiplerini güvenli hale getir
                                 for col in ['Tarih (Kapanış)', 'Çıkış Nedeni', 'Durum']:
                                     if col in df.columns:
                                         df[col] = df[col].astype(object)
@@ -1142,45 +983,22 @@ class MLTradingPipeline:
                         except Exception as e:
                             logger.error(f"   ❌ Excel güncelleme hatası: {e}", exc_info=True)
                                 
-                        # Sayaç artır
                         closed_count += 1
                             
-                # ── Döngü sonu özet ──────────────────────────────────────────
                 if closed_count > 0:
                     logger.info(f"   🧹 {closed_count} işlemin kontrolü ve temizliği tamamlandı.")
-                else:
-                    open_count = len(self.trade_memory.open_trades)
-                    if open_count > 0:
-                        logger.info(f"   ℹ️ {open_count} açık işlem hâlâ aktif.")
-                    else:
-                        logger.info("   Açık pozisyon yok.")
                 
-                # ══════════════════════════════════════════════════════════════
-                # ORPHAN ORDER CLEANUP (SAHIPSIZ EMIR TEMIZLIĞI)
-                # ══════════════════════════════════════════════════════════════
-                # SORUN: Bir pozisyon SL veya TP ile kapandığında, Binance
-                #        karşı emri (SL olduysa TP, TP olduysa SL) OTOMATİK
-                #        SİLMEZ. Bu emirler "orphan" (sahipsiz) olarak tahtada
-                #        kalır.
-                #
-                # ÇÖZÜM: Her döngüde borsadaki TÜM açık emirleri çek.
-                #        Emir sembolü aktif bir pozisyonda yoksa → orphan → sil.
-                # ══════════════════════════════════════════════════════════════
                 try:
                     exchange = self.executor._get_exchange()
-                    
-                    # Borsadaki tüm açık emirleri çek
                     all_open_orders = exchange.fetch_open_orders()
                     
                     if all_open_orders:
                         orphan_count = 0
-                        
                         for order in all_open_orders:
                             order_symbol = order.get('symbol', '')
                             order_id     = order.get('id', '?')
                             order_type   = order.get('type', '?')
                             
-                            # Bu emrin sembolü aktif bir pozisyonda var mı?
                             has_position = False
                             for act_sym in active_symbols:
                                 if order_symbol == act_sym:
@@ -1188,7 +1006,6 @@ class MLTradingPipeline:
                                     break
                             
                             if not has_position:
-                                # Bu emir sahipsiz → sil
                                 try:
                                     exchange.cancel_order(order_id, order_symbol)
                                     orphan_count += 1
@@ -1201,8 +1018,6 @@ class MLTradingPipeline:
                         
                         if orphan_count > 0:
                             logger.info(f"   🧹 {orphan_count} sahipsiz (orphan) emir temizlendi.")
-                        else:
-                            logger.debug(f"   ✅ {len(all_open_orders)} açık emir kontrol edildi, orphan yok.")
                             
                 except Exception as orphan_err:
                     logger.warning(f"   ⚠️ Orphan emir kontrolü başarısız (kritik değil): {orphan_err}")
@@ -1210,15 +1025,7 @@ class MLTradingPipeline:
             except Exception as e:
                 logger.error(f"   ❌ Canlı pozisyon kontrol/temizlik hatası: {e}", exc_info=True)
 
-    # =========================================================================
-    # ANA DÖNGÜ
-    # =========================================================================
-
     def run_cycle(self) -> CycleReport:
-        """
-        Tek bir tarama→analiz→execution döngüsü.
-        Scheduler bu metodu periyodik olarak çağırır.
-        """
         start  = time.time()
         report = CycleReport(timestamp=datetime.now(timezone.utc).isoformat())
 
@@ -1247,28 +1054,24 @@ class MLTradingPipeline:
             logger.info(f"\n🔬 ML analizi ({len(coins)} coin)...")
             results = []
             
-            # Kendi hafızasındaki (RAM) açık işlemleri kontrol et
             if self.dry_run:
                 open_coins = [trade.symbol for trade in self.paper_trader.open_trades.values()]
             else:
                 open_coins = [mem_trade.coin for mem_trade in self.trade_memory.open_trades.values()]
 
             for c in coins:
-                # 1. Açık pozisyon kontrolü
                 if c.coin in open_coins:
                     logger.info(f"   ⏭️ {c.coin} atlanıyor (Zaten açık pozisyon var)")
                     continue
                 
-                # 2. Cooldown kontrolü
-                # ═══ DÜZELTME 7: Hem kısa hem uzun sembol kontrolü ═══
+                # UTC Cooldown Kontrolü
                 if c.coin in self.cooldowns or c.symbol in self.cooldowns:
                     cooldown_key = c.coin if c.coin in self.cooldowns else c.symbol
-                    if datetime.now() < self.cooldowns[cooldown_key]:
-                        kalan_dk = int((self.cooldowns[cooldown_key] - datetime.now()).total_seconds() / 60)
+                    if datetime.now(timezone.utc) < self.cooldowns[cooldown_key]:
+                        kalan_dk = int((self.cooldowns[cooldown_key] - datetime.now(timezone.utc)).total_seconds() / 60)
                         logger.info(f"   ❄️ {c.coin} atlanıyor (Soğuma süresinde - Kalan: {kalan_dk} dk)")
                         continue
                     else:
-                        # Süresi dolmuş cooldown'ları temizle (her iki formatı da)
                         if c.coin in self.cooldowns:
                             del self.cooldowns[c.coin]
                         if c.symbol in self.cooldowns:
@@ -1281,7 +1084,6 @@ class MLTradingPipeline:
                 if r.ic_confidence >= IC_TRADE:
                     report.total_above_gate += 1
 
-            # Execution
             logger.info(f"\n💹 Execution...")
             for r in results:
                 if r.status == "ready":
@@ -1340,12 +1142,7 @@ class MLTradingPipeline:
         self._log_cycle_summary(report)
         return report
 
-    # =========================================================================
-    # İLK EĞİTİM (Walk-forward)
-    # =========================================================================
-
     def retrain_from_experience(self):
-        """Kendi kapalı işlemlerinden (tecrübe) öğrenerek modeli yeniden eğitir."""
         logger.info("🧠 Kendi tecrübelerinden öğrenme (Retrain) başlatılıyor...")
         
         try:
@@ -1407,9 +1204,6 @@ class MLTradingPipeline:
             return False
     
     def initial_train(self, symbol: str = "BTC/USDT:USDT") -> bool:
-        """
-        Pipeline ilk başladığında LightGBM'i tarihsel veri ile eğitir.
-        """
         logger.info(f"🎓 İlk eğitim: {symbol} 1h verisi kullanılıyor...")
 
         try:
@@ -1603,10 +1397,6 @@ class MLTradingPipeline:
             logger.error(f"❌ İlk eğitim hatası: {e}", exc_info=True)
             return False
 
-    # =========================================================================
-    # YARDIMCI
-    # =========================================================================
-
     def _log_cycle_summary(self, report: CycleReport) -> None:
         emoji = {"success":"✅","partial":"⚡","no_signal":"😴",
                  "error":"❌","killed":"⛔"}.get(report.status.value, "❓")
@@ -1623,7 +1413,6 @@ class MLTradingPipeline:
         logger.info(f"{'─'*50}\n")
 
     def print_performance(self) -> None:
-        """Paper trade performans raporunu konsola yazdırır."""
         PerformanceAnalyzer(self.paper_trader).print_report(
             PerformanceAnalyzer(self.paper_trader).full_analysis()
         )
@@ -1634,8 +1423,8 @@ class MLTradingPipeline:
 # SCHEDULER
 # =============================================================================
 
-def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 75) -> None:
-    """Pipeline'ı belirli aralıklarla otomatik çalıştırır. Ctrl+C ile durur."""
+# Varsayılan çalışma süresi 10 dakika olarak güncellendi
+def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 10) -> None:
     pipeline._is_running = True
 
     def _stop(signum, frame):
@@ -1665,10 +1454,20 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 75) -> No
         if report.status == CycleStatus.KILLED:
             break
 
-        logger.info(f"⏰ Sonraki: {(datetime.now()+timedelta(minutes=interval_minutes)).strftime('%H:%M:%S')}")
-        for _ in range(interval_minutes * 60):
+        logger.info(f"⏰ Sonraki Tarama: {(datetime.now()+timedelta(minutes=interval_minutes)).strftime('%H:%M:%S')}")
+        
+        # Bot uyurken de açık işlemleri (TP/SL) takip etmesi için özel döngü
+        for i in range(interval_minutes * 60):
             if not pipeline._is_running:
                 break
+            
+            # Her 30 saniyede bir Binance API'yi yokla ve askıda kalanları temizle
+            if i > 0 and i % 30 == 0:
+                try:
+                    pipeline._check_open_positions()
+                except Exception:
+                    pass
+                    
             time.sleep(1)
 
     logger.info("🏁 Scheduler kapatıldı.")
@@ -1679,11 +1478,12 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 75) -> No
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="ML Crypto Bot v2.1.1")
+    parser = argparse.ArgumentParser(description="ML Crypto Bot v2.1.3")
     parser.add_argument("--live",     action="store_true", help="Canlı trade (ÖNERİLEN)")
     parser.add_argument("--top",      type=int, default=20, help="Top N coin")
     parser.add_argument("--schedule", action="store_true", help="Scheduler modu")
-    parser.add_argument("-i","--interval", type=int, default=75, help="Aralık (dk)")
+    # Interval varsayılan değeri 10 dakikaya düşürüldü
+    parser.add_argument("-i","--interval", type=int, default=10, help="Aralık (dk)")
     parser.add_argument("--report",   action="store_true", help="Performans raporu")
     parser.add_argument("--train",    action="store_true", help="Sadece eğitim")
     parser.add_argument("--verbose",  action="store_true", help="Debug")
@@ -1694,30 +1494,24 @@ def main():
 
     pipeline = MLTradingPipeline(dry_run=not args.live, top_n=args.top)
 
-    # ── Sadece rapor modu ──
     if args.report:
         pipeline.print_performance()
         return
 
-    # ── Sadece eğitim modu ──
     if args.train:
         pipeline.initial_train()
         return
 
-    # ── Bakiye başlat ──
     if not pipeline._init_balance():
         sys.exit(1)
 
-    # ── Model eğitilmemişse warm-up yap ──
     if not pipeline.lgbm_model.is_trained:
         logger.info("🎓 Model eğitilmemiş — ilk eğitim başlıyor...")
         pipeline.initial_train()
 
-    # ── Scheduler modu: sürekli döngü ──
     if args.schedule:
         run_scheduler(pipeline, args.interval)
     else:
-        # ── Tek döngü: bir cycle çalıştır ve çık ──
         report = pipeline.run_cycle()
         logger.info(f"Döngü: {report.status.value}")
 
