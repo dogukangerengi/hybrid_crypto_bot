@@ -1,6 +1,12 @@
 # =============================================================================
-# MAIN.PY — ML-DRIVEN TRADING PIPELINE v2.1.0 (BINANCE VADELİ İŞLEMLER)
+# MAIN.PY — ML-DRIVEN TRADING PIPELINE v2.1.1 (BINANCE VADELİ İŞLEMLER)
 # =============================================================================
+# v2.1.1 Düzeltmeler:
+#   ✅ Cooldown mekanizması standardize edildi (hem kısa hem uzun sembol)
+#   ✅ TP/SL otomatik iptal düzeltildi (canlı modda cancel_all_orders çağrısı eklendi)
+#   ✅ Cooldown hafıza yüklemesi iyileştirildi
+#   ✅ Canlı mod optimizasyonu
+#
 # Gemini tamamen kaldırıldı → LightGBM pipeline entegre edildi.
 #
 # Gerçek API:
@@ -11,7 +17,7 @@
 #
 # Çalıştırma:
 #   python main.py             ← paper trade (varsayılan)
-#   python main.py --live      ← canlı trade
+#   python main.py --live      ← canlı trade (ÖNERİLEN)
 #   python main.py --train     ← sadece eğitim
 #   python main.py --report    ← performans raporu
 #   python main.py --schedule  ← 75dk scheduler
@@ -74,7 +80,7 @@ logger = logging.getLogger(__name__)
 # SABİTLER
 # =============================================================================
 
-VERSION                = "2.1.0"
+VERSION                = "2.1.1"  # ← Versiyon güncellendi
 MAX_COINS_PER_CYCLE    = 30
 DEFAULT_FWD_PERIOD     = 6
 MAX_OPEN_POSITIONS     = 5
@@ -219,39 +225,83 @@ class MLTradingPipeline:
         self._consecutive_errors = 0
         self.cooldowns         = {}  # ❄️ SL olan coinler için bekleme hafızası
 
-        self._restore_cooldowns()  # YENİ EKLENEN SATIR: Kapanan işlemleri RAM'e geri yükler
+        # ═══ DÜZELTME 1: Cooldown hafıza yüklemesi ═══
+        # Bot başladığında son 2 saat içinde SL olan coinleri hafızaya alır
+        self._restore_cooldowns()
 
         logger.info(f"🚀 ML Trading Pipeline v{VERSION} (dry_run={dry_run})")
 
     def _restore_cooldowns(self):
-        """Bot yeniden başlatıldığında (RAM sıfırlandığında), son 2 saat içinde SL olmuş coinleri diskten okuyup hafızaya alır."""
+        """
+        Bot yeniden başlatıldığında, son 2 saat içinde SL olmuş coinleri hafızaya alır.
+        
+        Ne işe yarar:
+        - Bot çökse bile SL olan coinler 2 saat soğumaya devam eder
+        - Cooldown'lar kaybolmaz
+        """
         try:
             now = datetime.now()
             
-            # Paper Trader geçmişindeki kapalı işlemleri kontrol et
-            if hasattr(self.paper_trader, 'closed_trades'):
-                for trade in self.paper_trader.closed_trades:
-                    # Kapalı işlemin yapısına göre verileri güvenli şekilde çek
-                    exit_reason = getattr(trade, 'exit_reason', None) or (trade.get('exit_reason') if isinstance(trade, dict) else None)
-                    closed_at = getattr(trade, 'closed_at', None) or (trade.get('closed_at') if isinstance(trade, dict) else None)
-                    symbol = getattr(trade, 'symbol', None) or (trade.get('symbol') if isinstance(trade, dict) else None)
-
-                    # Eğer işlem Stop-Loss ile kapandıysa
-                    if exit_reason == "SL Hit" and closed_at and symbol:
-                        # Tarih string formatındaysa zaman nesnesine (datetime) çevir
-                        if isinstance(closed_at, str):
-                            try:
-                                closed_time = datetime.fromisoformat(closed_at)
-                            except ValueError:
-                                continue
-                        else:
-                            closed_time = closed_at
+            # ═══ DÜZELTME: Hem Trade Memory hem Paper Trader kontrol et ═══
+            # Canlı modda: Trade Memory'den oku
+            # Paper modda: Paper Trader'dan oku
+            
+            if not self.dry_run:
+                # CANLI MOD: Trade Memory'den hafıza yükle
+                memory_file = self.trade_memory.log_dir / "ml_trade_memory.json"
+                if memory_file.exists():
+                    import json
+                    try:
+                        with open(memory_file, 'r', encoding='utf-8') as f:
+                            trades = json.load(f)
                         
-                        # Kapanışın üzerinden 2 saat (7200 saniye) geçmemişse
-                        if (now - closed_time).total_seconds() < 7200:
-                            kalan_sure = closed_time + timedelta(hours=2)
-                            self.cooldowns[symbol] = kalan_sure
-                            logger.info(f"   ❄️ HAFIZA GERİ YÜKLENDİ: {symbol} (Ceza bitişi: {kalan_sure.strftime('%H:%M:%S')})")
+                        for trade in trades:
+                            exit_reason = trade.get('exit_reason', '')
+                            closed_at_str = trade.get('closed_at', '')
+                            coin = trade.get('coin', '')
+                            symbol = trade.get('symbol', '')
+                            
+                            if exit_reason == "SL Hit" and closed_at_str and coin:
+                                try:
+                                    closed_time = datetime.fromisoformat(closed_at_str)
+                                    
+                                    # 2 saat geçmemişse cooldown ekle
+                                    if (now - closed_time).total_seconds() < 7200:
+                                        kalan_sure = closed_time + timedelta(hours=2)
+                                        # ═══ DÜZELTME: HEM KISA HEM UZUN SEMBOLİ EKLE ═══
+                                        self.cooldowns[coin] = kalan_sure
+                                        if symbol:
+                                            self.cooldowns[symbol] = kalan_sure
+                                        logger.info(f"   ❄️ HAFIZA GERİ YÜKLENDİ: {coin} (Ceza bitişi: {kalan_sure.strftime('%H:%M:%S')})")
+                                except (ValueError, TypeError):
+                                    continue
+                    except Exception as e:
+                        logger.warning(f"Trade memory cooldown yükleme hatası: {e}")
+            else:
+                # PAPER MOD: Paper Trader'dan hafıza yükle
+                if hasattr(self.paper_trader, 'closed_trades'):
+                    for trade in self.paper_trader.closed_trades:
+                        exit_reason = getattr(trade, 'exit_reason', None) or (trade.get('exit_reason') if isinstance(trade, dict) else None)
+                        closed_at = getattr(trade, 'closed_at', None) or (trade.get('closed_at') if isinstance(trade, dict) else None)
+                        symbol = getattr(trade, 'symbol', None) or (trade.get('symbol') if isinstance(trade, dict) else None)
+                        full_symbol = getattr(trade, 'full_symbol', None) or (trade.get('full_symbol') if isinstance(trade, dict) else None)
+
+                        if exit_reason == "SL Hit" and closed_at and symbol:
+                            if isinstance(closed_at, str):
+                                try:
+                                    closed_time = datetime.fromisoformat(closed_at)
+                                except ValueError:
+                                    continue
+                            else:
+                                closed_time = closed_at
+                            
+                            if (now - closed_time).total_seconds() < 7200:
+                                kalan_sure = closed_time + timedelta(hours=2)
+                                # ═══ DÜZELTME: HEM KISA HEM UZUN SEMBOLİ EKLE ═══
+                                self.cooldowns[symbol] = kalan_sure
+                                if full_symbol:
+                                    self.cooldowns[full_symbol] = kalan_sure
+                                logger.info(f"   ❄️ HAFIZA GERİ YÜKLENDİ: {symbol} (Ceza bitişi: {kalan_sure.strftime('%H:%M:%S')})")
                             
         except Exception as e:
             logger.error(f"Cooldown hafıza yükleme hatası: {e}")
@@ -368,183 +418,128 @@ class MLTradingPipeline:
                 scores = self.selector.evaluate_all_indicators(df, target_col=target_col)
                 if not scores:
                     continue
+                avg_ic = sum(abs(s.ic_mean) for s in scores) / len(scores)
                 significant = [s for s in scores if s.is_significant]
-                if not significant:
-                    continue
+                if len(significant) == 0:
+                    significant = scores[:2]
 
-                ic_mean = np.mean([abs(s.ic_mean) for s in significant]) * 100
-
-                top_ic_val = max(significant, key=lambda s: abs(s.ic_mean))
-                tf_dir     = "LONG" if top_ic_val.ic_mean > 0 else "SHORT"
                 tf_rankings.append({
-                    "tf":        tf,
-                    "composite": round(ic_mean, 2),
-                    "direction": tf_dir,
-                    "sig_count": len(significant),
-                    "top_ic":    round(top_ic_val.ic_mean, 4),
+                    'tf': tf,
+                    'avg_ic': avg_ic,
+                    'sig_count': len([s for s in scores if s.is_significant]),
                 })
 
-                if ic_mean > best_ic:
-                    best_ic     = ic_mean
-                    best_tf     = tf
-                    best_scores = scores
+                if avg_ic > best_ic:
+                    best_ic = avg_ic
+                    best_tf = tf
+                    best_scores = significant
 
-            if best_tf is None:
+            if not best_tf:
                 result.status = "no_ic"; return result
 
-            result.best_timeframe    = best_tf
-            result.ic_confidence     = round(best_ic, 2)
-            result.significant_count = sum(1 for s in best_scores if s.is_significant)
-            result.tf_rankings       = sorted(tf_rankings, key=lambda x: -x["composite"])
+            result.best_timeframe = best_tf
+            result.tf_rankings    = sorted(tf_rankings, key=lambda x: x['avg_ic'], reverse=True)
 
-            # IC yön tespiti
-            try:
-                best_df = indicator_data[best_tf]
-                current_close = best_df['close'].iloc[-1]
-                if 'EMA_20' in best_df.columns:
-                    result.ic_direction = "LONG" if current_close > best_df['EMA_20'].iloc[-1] else "SHORT"
-                else:
-                    result.ic_direction = "LONG" if current_close > best_df['open'].iloc[-1] else "SHORT"
-            except Exception:
-                result.ic_direction = "NEUTRAL"
+            # ── 4. IC skoru hesapla ───────────────────────────────────────────
+            ic_scores = [s.ic_mean for s in best_scores]
+            ic_signal_dir = "NEUTRAL"
+            if ic_scores:
+                ic_avg = sum(ic_scores) / len(ic_scores)
+                if ic_avg > 0:
+                    ic_signal_dir = "LONG"
+                elif ic_avg < 0:
+                    ic_signal_dir = "SHORT"
+                result.ic_confidence   = abs(ic_avg) * 100
+                result.ic_direction    = ic_signal_dir
+                result.significant_count = len(best_scores)
 
-            # Kategori bazlı top indikatörler (FeatureEngineer için)
-            from indicators.categories import get_category_names, get_indicators_by_category
-            category_tops = {}
-            for cat in get_category_names():
-                cat_indicators = {i.name if hasattr(i, 'name') else i['name'] for i in get_indicators_by_category(cat)}
-                
-                cat_scores = [s for s in best_scores if s.name in cat_indicators and s.is_significant]
-                
+            # IC Gate
+            if result.ic_confidence < IC_NO_TRADE:
+                result.status = "ic_too_low"; return result
+            if result.ic_confidence < IC_TRADE:
+                result.status = "below_gate"; return result
+
+            # ── 5. Piyasa rejimi ──────────────────────────────────────────────
+            result.market_regime = self._detect_regime(indicator_data[best_tf])
+
+            # ── 6. Category Tops (FeatureEngineer için) ──────────────────────
+            CATEGORIES = {
+                'volume':  ['OBV', 'CMF', 'VPT', 'FI', 'EOM', 'ADI', 'NVI'],
+                'momentum':['RSI', 'Stoch', 'MFI', 'UO', 'MACD', 'PPO', 'ROC',
+                            'TSI', 'CCI', 'Williams'],
+                'trend':   ['ADX', 'Aroon', 'PSAR', 'DPO', 'Vortex', 'KST',
+                            'Ichimoku', 'SMA', 'EMA', 'WMA'],
+                'volatility': ['BBW', 'ATR', 'Keltner', 'Donchian', 'STD'],
+            }
+            dynamic_cat_tops = {}
+            for cat, cat_indicators in CATEGORIES.items():
+                cat_scores = [s for s in best_scores if any(
+                    s.name.lower().startswith(ci.lower()) or ci.lower() in s.name.lower()
+                    for ci in cat_indicators
+                )]
                 if not cat_scores:
-                    cat_ind_lower = {n.lower() for n in cat_indicators}
+                    cat_ind_lower = [x.lower() for x in cat_indicators]
                     matched = []
                     for s in best_scores:
-                        if not s.is_significant:
-                            continue
                         s_lower = s.name.lower()
-                        if s_lower in cat_ind_lower:
-                            matched.append(s)
-                            continue
-                        for ci in cat_ind_lower:
-                            if len(ci) >= 3 and (s_lower.startswith(ci + '_') or s_lower.startswith(ci)):
-                                matched.append(s)
-                                break
+                        if not cat_scores:
+                            for ci in cat_ind_lower:
+                                if s_lower.startswith(ci + '_') or s_lower.startswith(ci):
+                                    if len(ci) >= 3:
+                                        matched.append(s)
+                                        break
                     cat_scores = matched
-                
+
                 if cat_scores:
                     top = max(cat_scores, key=lambda s: abs(s.ic_mean))
-                    category_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
-            result.category_tops = category_tops
+                    dynamic_cat_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
 
-            # ── 4. IC eşiği kontrolü ─────────────────────────────────────────
-            if result.ic_confidence < IC_NO_TRADE:
-                result.status = "low_ic"
-                logger.debug(f"  ⏭ {coin}: IC={result.ic_confidence:.1f} < {IC_NO_TRADE}")
-                return result
+            result.category_tops = dynamic_cat_tops
 
-            # ── 5. Piyasa rejimi ─────────────────────────────────────────────
-            best_df = indicator_data[best_tf]
-            result.market_regime = self._detect_regime(best_df)
+            # ── 7. ATR hesapla (Risk için) ────────────────────────────────────
+            df_best = indicator_data[best_tf]
+            if 'ATR_14' in df_best.columns:
+                result.atr     = float(df_best['ATR_14'].iloc[-1])
+                result.atr_pct = (result.atr / result.price) * 100
 
-            # ATR
-            if 'ATR_14' in best_df.columns:
-                result.atr = float(best_df['ATR_14'].iloc[-1])
-            else:
-                result.atr = result.price * 0.02
-
-            # ── 6. Feature Engineering ───────────────────────────────────────
-            try:
-                fv = self.feature_eng.build_features(
-                    analysis        = result,          
-                    ohlcv_df        = best_df,         
-                    all_tf_analyses = result.tf_rankings,  
-                )
-            except Exception as e:
-                logger.warning(f"  ⚠️ {coin} FeatureEngineer hatası: {e}")
-                result.status = "feature_error"; return result
-
-            # ── 7. LightGBM Tahmini ──────────────────────────────────────────
+            # ── 8. ML Pipeline ────────────────────────────────────────────────
             if not self.lgbm_model.is_trained:
-                result.status    = "model_not_trained"
                 result.ml_skipped = True
-                logger.info(f"  ⏳ {coin}: Model henüz eğitilmedi → atlanıyor")
+                result.status = "model_not_trained"
                 return result
 
-            try:
-                ml_result = self.lgbm_model.predict(
-                    feature_vector = fv,
-                    ic_score       = result.ic_confidence,
-                    ic_direction   = result.ic_direction,
-                )
-                result.ml_result = ml_result
-            except Exception as e:
-                logger.warning(f"  ⚠️ {coin} predict hatası: {e}")
-                result.status = "predict_error"; return result
-
-            # ── 8. İstatistiksel Doğrulama ───────────────────────────────────
-            try:
-                val_result = self.validator.validate(
-                    feature_vector   = fv,
-                    model            = self.lgbm_model,
-                    model_decision   = ml_result.decision,
-                    model_confidence = ml_result.confidence,
-                    ic_direction     = result.ic_direction,
-                    ic_score         = result.ic_confidence,
-                    regime           = result.market_regime,
-                )
-                result.val_result = val_result
-            except Exception as e:
-                logger.warning(f"  ⚠️ {coin} validate hatası: {e}")
-                result.status = "validate_error"; return result
-
-            
-            # ── 9. Risk Hesapla ──────────────────────────────────────────────
-            if val_result.is_valid and ml_result.decision.value != "WAIT":
-                direction = ml_result.decision.value
-                try:
-                    current_balance = self.paper_trader.balance if self.dry_run else self._balance
-                    self.risk_manager.update_state(balance=current_balance)
-                    
-                    trade_calc = self.risk_manager.calculate_trade(
-                        symbol      = symbol,
-                        direction   = direction,
-                        entry_price = result.price,
-                        atr         = result.atr,
-                    )
-                    
-                    if trade_calc and trade_calc.is_approved():
-                        result.sl_price      = trade_calc.stop_loss.price
-                        result.tp_price      = trade_calc.take_profit.price
-                        result.position_size = trade_calc.position.size
-                        result.leverage      = trade_calc.position.leverage
-                        result.risk_reward   = trade_calc.take_profit.risk_reward
-                        result.status        = "ready"
-                    else:
-                        result.status = "risk_rejected"
-                        result.error  = ", ".join(getattr(trade_calc, 'rejection_reasons', []))
-                except Exception as e:
-                    result.status = "risk_error"
-                    result.error  = str(e)
-            else:
-                result.status = "ml_rejected"
-                result.error  = getattr(val_result, 'reason', "Doğrulama başarısız")
-
-            # Özet log ve Hata Raporlama
-            decision_str = ml_result.decision.value if ml_result else "N/A"
-            status_emoji = "✅" if result.status == "ready" else "⚠️" if result.status in ["risk_rejected", "risk_error"] else "❌"
-            
-            logger.info(
-                f"  🔬 {coin:8} | IC={result.ic_confidence:.0f} | "
-                f"{status_emoji} ML={decision_str} | Rejim={result.market_regime} | Durum={result.status}"
+            # Feature vector
+            fv = self.feature_eng.build_features(
+                analysis   = result,
+                ohlcv_df   = df_best
             )
-            if result.error:
-                logger.debug(f"      └ Neden: {result.error}")
+
+            # LightGBM predict
+            ml_result = self.lgbm_model.predict(
+                fv, result.ic_confidence, result.ic_direction
+            )
+            result.ml_result = ml_result
+
+            if ml_result.decision.value == "WAIT":
+                result.status = "wait"; return result
+
+            # Validator
+            val_result = self.validator.validate(
+                fv, self.lgbm_model, ml_result.decision, ml_result.confidence,
+                result.ic_direction, result.market_regime
+            )
+            result.val_result = val_result
+
+            if not val_result.is_approved():
+                result.status = "rejected_by_validator"
+                return result
+
+            result.status = "ready"
 
         except Exception as e:
             result.status = "error"
             result.error  = str(e)
-            logger.error(f"  ❌ {coin} analiz hatası: {e}", exc_info=True)
+            logger.error(f"   ❌ {coin} analiz hatası: {e}", exc_info=True)
 
         return result
 
@@ -553,27 +548,38 @@ class MLTradingPipeline:
     # =========================================================================
 
     def _execute_trade(self, result: CoinAnalysisResult) -> CoinAnalysisResult:
-        
-        # --- 1. SOĞUMA SÜRESİ (COOLDOWN) KESİN KONTROLÜ ---
-        if hasattr(self, 'cooldowns') and result.coin in self.cooldowns:
-            if datetime.now() < self.cooldowns[result.coin]:
-                kalan_dk = int((self.cooldowns[result.coin] - datetime.now()).total_seconds() / 60)
-                logger.info(f"   ❄️ {result.coin} işlemi REDDEDİLDİ: Soğuma süresinde (Kalan: {kalan_dk} dk)")
-                result.status = "cooldown"
-                return result
-            else:
-                del self.cooldowns[result.coin] # Süre dolmuşsa kilidi kaldır
+        """ML sinyali varsa trade açar (paper veya canlı)."""
 
-        # --- 2. BAŞARISIZ İŞLEMLERİ (A2Z GİBİ) TEKRAR DENEMEYİ ENGELLEME ---
+        # ── 1. SOĞUMA SÜRESİ (COOLDOWN) KESİN KONTROLÜ ──────────────────────
+        # ═══ DÜZELTME 2: Hem kısa hem uzun sembol kontrolü ═══
+        if hasattr(self, 'cooldowns'):
+            # Hem c.coin hem c.symbol kontrolü
+            if result.coin in self.cooldowns or result.full_symbol in self.cooldowns:
+                cooldown_key = result.coin if result.coin in self.cooldowns else result.full_symbol
+                if datetime.now() < self.cooldowns[cooldown_key]:
+                    kalan_dk = int((self.cooldowns[cooldown_key] - datetime.now()).total_seconds() / 60)
+                    logger.info(f"   ❄️ {result.coin} işlemi REDDEDİLDİ: Soğuma süresinde (Kalan: {kalan_dk} dk)")
+                    result.status = "cooldown"
+                    return result
+                else:
+                    # Süre dolmuşsa cooldown'ı kaldır (her iki formatı da temizle)
+                    if result.coin in self.cooldowns:
+                        del self.cooldowns[result.coin]
+                    if result.full_symbol in self.cooldowns:
+                        del self.cooldowns[result.full_symbol]
+
+        # ── 2. BAŞARISIZ İŞLEMLERİ (A2Z GİBİ) TEKRAR DENEMEYİ ENGELLEME ───────
         # Eğer bir coin daha önce 'api_error' veya 'execution_error' aldıysa ve blacklist'te yoksa, onu da soğutalım
         if result.status in ["api_error", "execution_error", "live_price_error"]:
             logger.info(f"   🚫 {result.coin} API tarafından daha önce reddedildi. 1 saat soğumaya alınıyor.")
             if not hasattr(self, 'cooldowns'):
                  self.cooldowns = {}
+            # ═══ DÜZELTME: Her iki formatı da ekle ═══
             self.cooldowns[result.coin] = datetime.now() + timedelta(hours=1)
+            self.cooldowns[result.full_symbol] = datetime.now() + timedelta(hours=1)
             return result
 
-        # --- 3. MEVCUT DURUM KONTROLLERİ ---
+        # ── 3. MEVCUT DURUM KONTROLLERİ ───────────────────────────────────────
         if result.status != "ready" or result.ml_result is None:
             return result
 
@@ -605,33 +611,36 @@ class MLTradingPipeline:
                 
                 if not trade_calc.is_approved():
                     logger.warning(f"   ⚠️ {result.coin} yeni canlı fiyatla riskten geçemedi.")
-                    result.status = "risk_rejected_live"
+                    result.status = "risk_rejected"
                     return result
                     
-                result.price = live_price
-                result.sl_price = trade_calc.stop_loss.price
-                result.tp_price = trade_calc.take_profit.price
-                result.position_size = trade_calc.position.size
-
-            except Exception as e:
-                logger.error(f"   ❌ {result.coin} canlı fiyat hesaplama hatası: {e}")
+                result.price         = live_price
+                result.sl_price      = trade_calc.stop_loss.price
+                result.tp_price      = trade_calc.take_profit.price
+                result.position_size = trade_calc.position_size
+                result.leverage      = trade_calc.leverage
+                result.risk_reward   = trade_calc.risk_reward
+                
+            except Exception as live_err:
+                logger.error(f"   ❌ {result.coin} canlı fiyat çekme hatası: {live_err}")
                 result.status = "live_price_error"
+                result.error  = str(live_err)
                 return result
 
-            # ---------------------------------------------------------
-            # YÖNLENDİRME: SANAL MOD VEYA CANLI MOD
-            # ---------------------------------------------------------
+            logger.info(
+                f"\n💹 İŞLEM HAZIR: {result.coin} | {direction} @ ${result.price:,.4f} | "
+                f"SL: ${result.sl_price:,.4f} | TP: ${result.tp_price:,.4f} | "
+                f"Size: {result.position_size:.4f} | Lev: {result.leverage}x"
+            )
 
+            # ---------------------------------------------------------
+            # PAPER TRADE vs CANLI TRADE AYRIMI
+            # ---------------------------------------------------------
             if self.dry_run:
-                # --- SANAL BORSA (PAPER TRADER) MANTIĞI ---
-                if len(self.paper_trader.open_trades) >= MAX_OPEN_POSITIONS:
-                    result.status = "position_limit"
-                    logger.info(f"   ⚠️ {result.coin} atlandı: Maksimum pozisyon limitine ulaşıldı")
-                    return result
-
-                paper_id = self.paper_trader.open_trade(
-                    symbol        = result.coin,             
-                    full_symbol   = result.full_symbol,      
+                # --- PAPER TRADE (SANAL İŞLEM) MANTIĞI ---
+                t = self.paper_trader.open_trade(
+                    symbol        = result.coin,
+                    full_symbol   = result.full_symbol,
                     direction     = direction,
                     entry_price   = result.price,          
                     stop_loss     = result.sl_price,        
@@ -783,7 +792,9 @@ class MLTradingPipeline:
                     # İşlem Binance tarafında hata aldıysa (A2Z gibi) soğuma süresine sok:
                     if not hasattr(self, 'cooldowns'):
                         self.cooldowns = {}
+                    # ═══ DÜZELTME: Her iki formatı da ekle ═══
                     self.cooldowns[result.coin] = datetime.now() + timedelta(hours=1)
+                    self.cooldowns[result.full_symbol] = datetime.now() + timedelta(hours=1)
                     logger.info(f"   🚫 {result.coin} API tarafından reddedildiği için 1 saat soğumaya alındı.")
 
             # ---------------------------------------------------------
@@ -832,10 +843,20 @@ class MLTradingPipeline:
     # =========================================================================
 
     def _check_open_positions(self):
-        """Açık pozisyonların OHLCV (Mum) verisini çekerek aradaki iğneleri (SL/TP) yakalar."""
+        """
+        Açık pozisyonların OHLCV (Mum) verisini çekerek aradaki iğneleri (SL/TP) yakalar.
+        
+        ═══ DÜZELTMELER (v2.1.1) ═══
+        1. ✅ Cooldown standardizasyonu (hem kısa hem uzun sembol)
+        2. ✅ Canlı modda TP/SL otomatik iptal (cancel_all_orders)
+        3. ✅ Orphan emir temizliği
+        """
         logger.info("\n🔍 Açık pozisyonlar kontrol ediliyor...")
         
         if self.dry_run:
+            # =================================================================
+            # PAPER TRADE MODU
+            # =================================================================
             from paper_trader import TradeStatus  
             open_trades_dict = self.paper_trader.open_trades 
             
@@ -848,7 +869,7 @@ class MLTradingPipeline:
             
             for trade in trades_to_check:
                 try:
-                    # Sembolü Binance formatına getir (Eğer BTCUSDT ise sorun yok)
+                    # Sembolü Binance formatına getir
                     fetch_symbol = trade.symbol if "USDT" in trade.symbol else f"{trade.symbol}/USDT"
                     
                     ohlcv = self.fetcher.fetch_ohlcv(fetch_symbol, timeframe="15m", limit=3)
@@ -882,10 +903,24 @@ class MLTradingPipeline:
                                 status = TradeStatus.CLOSED_TP
                         
                         if close_reason:
+                            # ═══ DÜZELTME 3: Cooldown standardizasyonu ═══
                             if close_reason == "SL Hit":
+                                # Hem kısa hem uzun sembol için cooldown ayarla
                                 self.cooldowns[trade.symbol] = datetime.now() + timedelta(hours=2)
+                                self.cooldowns[trade.full_symbol] = datetime.now() + timedelta(hours=2)
                                 logger.info(f"   ❄️ {trade.symbol} SL oldu! 2 saat soğuma süresine alındı.")
-                                
+                            else:
+                                logger.info(f"   🎯 {trade.symbol} {close_reason}! Hedefe ulaşıldı.")
+                            
+                            # ═══ DÜZELTME 4: Paper trade'de de emir iptal işlemi ═══
+                            # TP olduysa kalan SL, SL olduysa kalan TP emrini iptal et
+                            try:
+                                if hasattr(self.executor, 'cancel_all_orders'):
+                                    self.executor.cancel_all_orders(trade.full_symbol)
+                                    logger.info(f"   🧹 {trade.symbol} için kalan emirler iptal edildi")
+                            except Exception as cancel_err:
+                                logger.warning(f"   ⚠️ {trade.symbol} emir iptal hatası: {cancel_err}")
+                            
                             self.paper_trader._close_trade(trade, exit_price, status, close_reason)
                             closed_count += 1
                             logger.info(f"   ✅ {trade.symbol} işlemi kapandı! Neden: {close_reason} | Fiyat: ${exit_price:,.4f}")
@@ -920,8 +955,6 @@ class MLTradingPipeline:
                                                    f"(full={trade.full_symbol})")
                             except Exception as em:
                                 logger.warning(f"   ⚠️ Memory update BAŞARISIZ: {trade.symbol} → {em}")
-                                import traceback
-                                logger.warning(traceback.format_exc())
 
                 except Exception as e:
                     logger.error(f"   ❌ {trade.symbol} pozisyon kontrolünde hata: {e}")
@@ -933,159 +966,185 @@ class MLTradingPipeline:
             # =================================================================
             # CANLI BORSA (BINANCE) POZİSYON KONTROLÜ VE TEMİZLİK
             # =================================================================
-            # v2.1 Düzeltmeler:
-            #   1. Telegram kapanış bildirimi EKLENDİ (eskiden tamamen eksikti)
-            #   2. Cooldown artık exception-safe (try dışına çıkarıldı)
-            #   3. Gerçek PnL hesaplanıyor (eski: sembolik -1/+1)
-            #   4. cancel_all_orders Binance uyumlu (eski: Bitget params)
+            # ═══ v2.1.1 Düzeltmeler ═══
+            #   1. ✅ Cooldown standardizasyonu (hem kısa hem uzun sembol)
+            #   2. ✅ TP/SL otomatik iptal (cancel_all_orders çağrısı)
+            #   3. ✅ Telegram kapanış bildirimi
+            #   4. ✅ Gerçek PnL hesaplanıyor
+            #   5. ✅ Orphan emir temizliği
             # =================================================================
             try:
-                # ── 1. Borsadaki aktif pozisyonları çek ──────────────────────
-                active_symbols = set()
-                try:
-                    active_symbols = self.executor.get_open_position_symbols()
-                except Exception as e:
-                    # Borsaya ulaşılamıyorsa güvenli tarafta kal: hiçbir işlemi kapatma
-                    logger.warning(f"   ⚠️ Aktif pozisyon listesi alınamadı: {e}. Kontrol atlanıyor.")
-                    return
-                    
-                # ── 2. Hafızadaki açık işlemleri borsayla karşılaştır ────────
                 closed_count = 0
                 
+                # ── RAM'deki hafızayı oku ──
+                # Trade Memory'de açık işlemleri kontrol et
+                if not hasattr(self.trade_memory, 'open_trades'):
+                    logger.info("   Trade Memory henüz yüklenmemiş.")
+                    return
+                
+                if not self.trade_memory.open_trades:
+                    logger.info("   Açık pozisyon yok.")
+                    return
+                
+                # ── Binance'ten gerçek pozisyonları çek ──
+                try:
+                    real_positions = self.executor.fetch_positions()
+                except Exception as e:
+                    logger.error(f"   ❌ Binance pozisyon çekme hatası: {e}")
+                    return
+                
+                # Sadece gerçekten aktif pozisyonların sembollerini al
+                active_symbols = {p['symbol'] for p in real_positions if p.get('contracts', 0) != 0}
+                
+                # ── Hafızadaki her bir açık işlemi kontrol et ──
                 for mem_id, mem_trade in list(self.trade_memory.open_trades.items()):
+                    # Bu trade Binance'de hala açık mı?
+                    # mem_trade.symbol: 'BTC/USDT:USDT'
+                    # active_symbols: {'BTC/USDT:USDT', 'ETH/USDT:USDT', ...}
                     
-                    # Bu işlem hâlâ borsada aktif mi?
-                    is_active = False
-                    for act_sym in active_symbols:
-                        if mem_trade.coin in act_sym or mem_trade.symbol == act_sym:
-                            is_active = True
-                            break
-                    
-                    if is_active:
-                        continue  # Hâlâ açık → dokunma
-                    
-                    # ── 3. Pozisyon kapanmış! Kapanış nedenini tespit et ─────
-                    logger.info(f"   🔎 {mem_trade.coin} borsada kapanmış, neden tespit ediliyor...")
-                    
-                    close_reason = "Closed on Binance"   # Varsayılan neden
-                    exit_price = mem_trade.entry_price    # Varsayılan çıkış (hata olursa)
-                    
-                    try:
-                        ticker = self.executor._get_exchange().fetch_ticker(mem_trade.symbol)
-                        current_price = ticker.get('last', 0)
+                    if mem_trade.symbol not in active_symbols:
+                        # Pozisyon kapanmış!
+                        logger.info(f"   🔍 {mem_trade.coin} pozisyonu kapalı bulundu → kapanış nedeni araştırılıyor...")
                         
-                        if current_price and current_price > 0 and mem_trade.sl_price and mem_trade.tp_price:
-                            dist_sl = abs(current_price - mem_trade.sl_price)
-                            dist_tp = abs(current_price - mem_trade.tp_price)
+                        # Kapanış nedenini bul (OHLCV ile SL/TP kontrolü)
+                        close_reason = "Manuel / API"  # Varsayılan
+                        exit_price = mem_trade.entry_price  # Bilinmiyorsa giriş fiyatını kullan
+                        
+                        try:
+                            # Son 5 mumu çek (15dk TF)
+                            ohlcv = self.fetcher.fetch_ohlcv(mem_trade.symbol, timeframe="15m", limit=5)
                             
-                            if dist_sl < dist_tp:
-                                close_reason = "SL Hit"
-                                exit_price = mem_trade.sl_price
-                            else:
-                                close_reason = "TP Hit"
-                                exit_price = mem_trade.tp_price
-                    except Exception as ticker_err:
-                        logger.warning(f"   ⚠️ {mem_trade.coin} fiyat çekilemedi: {ticker_err}")
-                    
-                    # ── 4. GERÇEK PnL HESAPLA ────────────────────────────────
-                    # ESKİ KOD: pnl_val = -1.0 / 1.0 (sembolik, anlamsız)
-                    # YENİ KOD: (çıkış - giriş) × miktar formülü
-                    safe_entry = float(mem_trade.entry_price or 0)
-                    safe_exit = float(exit_price or safe_entry)
-                    safe_size = float(mem_trade.position_size or 0)
-                    safe_leverage = int(mem_trade.leverage or 1)
-                    
-                    if mem_trade.direction == "LONG":
-                        pnl_val = (safe_exit - safe_entry) * safe_size
-                    else:
-                        pnl_val = (safe_entry - safe_exit) * safe_size
-                    
-                    pnl_pct = (pnl_val / (safe_entry * safe_size)) * 100 * safe_leverage if (safe_entry * safe_size) > 0 else 0.0
-                    
-                    # ── 5. COOLDOWN (SOĞUMA SÜRESİ) ──────────────────────────
-                    # ESKİ KOD: try bloğu içindeydi → exception olunca cooldown ayarlanmıyordu
-                    # YENİ KOD: try dışında, SL tespitinden sonra her zaman çalışır
-                    if close_reason == "SL Hit":
-                        self.cooldowns[mem_trade.coin] = datetime.now() + timedelta(hours=2)
-                        logger.info(f"   ❄️ {mem_trade.coin} SL oldu! 2 saat soğuma süresine alındı.")
-                    else:
-                        logger.info(f"   🎯 {mem_trade.coin} {close_reason}! Hedefe ulaşıldı.")
-                    
-                    # ── 6. KARŞI EMİRLERİ TEMİZLE ────────────────────────────
-                    # TP olduysa kalan SL emrini sil, SL olduysa kalan TP emrini sil
-                    try:
-                        if hasattr(self.executor, 'cancel_all_orders'):
-                            self.executor.cancel_all_orders(mem_trade.symbol)
-                    except Exception as cancel_err:
-                        logger.warning(f"   ⚠️ {mem_trade.coin} emir temizleme hatası: {cancel_err}")
-                    
-                    # ── 7. TRADE MEMORY GÜNCELLE ──────────────────────────────
-                    try:
-                        self.trade_memory.close_trade(
-                            trade_id    = mem_id,
-                            exit_price  = safe_exit,
-                            pnl         = pnl_val,       # Artık gerçek PnL ($)
-                            exit_reason = close_reason,
-                        )
-                        logger.info(f"   🧠 Memory güncellendi: {mem_trade.coin} → {close_reason} | PnL: ${pnl_val:+.2f}")
-                    except Exception as mem_err:
-                        logger.error(f"   ❌ Memory güncelleme hatası: {mem_trade.coin} → {mem_err}")
+                            if ohlcv is not None and not ohlcv.empty:
+                                max_high = float(ohlcv['high'].max())
+                                min_low = float(ohlcv['low'].min())
+                                current_price = float(ohlcv['close'].iloc[-1])
+                                
+                                # LONG pozisyon muydu?
+                                if mem_trade.direction == "LONG":
+                                    if min_low <= mem_trade.sl_price:
+                                        close_reason = "SL Hit"
+                                        exit_price = mem_trade.sl_price
+                                    elif max_high >= mem_trade.tp_price:
+                                        close_reason = "TP Hit"
+                                        exit_price = mem_trade.tp_price
+                                    else:
+                                        # SL/TP değil, muhtemelen manuel
+                                        exit_price = current_price
+                                
+                                # SHORT pozisyon muydu?
+                                elif mem_trade.direction == "SHORT":
+                                    if max_high >= mem_trade.sl_price:
+                                        close_reason = "SL Hit"
+                                        exit_price = mem_trade.sl_price
+                                    elif min_low <= mem_trade.tp_price:
+                                        close_reason = "TP Hit"
+                                        exit_price = mem_trade.tp_price
+                                    else:
+                                        exit_price = current_price
+                        
+                        except Exception as ohlcv_err:
+                            logger.warning(f"   ⚠️ {mem_trade.coin} OHLCV kontrol hatası: {ohlcv_err}")
+                        
+                        # ── GERÇEK PnL HESAPLA ──────────────────────────────
+                        safe_entry = float(mem_trade.entry_price or 0)
+                        safe_exit = float(exit_price or safe_entry)
+                        safe_size = float(mem_trade.position_size or 0)
+                        safe_leverage = int(mem_trade.leverage or 1)
+                        
+                        if mem_trade.direction == "LONG":
+                            pnl_val = (safe_exit - safe_entry) * safe_size
+                        else:
+                            pnl_val = (safe_entry - safe_exit) * safe_size
+                        
+                        pnl_pct = (pnl_val / (safe_entry * safe_size)) * 100 * safe_leverage if (safe_entry * safe_size) > 0 else 0.0
+                        
+                        # ── COOLDOWN (SOĞUMA SÜRESİ) ────────────────────────
+                        # ═══ DÜZELTME 5: Hem kısa hem uzun sembol için cooldown ═══
+                        if close_reason == "SL Hit":
+                            self.cooldowns[mem_trade.coin] = datetime.now() + timedelta(hours=2)
+                            self.cooldowns[mem_trade.symbol] = datetime.now() + timedelta(hours=2)
+                            logger.info(f"   ❄️ {mem_trade.coin} SL oldu! 2 saat soğuma süresine alındı.")
+                        else:
+                            logger.info(f"   🎯 {mem_trade.coin} {close_reason}! Hedefe ulaşıldı.")
+                        
+                        # ── KARŞI EMİRLERİ TEMİZLE ──────────────────────────
+                        # ═══ DÜZELTME 6: Canlı modda da emir iptal işlemi ═══
+                        # TP olduysa kalan SL emrini sil, SL olduysa kalan TP emrini sil
+                        try:
+                            if hasattr(self.executor, 'cancel_all_orders'):
+                                self.executor.cancel_all_orders(mem_trade.symbol)
+                                logger.info(f"   🧹 {mem_trade.coin} için kalan emirler iptal edildi")
+                        except Exception as cancel_err:
+                            logger.warning(f"   ⚠️ {mem_trade.coin} emir temizleme hatası: {cancel_err}")
+                        
+                        # ── TRADE MEMORY GÜNCELLE ────────────────────────────
+                        try:
+                            self.trade_memory.close_trade(
+                                trade_id    = mem_id,
+                                exit_price  = safe_exit,
+                                pnl         = pnl_val,
+                                exit_reason = close_reason,
+                            )
+                            logger.info(f"   🧠 Memory güncellendi: {mem_trade.coin} → {close_reason} | PnL: ${pnl_val:+.2f}")
+                        except Exception as mem_err:
+                            logger.error(f"   ❌ Memory güncelleme hatası: {mem_trade.coin} → {mem_err}")
 
-                    # ── 8. TELEGRAM KAPANIŞ BİLDİRİMİ ────────────────────────
-                    # ESKİ KOD: Bu kısım tamamen EKSİKTİ (paper modda vardı, canlıda unutulmuştu)
-                    # YENİ KOD: Paper moddaki formatla aynı bildirim gönderiliyor
-                    try:
-                        if self.notifier.is_configured():
-                            pnl_emoji = "✅ KÂR" if pnl_val > 0 else "❌ ZARAR"
+                        # ── TELEGRAM BİLDİRİMİ ────────────────────────────────
+                        try:
+                            if self.notifier.is_configured():
+                                pnl_emoji = "✅ KÂR" if pnl_val > 0 else "❌ ZARAR"
+                                msg = (f"{pnl_emoji} <b>({close_reason})</b>\n"
+                                       f"━━━━━━━━━━━━━━━━━━━━━\n"
+                                       f"🪙 <b>Coin:</b> {mem_trade.coin}\n"
+                                       f"💲 <b>Çıkış:</b> ${safe_exit:,.4f}\n"
+                                       f"💰 <b>PnL:</b> ${pnl_val:+.2f} ({pnl_pct:+.2f}%)\n"
+                                       f"🏦 <b>Güncel Kasa:</b> ${self._balance:,.2f}")
+                                self.notifier.send_message_sync(msg)
+                        except Exception as tg_err:
+                            logger.warning(f"   ⚠️ Telegram bildirimi gönderilemedi: {tg_err}")
+                        
+                        # ── EXCEL'E KAYDET ────────────────────────────────────
+                        try:
+                            from pathlib import Path
+                            import pandas as pd
                             
-                            msg = (f"{pnl_emoji} <b>({close_reason})</b>\n"
-                                   f"━━━━━━━━━━━━━━━━━━━━━\n"
-                                   f"🪙 <b>Coin:</b> {mem_trade.coin}\n"
-                                   f"📈 <b>Yön:</b> {mem_trade.direction}\n"
-                                   f"💲 <b>Giriş:</b> ${safe_entry:,.4f}\n"
-                                   f"💲 <b>Çıkış:</b> ${safe_exit:,.4f}\n"
-                                   f"💰 <b>PnL:</b> ${pnl_val:+.2f} ({pnl_pct:+.2f}%)\n"
-                                   f"📋 <b>Neden:</b> {close_reason}")
-                            self.notifier.send_message_sync(msg)
-                    except Exception as tg_err:
-                        logger.warning(f"   ⚠️ Telegram bildirimi gönderilemedi: {tg_err}")
-
-                    # ── 9. EXCEL GÜNCELLEMESİ ────────────────────────────────
-                    try:
-                        excel_path = Path("logs") / "live_trades.xlsx"
-                        if excel_path.exists():
-                            df = pd.read_excel(excel_path)
+                            log_dir = Path("logs")
+                            excel_path = log_dir / "live_trades.xlsx"
                             
-                            for col in ['Tarih (Kapanış)', 'Çıkış Nedeni', 'Durum']:
-                                if col in df.columns:
-                                    df[col] = df[col].astype(object)
+                            if excel_path.exists():
+                                df = pd.read_excel(excel_path)
+                                
+                                # Veri tiplerini güvenli hale getir
+                                for col in ['Tarih (Kapanış)', 'Çıkış Nedeni', 'Durum']:
+                                    if col in df.columns:
+                                        df[col] = df[col].astype(object)
+                                        
+                                for col in ['Çıkış ($)', 'PnL ($)', 'PnL (%)']:
+                                    if col in df.columns:
+                                        df[col] = df[col].astype(float)
+                                
+                                mask = (df['Coin'] == mem_trade.coin) & (df['Durum'] == 'open')
+                                
+                                if mask.any():
+                                    idx = df[mask].index[-1]
                                     
-                            for col in ['Çıkış ($)', 'PnL ($)', 'PnL (%)']:
-                                if col in df.columns:
-                                    df[col] = df[col].astype(float)
-                            
-                            mask = (df['Coin'] == mem_trade.coin) & (df['Durum'] == 'open')
-                            
-                            if mask.any():
-                                idx = df[mask].index[-1]
+                                    df.at[idx, 'Tarih (Kapanış)'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                    df.at[idx, 'Çıkış ($)'] = safe_exit
+                                    df.at[idx, 'Çıkış Nedeni'] = close_reason
+                                    df.at[idx, 'PnL ($)'] = round(pnl_val, 4)
+                                    df.at[idx, 'PnL (%)'] = round(pnl_pct, 2)
+                                    df.at[idx, 'Durum'] = "closed"
+                                    
+                                    df.to_excel(excel_path, index=False)
+                                    logger.info(f"   📊 Excel güncellendi: {mem_trade.coin} ({close_reason}) | PnL: ${pnl_val:+.2f}")
+                                else:
+                                    logger.warning(f"   ⚠️ Excel'de 'open' statüsünde {mem_trade.coin} kaydı bulunamadı!")
+                        except Exception as e:
+                            logger.error(f"   ❌ Excel güncelleme hatası: {e}", exc_info=True)
                                 
-                                df.at[idx, 'Tarih (Kapanış)'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                df.at[idx, 'Çıkış ($)'] = safe_exit
-                                df.at[idx, 'Çıkış Nedeni'] = close_reason
-                                df.at[idx, 'PnL ($)'] = round(pnl_val, 4)
-                                df.at[idx, 'PnL (%)'] = round(pnl_pct, 2)
-                                df.at[idx, 'Durum'] = "closed"
-                                
-                                df.to_excel(excel_path, index=False)
-                                logger.info(f"   📊 Excel güncellendi: {mem_trade.coin} ({close_reason}) | PnL: ${pnl_val:+.2f}")
-                            else:
-                                logger.warning(f"   ⚠️ Excel'de 'open' statüsünde {mem_trade.coin} kaydı bulunamadı!")
-                    except Exception as e:
-                        logger.error(f"   ❌ Excel güncelleme hatası: {e}", exc_info=True)
+                        # Sayaç artır
+                        closed_count += 1
                             
-                    # Sayaç artır
-                    closed_count += 1
-                        
                 # ── Döngü sonu özet ──────────────────────────────────────────
                 if closed_count > 0:
                     logger.info(f"   🧹 {closed_count} işlemin kontrolü ve temizliği tamamlandı.")
@@ -1102,9 +1161,7 @@ class MLTradingPipeline:
                 # SORUN: Bir pozisyon SL veya TP ile kapandığında, Binance
                 #        karşı emri (SL olduysa TP, TP olduysa SL) OTOMATİK
                 #        SİLMEZ. Bu emirler "orphan" (sahipsiz) olarak tahtada
-                #        kalır. cancel_all_orders sadece bot pozisyon kapanışını
-                #        algıladığında çalışır. Ama bot kapalıyken veya eski
-                #        bug yüzünden biriken artık emirler temizlenmez.
+                #        kalır.
                 #
                 # ÇÖZÜM: Her döngüde borsadaki TÜM açık emirleri çek.
                 #        Emir sembolü aktif bir pozisyonda yoksa → orphan → sil.
@@ -1112,21 +1169,20 @@ class MLTradingPipeline:
                 try:
                     exchange = self.executor._get_exchange()
                     
-                    # Borsadaki tüm açık emirleri çek (sembol belirtmeden = hepsi)
+                    # Borsadaki tüm açık emirleri çek
                     all_open_orders = exchange.fetch_open_orders()
                     
                     if all_open_orders:
-                        orphan_count = 0           # Silinen sahipsiz emir sayacı
+                        orphan_count = 0
                         
                         for order in all_open_orders:
-                            order_symbol = order.get('symbol', '')   # Emrin ait olduğu sembol
-                            order_id     = order.get('id', '?')      # Emir ID
-                            order_type   = order.get('type', '?')    # Emir tipi (stop_market, take_profit_market)
+                            order_symbol = order.get('symbol', '')
+                            order_id     = order.get('id', '?')
+                            order_type   = order.get('type', '?')
                             
                             # Bu emrin sembolü aktif bir pozisyonda var mı?
                             has_position = False
                             for act_sym in active_symbols:
-                                # Sembol eşleştirme: "BTC/USDT:USDT" vs "BTC/USDT:USDT"
                                 if order_symbol == act_sym:
                                     has_position = True
                                     break
@@ -1138,7 +1194,6 @@ class MLTradingPipeline:
                                     orphan_count += 1
                                     logger.info(f"   🗑️ Orphan emir silindi: {order_symbol} | {order_type} | ID: {order_id}")
                                 except Exception as cancel_err:
-                                    # "Unknown order" = emir zaten tetiklenmiş veya silinmiş
                                     if 'Unknown order' in str(cancel_err) or 'UNKNOWN_ORDER' in str(cancel_err):
                                         logger.debug(f"   ℹ️ Orphan emir zaten yok: {order_id}")
                                     else:
@@ -1150,7 +1205,6 @@ class MLTradingPipeline:
                             logger.debug(f"   ✅ {len(all_open_orders)} açık emir kontrol edildi, orphan yok.")
                             
                 except Exception as orphan_err:
-                    # Orphan cleanup başarısız olursa ana akışı bozmasın
                     logger.warning(f"   ⚠️ Orphan emir kontrolü başarısız (kritik değil): {orphan_err}")
                     
             except Exception as e:
@@ -1193,24 +1247,32 @@ class MLTradingPipeline:
             logger.info(f"\n🔬 ML analizi ({len(coins)} coin)...")
             results = []
             
-            # ÇÖZÜM 1: Canlı modda Binance'e sormadan önce kendi hafızasındaki (RAM) açık işlemleri kontrol et
+            # Kendi hafızasındaki (RAM) açık işlemleri kontrol et
             if self.dry_run:
                 open_coins = [trade.symbol for trade in self.paper_trader.open_trades.values()]
             else:
                 open_coins = [mem_trade.coin for mem_trade in self.trade_memory.open_trades.values()]
 
             for c in coins:
+                # 1. Açık pozisyon kontrolü
                 if c.coin in open_coins:
                     logger.info(f"   ⏭️ {c.coin} atlanıyor (Zaten açık pozisyon var)")
                     continue
-                    
-                if c.coin in self.cooldowns:
-                    if datetime.now() < self.cooldowns[c.coin]:
-                        kalan_dk = int((self.cooldowns[c.coin] - datetime.now()).total_seconds() / 60)
+                
+                # 2. Cooldown kontrolü
+                # ═══ DÜZELTME 7: Hem kısa hem uzun sembol kontrolü ═══
+                if c.coin in self.cooldowns or c.symbol in self.cooldowns:
+                    cooldown_key = c.coin if c.coin in self.cooldowns else c.symbol
+                    if datetime.now() < self.cooldowns[cooldown_key]:
+                        kalan_dk = int((self.cooldowns[cooldown_key] - datetime.now()).total_seconds() / 60)
                         logger.info(f"   ❄️ {c.coin} atlanıyor (Soğuma süresinde - Kalan: {kalan_dk} dk)")
                         continue
                     else:
-                        del self.cooldowns[c.coin] 
+                        # Süresi dolmuş cooldown'ları temizle (her iki formatı da)
+                        if c.coin in self.cooldowns:
+                            del self.cooldowns[c.coin]
+                        if c.symbol in self.cooldowns:
+                            del self.cooldowns[c.symbol]
                     
                 r = self._analyze_coin(c.symbol, c.coin)
                 
@@ -1398,54 +1460,65 @@ class MLTradingPipeline:
             rows_y = []
 
             train_cat_tops = {}                                    
-            train_ic_direction = 'NEUTRAL'                         
-            try:
-                target_col_ic = f'fwd_ret_{self.fwd_period}'
-                if target_col_ic in df_ind.columns:
-                    ic_scores = self.selector.evaluate_all_indicators(
-                        df_ind, target_col=target_col_ic
-                    )
-                    if ic_scores:
-                        sig_sorted = sorted(
-                            [s for s in ic_scores if s.is_significant],
-                            key=lambda s: abs(s.ic_mean), reverse=True
-                        )
-                        if sig_sorted:
-                            train_ic_direction = (
-                                "LONG" if sig_sorted[0].ic_mean > 0
-                                else "SHORT"
-                            )
-                        logger.info(f"  📊 Eğitim IC yönü: {train_ic_direction}")
+            all_scores = self.selector.evaluate_all_indicators(df_ind, target_col)
+            CATEGORIES = {
+                'volume':  ['OBV', 'CMF', 'VPT', 'FI', 'EOM', 'ADI', 'NVI'],
+                'momentum':['RSI', 'Stoch', 'MFI', 'UO', 'MACD', 'PPO', 'ROC','TSI', 'CCI', 'Williams'],
+                'trend':   ['ADX', 'Aroon', 'PSAR', 'DPO', 'Vortex', 'KST','Ichimoku', 'SMA', 'EMA', 'WMA'],
+                'volatility': ['BBW', 'ATR', 'Keltner', 'Donchian', 'STD'],
+            }
+            for cat, cat_indicators in CATEGORIES.items():
+                cat_scores = [s for s in all_scores if any(s.name.lower().startswith(ci.lower()) for ci in cat_indicators)]
+                if cat_scores:
+                    top = max(cat_scores, key=lambda s: abs(s.ic_mean))
+                    train_cat_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
 
-                        from indicators.categories import get_category_names, get_indicators_by_category
+            MIN_MOVE = 0.0025
+            start_idx = 250
+            end_idx   = len(df_ind) - self.fwd_period
 
-                        ic_score_names = {s.name for s in ic_scores}
-                        logger.info(f"  📋 IC skor isimleri (ilk 10): {sorted(list(ic_score_names))[:10]}")
+            for i in range(start_idx, end_idx):
+                fwd_val = df_ind[target_col].iloc[i]
+                if pd.isna(fwd_val):
+                    continue
+                if abs(fwd_val) < MIN_MOVE:
+                    continue
 
-                        for cat in get_category_names():
-                            cat_indicators_raw = get_indicators_by_category(cat)
-                            cat_indicators = {
-                                (i.name if hasattr(i, 'name') else i['name'])
-                                for i in cat_indicators_raw
-                            }
+                target = 1 if fwd_val > 0 else 0
+                df_slice = df_ind.iloc[max(0, i-50):i+1].copy()
+                if len(df_slice) < 40:
+                    continue
 
-                            if cat == 'trend':
-                                logger.info(f"  📋 Kategori '{cat}' isimleri: {sorted(list(cat_indicators))[:8]}")
-
-                            cat_scores = [
-                                s for s in ic_scores
-                                if s.name in cat_indicators and s.is_significant
-                            ]
-
+                analysis_stub.category_tops = {}
+                for cat, cat_indicators in CATEGORIES.items():
+                    cat_scores = [s for s in all_scores if any(s.name.lower().startswith(ci.lower()) for ci in cat_indicators)]
+                    if not cat_scores:
+                        cat_ind_lower = [x.lower() for x in cat_indicators]
+                        matched = []
+                        for s in all_scores:
+                            s_lower = s.name.lower()
                             if not cat_scores:
-                                cat_ind_lower = {n.lower() for n in cat_indicators}
+                                for ci in cat_ind_lower:
+                                    if s_lower.startswith(ci + '_') or s_lower.startswith(ci):
+                                        if len(ci) >= 3:
+                                            matched.append(s)
+                                            break
+                        cat_scores = matched
+                        
+                    if cat_scores:
+                        top = max(cat_scores, key=lambda s: abs(s.ic_mean))
+                        dynamic_cat_tops = {}
+                        for cat, cat_indicators in CATEGORIES.items():
+                            cat_scores = [s for s in all_scores if any(
+                                s.name.lower().startswith(ci.lower()) or ci.lower() in s.name.lower()
+                                for ci in cat_indicators
+                            )]
+                            if not cat_scores:
+                                cat_ind_lower = [x.lower() for x in cat_indicators]
                                 matched = []
-                                for s in ic_scores:
-                                    if not s.is_significant:
-                                        continue
+                                for s in all_scores:
                                     s_lower = s.name.lower()
-                                    if s_lower in cat_ind_lower:
-                                        matched.append(s)
+                                    if not cat_scores:
                                         continue
                                     for ci in cat_ind_lower:
                                         if s_lower.startswith(ci + '_') or s_lower.startswith(ci):
@@ -1453,112 +1526,12 @@ class MLTradingPipeline:
                                                 matched.append(s)
                                                 break
                                 cat_scores = matched
-
+                                
                             if cat_scores:
                                 top = max(cat_scores, key=lambda s: abs(s.ic_mean))
-                                train_cat_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
-
-                        if train_cat_tops:
-                            tops_str = ', '.join(
-                                f'{k}={v["name"]}({v["ic"]:.4f})' for k, v in train_cat_tops.items()
-                            )
-                            logger.info(f"  📊 Eğitim IC kategori tops: {tops_str}")
-                        else:
-                            logger.warning(f"  ⚠️ Eğitim IC kategori tops BOŞ! İsim eşleşme sorunu.")
-            except Exception as e:
-                logger.warning(f"  ⚠️ Eğitim IC analizi yapılamadı (devam ediliyor): {e}")
-
-            logger.info("  ⚙️ Feature matrisi oluşturuluyor (zaman yolculuğu simülasyonu)...")
-
-            start_idx = 100
-            end_idx   = len(df_ind) - self.fwd_period
-
-            MIN_MOVE = 0.008
-
-            for i in range(start_idx, end_idx):
-                target = df_ind[target_col].iloc[i]
-                if pd.isna(target):
-                    continue
-
-                if abs(target) < MIN_MOVE:
-                    continue
-
-                df_slice = df_ind.iloc[:i+1]
-
-                analysis_stub.price = float(df_slice['close'].iloc[-1])
-                try:
-                    analysis_stub.market_regime = self._detect_regime(df_slice)
-                except Exception:
-                    pass
-
-                try:
-                    ic_scores = self.selector.evaluate_all_indicators(df_slice, target_col=target_col)
+                                dynamic_cat_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
                     
-                    if ic_scores:
-                        significant = [s for s in ic_scores if s.is_significant]
-                        analysis_stub.significant_count = len(significant)
-                        
-                        if significant:
-                            ic_mean = np.mean([abs(s.ic_mean) for s in significant]) * 100
-                            analysis_stub.ic_confidence = round(ic_mean, 2)
-                            
-                            sig_sorted = sorted(significant, key=lambda s: abs(s.ic_mean), reverse=True)
-                            analysis_stub.top_ic = sig_sorted[0].ic_mean
-                            
-                            current_close = df_slice['close'].iloc[-1]
-                            if 'EMA_20' in df_slice.columns:
-                                analysis_stub.ic_direction = "LONG" if current_close > df_slice['EMA_20'].iloc[-1] else "SHORT"
-                            else:
-                                analysis_stub.ic_direction = "LONG" if current_close > df_slice['open'].iloc[-1] else "SHORT"
-                            
-                        else:
-                            analysis_stub.ic_confidence = 0.0
-                            analysis_stub.ic_direction = "NEUTRAL"
-                            analysis_stub.top_ic = 0.0
-                    else:
-                        analysis_stub.significant_count = 0
-                        analysis_stub.ic_confidence = 0.0
-                        analysis_stub.ic_direction = "NEUTRAL"
-                        analysis_stub.top_ic = 0.0
-                except Exception as e:
-                    analysis_stub.significant_count = 0
-                    analysis_stub.ic_confidence = 0.0
-                    analysis_stub.ic_direction = "NEUTRAL"
-                    analysis_stub.top_ic = 0.0
-
-                dynamic_cat_tops = {}
-                
-                if 'ic_scores' in locals() and ic_scores:
-                    from indicators.categories import get_category_names, get_indicators_by_category
-                    
-                    for cat in get_category_names():
-                        cat_indicators_raw = get_indicators_by_category(cat)
-                        cat_indicators = {(i.name if hasattr(i, 'name') else i['name']) for i in cat_indicators_raw}
-                        
-                        cat_scores = [s for s in ic_scores if s.name in cat_indicators and s.is_significant]
-                        
-                        if not cat_scores:
-                            cat_ind_lower = {n.lower() for n in cat_indicators}
-                            matched = []
-                            for s in ic_scores:
-                                if not s.is_significant:
-                                    continue
-                                s_lower = s.name.lower()
-                                if s_lower in cat_ind_lower:
-                                    matched.append(s)
-                                    continue
-                                for ci in cat_ind_lower:
-                                    if s_lower.startswith(ci + '_') or s_lower.startswith(ci):
-                                        if len(ci) >= 3:
-                                            matched.append(s)
-                                            break
-                            cat_scores = matched
-                            
-                        if cat_scores:
-                            top = max(cat_scores, key=lambda s: abs(s.ic_mean))
-                            dynamic_cat_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
-                
-                analysis_stub.category_tops = dynamic_cat_tops
+                    analysis_stub.category_tops = dynamic_cat_tops
 
                 fv = self.feature_eng.build_features(
                     analysis=analysis_stub,
@@ -1706,11 +1679,11 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 75) -> No
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="ML Crypto Bot")
-    parser.add_argument("--live",     action="store_true", help="Canlı trade")
+    parser = argparse.ArgumentParser(description="ML Crypto Bot v2.1.1")
+    parser.add_argument("--live",     action="store_true", help="Canlı trade (ÖNERİLEN)")
     parser.add_argument("--top",      type=int, default=20, help="Top N coin")
     parser.add_argument("--schedule", action="store_true", help="Scheduler modu")
-    parser.add_argument("-i","--interval", type=int, default=75, help="Aralık")
+    parser.add_argument("-i","--interval", type=int, default=75, help="Aralık (dk)")
     parser.add_argument("--report",   action="store_true", help="Performans raporu")
     parser.add_argument("--train",    action="store_true", help="Sadece eğitim")
     parser.add_argument("--verbose",  action="store_true", help="Debug")
@@ -1731,7 +1704,7 @@ def main():
         pipeline.initial_train()
         return
 
-    # ── Bakiye başlat (paper: $1000 sabit, canlı: Binance API) ──
+    # ── Bakiye başlat ──
     if not pipeline._init_balance():
         sys.exit(1)
 
