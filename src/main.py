@@ -930,129 +930,230 @@ class MLTradingPipeline:
                 logger.info(f"   Mevcut Bakiye: ${self.paper_trader.balance:.2f}")
 
         else:
-            # --- CANLI BORSA (BINANCE) POZİSYON KONTROLÜ VE TEMİZLİK ---
+            # =================================================================
+            # CANLI BORSA (BINANCE) POZİSYON KONTROLÜ VE TEMİZLİK
+            # =================================================================
+            # v2.1 Düzeltmeler:
+            #   1. Telegram kapanış bildirimi EKLENDİ (eskiden tamamen eksikti)
+            #   2. Cooldown artık exception-safe (try dışına çıkarıldı)
+            #   3. Gerçek PnL hesaplanıyor (eski: sembolik -1/+1)
+            #   4. cancel_all_orders Binance uyumlu (eski: Bitget params)
+            # =================================================================
             try:
+                # ── 1. Borsadaki aktif pozisyonları çek ──────────────────────
                 active_symbols = set()
                 try:
                     active_symbols = self.executor.get_open_position_symbols()
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Borsaya ulaşılamıyorsa güvenli tarafta kal: hiçbir işlemi kapatma
+                    logger.warning(f"   ⚠️ Aktif pozisyon listesi alınamadı: {e}. Kontrol atlanıyor.")
+                    return
                     
-                # Hafızadaki (TradeMemory) açık canlı işlemleri kontrol et
+                # ── 2. Hafızadaki açık işlemleri borsayla karşılaştır ────────
                 closed_count = 0
+                
                 for mem_id, mem_trade in list(self.trade_memory.open_trades.items()):
+                    
+                    # Bu işlem hâlâ borsada aktif mi?
                     is_active = False
                     for act_sym in active_symbols:
                         if mem_trade.coin in act_sym or mem_trade.symbol == act_sym:
                             is_active = True
                             break
-                            
-                    if not is_active:
-                        # 1. Kapanış Nedenini (SL/TP) Tahmin Et ve Soğuma Süresini Uygula
-                        close_reason = "Closed on Binance"
-                        exit_price = mem_trade.entry_price # Hata olursa 0.0 yazmaması için varsayılan olarak giriş fiyatını al
-                        pnl_val = 0.0
-                        try:
-                            ticker = self.executor._get_exchange().fetch_ticker(mem_trade.symbol)
-                            current_price = ticker['last']
-                            
-                            # Fiyat SL'ye mi daha yakın, TP'ye mi hesapla
+                    
+                    if is_active:
+                        continue  # Hâlâ açık → dokunma
+                    
+                    # ── 3. Pozisyon kapanmış! Kapanış nedenini tespit et ─────
+                    logger.info(f"   🔎 {mem_trade.coin} borsada kapanmış, neden tespit ediliyor...")
+                    
+                    close_reason = "Closed on Binance"   # Varsayılan neden
+                    exit_price = mem_trade.entry_price    # Varsayılan çıkış (hata olursa)
+                    
+                    try:
+                        ticker = self.executor._get_exchange().fetch_ticker(mem_trade.symbol)
+                        current_price = ticker.get('last', 0)
+                        
+                        if current_price and current_price > 0 and mem_trade.sl_price and mem_trade.tp_price:
                             dist_sl = abs(current_price - mem_trade.sl_price)
                             dist_tp = abs(current_price - mem_trade.tp_price)
                             
                             if dist_sl < dist_tp:
                                 close_reason = "SL Hit"
-                                pnl_val = -1.0 # Negatif PnL belirtteci
-                                exit_price = mem_trade.sl_price # Stop fiyatını çıkış olarak kabul et
-                                # COOLDOWN (SOĞUMA) DEVREYE GİRİYOR
-                                self.cooldowns[mem_trade.coin] = datetime.now() + timedelta(hours=2)
-                                logger.info(f"   ❄️ {mem_trade.coin} SL oldu! 2 saat soğuma süresine alındı.")
+                                exit_price = mem_trade.sl_price
                             else:
                                 close_reason = "TP Hit"
-                                pnl_val = 1.0 # Pozitif PnL belirtteci
-                                exit_price = mem_trade.tp_price # TP fiyatını çıkış olarak kabul et
-                                logger.info(f"   🎯 {mem_trade.coin} TP oldu! Hedefe ulaşıldı.")
-                        except Exception:
-                            # Borsa anlık yanıt vermezse ML verisini bozmamak adına en mantıklı tahmini yap
-                            logger.warning(f"   ⚠️ {mem_trade.coin} için anlık fiyat çekilemedi, çıkış fiyatı tahmin ediliyor.")
-                            pass
-                        
-                        # 2. TEMİZLİK: Geriye kalan SL veya TP emirlerini kesin olarak çöpe at
+                                exit_price = mem_trade.tp_price
+                    except Exception as ticker_err:
+                        logger.warning(f"   ⚠️ {mem_trade.coin} fiyat çekilemedi: {ticker_err}")
+                    
+                    # ── 4. GERÇEK PnL HESAPLA ────────────────────────────────
+                    # ESKİ KOD: pnl_val = -1.0 / 1.0 (sembolik, anlamsız)
+                    # YENİ KOD: (çıkış - giriş) × miktar formülü
+                    safe_entry = float(mem_trade.entry_price or 0)
+                    safe_exit = float(exit_price or safe_entry)
+                    safe_size = float(mem_trade.position_size or 0)
+                    safe_leverage = int(mem_trade.leverage or 1)
+                    
+                    if mem_trade.direction == "LONG":
+                        pnl_val = (safe_exit - safe_entry) * safe_size
+                    else:
+                        pnl_val = (safe_entry - safe_exit) * safe_size
+                    
+                    pnl_pct = (pnl_val / (safe_entry * safe_size)) * 100 * safe_leverage if (safe_entry * safe_size) > 0 else 0.0
+                    
+                    # ── 5. COOLDOWN (SOĞUMA SÜRESİ) ──────────────────────────
+                    # ESKİ KOD: try bloğu içindeydi → exception olunca cooldown ayarlanmıyordu
+                    # YENİ KOD: try dışında, SL tespitinden sonra her zaman çalışır
+                    if close_reason == "SL Hit":
+                        self.cooldowns[mem_trade.coin] = datetime.now() + timedelta(hours=2)
+                        logger.info(f"   ❄️ {mem_trade.coin} SL oldu! 2 saat soğuma süresine alındı.")
+                    else:
+                        logger.info(f"   🎯 {mem_trade.coin} {close_reason}! Hedefe ulaşıldı.")
+                    
+                    # ── 6. KARŞI EMİRLERİ TEMİZLE ────────────────────────────
+                    # TP olduysa kalan SL emrini sil, SL olduysa kalan TP emrini sil
+                    try:
                         if hasattr(self.executor, 'cancel_all_orders'):
                             self.executor.cancel_all_orders(mem_trade.symbol)
-                        
-                        # 3. Hafızaya (Tecrübeye) ekle
+                    except Exception as cancel_err:
+                        logger.warning(f"   ⚠️ {mem_trade.coin} emir temizleme hatası: {cancel_err}")
+                    
+                    # ── 7. TRADE MEMORY GÜNCELLE ──────────────────────────────
+                    try:
                         self.trade_memory.close_trade(
-                            trade_id=mem_id,
-                            exit_price=exit_price,
-                            pnl=pnl_val,
-                            exit_reason=close_reason
+                            trade_id    = mem_id,
+                            exit_price  = safe_exit,
+                            pnl         = pnl_val,       # Artık gerçek PnL ($)
+                            exit_reason = close_reason,
                         )
+                        logger.info(f"   🧠 Memory güncellendi: {mem_trade.coin} → {close_reason} | PnL: ${pnl_val:+.2f}")
+                    except Exception as mem_err:
+                        logger.error(f"   ❌ Memory güncelleme hatası: {mem_trade.coin} → {mem_err}")
 
-                        # 4. EXCEL GÜNCELLEMESİ
-                        try:
-                            import pandas as pd
-                            from pathlib import Path
-                            from datetime import datetime
+                    # ── 8. TELEGRAM KAPANIŞ BİLDİRİMİ ────────────────────────
+                    # ESKİ KOD: Bu kısım tamamen EKSİKTİ (paper modda vardı, canlıda unutulmuştu)
+                    # YENİ KOD: Paper moddaki formatla aynı bildirim gönderiliyor
+                    try:
+                        if self.notifier.is_configured():
+                            pnl_emoji = "✅ KÂR" if pnl_val > 0 else "❌ ZARAR"
                             
-                            excel_path = Path("logs") / "live_trades.xlsx"
-                            if excel_path.exists():
-                                df = pd.read_excel(excel_path)
-                                
-                                # ÇÖZÜM 1: Metin yazacağımız sütunların veri tipini güvenli 'object' tipine çeviriyoruz
-                                for col in ['Tarih (Kapanış)', 'Çıkış Nedeni', 'Durum']:
-                                    if col in df.columns:
-                                        df[col] = df[col].astype(object)
-                                        
-                                # ÇÖZÜM 2: Ondalıklı sayı (float) yazacağımız sütunların tipini 'float' olarak zorluyoruz
-                                # Bu sayede Pandas'ın baştaki sıfırları görüp int64 (tam sayı) dayatması yapmasını engelliyoruz
-                                for col in ['Çıkış ($)', 'PnL ($)', 'PnL (%)']:
-                                    if col in df.columns:
-                                        df[col] = df[col].astype(float)
-                                
-                                # Durumu 'open' olan ve coin adı eşleşen son işlemi bul
-                                mask = (df['Coin'] == mem_trade.coin) & (df['Durum'] == 'open')
-                                
-                                if mask.any():
-                                    idx = df[mask].index[-1] # En güncel açık işlemi seç
-                                    
-                                    # Olası numpy/ccxt tiplerini standart Python float'ına çeviriyoruz
-                                    safe_exit = float(exit_price)
-                                    safe_entry = float(mem_trade.entry_price)
-                                    safe_size = float(mem_trade.position_size)
-                                    
-                                    # Yön bilgisine göre Dolar Bazlı ve Yüzdelik Kâr/Zarar Hesaplama
-                                    if mem_trade.direction == "LONG":
-                                        pnl_val = (safe_exit - safe_entry) * safe_size
-                                    else:
-                                        pnl_val = (safe_entry - safe_exit) * safe_size
-                                        
-                                    pnl_pct = (pnl_val / (safe_entry * safe_size)) * 100 * mem_trade.leverage
-                                    
-                                    # Excel tablosundaki değerleri güncelle
-                                    df.at[idx, 'Tarih (Kapanış)'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                    df.at[idx, 'Çıkış ($)'] = safe_exit
-                                    df.at[idx, 'Çıkış Nedeni'] = close_reason
-                                    df.at[idx, 'PnL ($)'] = round(pnl_val, 4)
-                                    df.at[idx, 'PnL (%)'] = round(pnl_pct, 2)
-                                    df.at[idx, 'Durum'] = "closed" # İşlemi kapalı olarak işaretle
-                                    
-                                    df.to_excel(excel_path, index=False)
-                                    logger.info(f"   📊 Excel güncellendi: {mem_trade.coin} ({close_reason}) | PnL: ${pnl_val:.2f}")
-                                else:
-                                    logger.warning(f"   ⚠️ Excel'de kapatılacak 'open' statüsünde {mem_trade.coin} kaydı bulunamadı!")
-                        except Exception as e:
-                            logger.error(f"   ❌ Excel güncelleme hatası: {e}", exc_info=True)
+                            msg = (f"{pnl_emoji} <b>({close_reason})</b>\n"
+                                   f"━━━━━━━━━━━━━━━━━━━━━\n"
+                                   f"🪙 <b>Coin:</b> {mem_trade.coin}\n"
+                                   f"📈 <b>Yön:</b> {mem_trade.direction}\n"
+                                   f"💲 <b>Giriş:</b> ${safe_entry:,.4f}\n"
+                                   f"💲 <b>Çıkış:</b> ${safe_exit:,.4f}\n"
+                                   f"💰 <b>PnL:</b> ${pnl_val:+.2f} ({pnl_pct:+.2f}%)\n"
+                                   f"📋 <b>Neden:</b> {close_reason}")
+                            self.notifier.send_message_sync(msg)
+                    except Exception as tg_err:
+                        logger.warning(f"   ⚠️ Telegram bildirimi gönderilemedi: {tg_err}")
+
+                    # ── 9. EXCEL GÜNCELLEMESİ ────────────────────────────────
+                    try:
+                        excel_path = Path("logs") / "live_trades.xlsx"
+                        if excel_path.exists():
+                            df = pd.read_excel(excel_path)
                             
-                        # Sayaç artırımı (İşlemlerin kontrol edildiğini anlamak için gerekli)
-                        closed_count += 1
+                            for col in ['Tarih (Kapanış)', 'Çıkış Nedeni', 'Durum']:
+                                if col in df.columns:
+                                    df[col] = df[col].astype(object)
+                                    
+                            for col in ['Çıkış ($)', 'PnL ($)', 'PnL (%)']:
+                                if col in df.columns:
+                                    df[col] = df[col].astype(float)
+                            
+                            mask = (df['Coin'] == mem_trade.coin) & (df['Durum'] == 'open')
+                            
+                            if mask.any():
+                                idx = df[mask].index[-1]
+                                
+                                df.at[idx, 'Tarih (Kapanış)'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                df.at[idx, 'Çıkış ($)'] = safe_exit
+                                df.at[idx, 'Çıkış Nedeni'] = close_reason
+                                df.at[idx, 'PnL ($)'] = round(pnl_val, 4)
+                                df.at[idx, 'PnL (%)'] = round(pnl_pct, 2)
+                                df.at[idx, 'Durum'] = "closed"
+                                
+                                df.to_excel(excel_path, index=False)
+                                logger.info(f"   📊 Excel güncellendi: {mem_trade.coin} ({close_reason}) | PnL: ${pnl_val:+.2f}")
+                            else:
+                                logger.warning(f"   ⚠️ Excel'de 'open' statüsünde {mem_trade.coin} kaydı bulunamadı!")
+                    except Exception as e:
+                        logger.error(f"   ❌ Excel güncelleme hatası: {e}", exc_info=True)
+                            
+                    # Sayaç artır
+                    closed_count += 1
                         
-                # Açık canlı işlemlerin kontrol döngüsü bittikten sonra:
+                # ── Döngü sonu özet ──────────────────────────────────────────
                 if closed_count > 0:
                     logger.info(f"   🧹 {closed_count} işlemin kontrolü ve temizliği tamamlandı.")
+                else:
+                    open_count = len(self.trade_memory.open_trades)
+                    if open_count > 0:
+                        logger.info(f"   ℹ️ {open_count} açık işlem hâlâ aktif.")
+                    else:
+                        logger.info("   Açık pozisyon yok.")
+                
+                # ══════════════════════════════════════════════════════════════
+                # ORPHAN ORDER CLEANUP (SAHIPSIZ EMIR TEMIZLIĞI)
+                # ══════════════════════════════════════════════════════════════
+                # SORUN: Bir pozisyon SL veya TP ile kapandığında, Binance
+                #        karşı emri (SL olduysa TP, TP olduysa SL) OTOMATİK
+                #        SİLMEZ. Bu emirler "orphan" (sahipsiz) olarak tahtada
+                #        kalır. cancel_all_orders sadece bot pozisyon kapanışını
+                #        algıladığında çalışır. Ama bot kapalıyken veya eski
+                #        bug yüzünden biriken artık emirler temizlenmez.
+                #
+                # ÇÖZÜM: Her döngüde borsadaki TÜM açık emirleri çek.
+                #        Emir sembolü aktif bir pozisyonda yoksa → orphan → sil.
+                # ══════════════════════════════════════════════════════════════
+                try:
+                    exchange = self.executor._get_exchange()
+                    
+                    # Borsadaki tüm açık emirleri çek (sembol belirtmeden = hepsi)
+                    all_open_orders = exchange.fetch_open_orders()
+                    
+                    if all_open_orders:
+                        orphan_count = 0           # Silinen sahipsiz emir sayacı
+                        
+                        for order in all_open_orders:
+                            order_symbol = order.get('symbol', '')   # Emrin ait olduğu sembol
+                            order_id     = order.get('id', '?')      # Emir ID
+                            order_type   = order.get('type', '?')    # Emir tipi (stop_market, take_profit_market)
+                            
+                            # Bu emrin sembolü aktif bir pozisyonda var mı?
+                            has_position = False
+                            for act_sym in active_symbols:
+                                # Sembol eşleştirme: "BTC/USDT:USDT" vs "BTC/USDT:USDT"
+                                if order_symbol == act_sym:
+                                    has_position = True
+                                    break
+                            
+                            if not has_position:
+                                # Bu emir sahipsiz → sil
+                                try:
+                                    exchange.cancel_order(order_id, order_symbol)
+                                    orphan_count += 1
+                                    logger.info(f"   🗑️ Orphan emir silindi: {order_symbol} | {order_type} | ID: {order_id}")
+                                except Exception as cancel_err:
+                                    # "Unknown order" = emir zaten tetiklenmiş veya silinmiş
+                                    if 'Unknown order' in str(cancel_err) or 'UNKNOWN_ORDER' in str(cancel_err):
+                                        logger.debug(f"   ℹ️ Orphan emir zaten yok: {order_id}")
+                                    else:
+                                        logger.warning(f"   ⚠️ Orphan emir silinemedi: {order_symbol} {order_id}: {cancel_err}")
+                        
+                        if orphan_count > 0:
+                            logger.info(f"   🧹 {orphan_count} sahipsiz (orphan) emir temizlendi.")
+                        else:
+                            logger.debug(f"   ✅ {len(all_open_orders)} açık emir kontrol edildi, orphan yok.")
+                            
+                except Exception as orphan_err:
+                    # Orphan cleanup başarısız olursa ana akışı bozmasın
+                    logger.warning(f"   ⚠️ Orphan emir kontrolü başarısız (kritik değil): {orphan_err}")
                     
             except Exception as e:
-                # EN DIŞTAKİ TRY BLOĞUNUN EKSİK OLAN EXCEPT KISMI BURASI
                 logger.error(f"   ❌ Canlı pozisyon kontrol/temizlik hatası: {e}", exc_info=True)
 
     # =========================================================================
