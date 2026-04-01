@@ -62,14 +62,14 @@ BOOTSTRAP_SAMPLE_RATIO = 0.8                   # Her iterasyonda kullanılan sam
 BOOTSTRAP_CI_LEVEL = 0.90                      # Güven aralığı seviyesi (%90)
 
 # Regime filtreleme
-REGIME_PENALTIES = {                           # Rejime göre güven çarpanı
-    'trending_up': 1.00,                       # Trend yukarı → tam güven
-    'trending_down': 1.00,                     # Trend aşağı → tam güven
-    'trending': 1.00,                          # Genel trend → tam güven
-    'ranging': 0.80,                           # Yatay → %20 penaltı (sahte sinyaller artar)
-    'volatile': 0.70,                          # Yüksek volatilite → %30 penaltı (noise artar)
-    'transitioning': 0.85,                     # Geçiş → %15 penaltı (belirsiz dönem)
-    'unknown': 0.90,                           # Bilinmiyor → hafif penaltı
+REGIME_PENALTIES = {
+    'trending_up': 1.00,
+    'trending_down': 1.00,
+    'trending': 1.00,
+    'ranging': 0.85,
+    'volatile': 0.75,
+    'transitioning': 0.90,
+    'unknown': 0.95,
 }
 
 # Anomaly detection
@@ -78,7 +78,7 @@ MAX_ANOMALY_RATIO = 0.25                       # Feature'ların %25'inden fazlas
 
 # Ensemble agreement
 IC_MODEL_AGREEMENT_BONUS = 1.10                # IC ve model aynı yönde → %10 güven bonusu
-IC_MODEL_DISAGREE_PENALTY = 0.80               # IC ve model farklı yönde → %20 güven penaltisi
+IC_MODEL_DISAGREE_PENALTY = 0.85               # IC ve model farklı yönde → %15 penaltı
 
 # ── COLD START PARAMETRELERİ ──
 # Model henüz yeterli kapalı trade görmemişken bootstrap veto'yu
@@ -342,27 +342,18 @@ class SignalValidator:
 
             # ── 5. Karar: CI kabul edilebilir mi? ──
             contains_50 = (lower_bound <= 0.50 <= upper_bound)
-            is_cold_start = (self._closed_trade_count < COLD_START_MIN_TRADES)
 
-            # YENİ KURAL: ci_width > 0.45 yapıldı. Dar veri setlerinde gereksiz vetoları engeller.
-            if ci_width > 0.45:
+            if ci_width > 0.55:
                 result.bootstrap_passed = False
                 result.veto_reasons.append(
-                    f"Bootstrap CI geniş: {ci_width:.3f} > 0.45 → tahmin belirsiz"
+                    f"Bootstrap CI geniş: {ci_width:.3f} > 0.55 → tahmin belirsiz"
                 )
-            elif contains_50 and not is_cold_start:
-                result.bootstrap_passed = False
-                result.veto_reasons.append(
-                    f"Bootstrap CI 0.50'yi kapsıyor: [{lower_bound:.2f}, {upper_bound:.2f}] "
-                    f"→ kararsız yön"
-                )
-            elif contains_50 and is_cold_start:
+            elif contains_50:
+                # CI 0.50'yi kapsıyor → sadece logla, VETO YAPMA
                 result.bootstrap_passed = True
-                result.cold_start_bypass = True
                 logger.info(
-                    f"  ⚡ Cold start bypass: CI [{lower_bound:.2f}, {upper_bound:.2f}] "
-                    f"0.50'yi kapsıyor ama veto atlandı "
-                    f"({self._closed_trade_count}/{COLD_START_MIN_TRADES} trade)"
+                    f"  ℹ️ Bootstrap CI 0.50'yi kapsıyor [{lower_bound:.2f}, {upper_bound:.2f}] "
+                    f"ama width={ci_width:.3f} kabul edilebilir"
                 )
             else:
                 result.bootstrap_passed = True
@@ -444,13 +435,15 @@ class SignalValidator:
         """Tüm kontrol sonuçlarını birleştirip final güven skoru hesapla."""
         
         if result.bootstrap_ci_width < 0.10:
-            bootstrap_factor = 1.05            
+            bootstrap_factor = 1.05
         elif result.bootstrap_ci_width < 0.20:
-            bootstrap_factor = 1.00            
-        elif result.bootstrap_ci_width < 0.30:
-            bootstrap_factor = 0.90            
+            bootstrap_factor = 1.00
+        elif result.bootstrap_ci_width < 0.35:
+            bootstrap_factor = 0.95
+        elif result.bootstrap_ci_width < 0.50:
+            bootstrap_factor = 0.90
         else:
-            bootstrap_factor = 0.80            
+            bootstrap_factor = 0.85            
 
         anomaly_factor = 1.0 - (result.anomaly_ratio * 0.5)  
 
@@ -464,9 +457,8 @@ class SignalValidator:
 
         result.adjusted_confidence = round(max(0, min(100, adjusted)), 1)
 
-        # Güvenlik Barajı (Minimum Threshold) Kontrolü
-        if result.adjusted_confidence < 50.0:
-            result.veto_reasons.append(f"Güvenlik barajı aşılamadı: %{result.adjusted_confidence:.1f} < %50.0")
+        if result.adjusted_confidence < 45.0:
+            result.veto_reasons.append(f"Güvenlik barajı aşılamadı: %{result.adjusted_confidence:.1f} < %45.0")
             
         if result.veto_reasons:
             result.is_valid = False

@@ -295,24 +295,36 @@ class MLTradingPipeline:
         return False
 
     def _detect_regime(self, df: pd.DataFrame) -> str:
-        """ADX bazlı piyasa rejimi: 'trending' / 'ranging' / 'volatile'"""
+        """Piyasa rejimi tespiti: trending / ranging / volatile"""
         try:
-            # Sütun adlarında içinde 'ADX' geçen ilk kolonu bulur
-            adx_col = next((col for col in df.columns if 'ADX' in col.upper()), None)
-            
+            # ADX_14 kolonunu bul — DMP_14 ve DMN_14'ü hariç tut
+            adx_col = None
+            for col in df.columns:
+                col_up = col.upper()
+                if col_up.startswith('ADX') and 'DMP' not in col_up and 'DMN' not in col_up:
+                    adx_col = col
+                    break
+
             if adx_col:
-                # Sütundaki NaN (boş) olan değerleri atlayarak sadece geçerli rakamları filtreler
                 adx_series = df[adx_col].dropna()
-                
-                # Eğer seri tamamen boş değilse son geçerli rakamı alır
                 if not adx_series.empty:
-                    adx = float(adx_series.iloc[-1]) # Son geçerli rakamı ondalıklı sayıya çevir
-                    
+                    adx = float(adx_series.iloc[-1])
                     if adx > 25: return 'trending'
                     if adx > 15: return 'ranging'
                     return 'volatile'
-        except Exception:
-            pass
+
+            # FALLBACK: ADX yoksa volatilite bazlı tespit
+            if 'close' in df.columns and len(df) >= 20:
+                returns = df['close'].pct_change().tail(20)
+                vol = returns.std()
+                if vol is not None and not np.isnan(vol):
+                    if vol > 0.03: return 'volatile'
+                    elif vol > 0.01: return 'ranging'
+                    else: return 'trending'
+                        
+        except Exception as e:
+            logger.warning(f"  ⚠️ Rejim tespiti hatası: {e}")
+
         return 'unknown'
 
     def _analyze_coin(self, symbol: str, coin: str) -> CoinAnalysisResult:
@@ -432,9 +444,33 @@ class MLTradingPipeline:
             result.category_tops = dynamic_cat_tops
 
             df_best = indicator_data[best_tf]
-            if 'ATR_14' in df_best.columns:
-                result.atr     = float(df_best['ATR_14'].iloc[-1])
-                result.atr_pct = (result.atr / result.price) * 100
+            
+            # ── ATR değerini oku ──
+            # pandas-ta atr() → "ATRr_14" adıyla mutlak ATR değeri üretir
+            # (İsimdeki "r" ratio değil, pandas-ta'nın default isimlendirmesi)
+            atr_found = False
+            for atr_col in ['ATRr_14', 'ATR_14', 'ATRr_7', 'NATR_14', 'TRUERANGE_1']:
+                if atr_col in df_best.columns:
+                    atr_series = df_best[atr_col].dropna()
+                    if not atr_series.empty:
+                        raw_val = float(atr_series.iloc[-1])
+                        
+                        if atr_col == 'NATR_14':
+                            # NATR = Normalized ATR (yüzde cinsinden) → mutlaka çevir
+                            result.atr = raw_val * result.price / 100
+                        else:
+                            # ATRr_14, ATR_14, ATRr_7, TRUERANGE_1 = zaten mutlak $
+                            result.atr = raw_val
+                        
+                        result.atr_pct = (result.atr / result.price) * 100 if result.price > 0 else 0.0
+                        atr_found = True
+                        break
+            
+            # Hiçbir ATR kolonu yoksa high-low farkından hesapla
+            if not atr_found and 'high' in df_best.columns and 'low' in df_best.columns:
+                hl_range = (df_best['high'] - df_best['low']).tail(14)
+                result.atr = float(hl_range.mean())
+                result.atr_pct = (result.atr / result.price) * 100 if result.price > 0 else 0.0
 
             if not self.lgbm_model.is_trained:
                 result.ml_skipped = True
@@ -535,9 +571,10 @@ class MLTradingPipeline:
                 result.price         = live_price
                 result.sl_price      = trade_calc.stop_loss.price
                 result.tp_price      = trade_calc.take_profit.price
-                result.position_size = trade_calc.position_size
-                result.leverage      = trade_calc.leverage
-                result.risk_reward   = trade_calc.risk_reward
+                # TradeCalculation objesi: position.size, position.leverage, take_profit.risk_reward
+                result.position_size = trade_calc.position.size
+                result.leverage      = trade_calc.position.leverage
+                result.risk_reward   = trade_calc.take_profit.risk_reward
                 
             except Exception as live_err:
                 logger.error(f"   ❌ {result.coin} canlı fiyat çekme hatası: {live_err}")
