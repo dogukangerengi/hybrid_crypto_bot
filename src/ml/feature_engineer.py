@@ -202,12 +202,12 @@ class MLFeatureVector:
         LightGBM pd.DataFrame input'u için kullanılır.
         
         Prefix Convention:
-        - ic_*     : IC bazlı (örn: ic_confidence, ic_top_abs)
-        - mkt_*    : Market context (örn: mkt_volatility_24h)
-        - ctf_*    : Cross-timeframe (örn: ctf_tf_agreement)
-        - px_*     : Price action (örn: px_momentum_5)
-        - risk_*   : Risk metrikleri (örn: risk_atr_pct)
-        - tmp_*    : Temporal (örn: tmp_hour_sin)
+        - ic_* : IC bazlı (örn: ic_confidence, ic_top_abs)
+        - mkt_* : Market context (örn: mkt_volatility_24h)
+        - ctf_* : Cross-timeframe (örn: ctf_tf_agreement)
+        - px_* : Price action (örn: px_momentum_5)
+        - risk_* : Risk metrikleri (örn: risk_atr_pct)
+        - tmp_* : Temporal (örn: tmp_hour_sin)
         """
         flat = {}                              # Düzleştirilmiş feature dict
         flat.update(self.ic_features)          # IC feature'ları ekle
@@ -340,7 +340,7 @@ class FeatureEngineer:
                 1 for v in vec.to_dict().values()
                 if v is None or (isinstance(v, float) and np.isnan(v))
             )
-            logger.info(
+            logger.debug(
                 f"  🧬 Feature: {n_features} toplam | "
                 f"{n_nan} NaN | Coin: {vec.coin}"
             )
@@ -469,11 +469,11 @@ class FeatureEngineer:
         )
 
         # Market rejimi (one-hot encoding)
-        # Mevcut sistemde ADX bazlı tespit edilir:
-        # trending = ADX > 25, ranging = ADX < 20, volatile = ATR spike
-        # One-hot: LightGBM kategorik değişkenleri native handle eder ama
-        # one-hot daha tutarlı sonuç verir (özellikle küçük veri setlerinde)
-        regime = getattr(analysis, 'market_regime', 'unknown')
+        # GÜVENLİK AĞI: 'unknown' gelirse 'ranging' yapıyoruz
+        regime = getattr(analysis, 'market_regime', 'ranging')
+        if not regime or regime == 'unknown':
+            regime = 'ranging'
+
         features['mkt_regime_trending'] = (                  # 1.0 = trending piyasa (güçlü trend var)
             1.0 if regime == 'trending' else 0.0
         )
@@ -894,7 +894,7 @@ class FeatureEngineer:
 
         if self.verbose:
             n_features = len([c for c in df.columns if not c.startswith('_')])
-            logger.info(
+            logger.debug(
                 f"  📊 Batch Features: {len(df)} coin × {n_features} feature"
             )
 
@@ -920,7 +920,7 @@ class FeatureEngineer:
             'ic_confidence': 0, 'top_ic': 0,
             'significant_count': 0, 'ic_direction': 'NEUTRAL',
             'category_tops': {}, 'tf_rankings': [],
-            'market_regime': 'unknown',
+            'market_regime': 'ranging',
             'atr': 0, 'atr_pct': 0,
             'sl_price': 0, 'tp_price': 0,
             'risk_reward': 0, 'leverage': 0,

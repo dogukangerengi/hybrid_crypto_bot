@@ -61,7 +61,7 @@ BOOTSTRAP_N_ITERATIONS = 500                   # Bootstrap tekrar sayısı (500 
 BOOTSTRAP_SAMPLE_RATIO = 0.8                   # Her iterasyonda kullanılan sample oranı
 BOOTSTRAP_CI_LEVEL = 0.90                      # Güven aralığı seviyesi (%90)
 
-# Regime filtreleme
+# Regime filtreleme (unknown çıkmasın diye default'u ranging gibi cezalandırıyoruz)
 REGIME_PENALTIES = {
     'trending_up': 1.00,
     'trending_down': 1.00,
@@ -69,7 +69,7 @@ REGIME_PENALTIES = {
     'ranging': 0.85,
     'volatile': 0.75,
     'transitioning': 0.90,
-    'unknown': 0.95,
+    'unknown': 0.85, # Bilinmeyen = Yatay varsayımı
 }
 
 # Anomaly detection
@@ -109,7 +109,7 @@ class ValidationResult:
     bootstrap_passed: bool = True              
 
     # Regime Filter
-    regime: str = "unknown"                    
+    regime: str = "ranging" # Varsayılan değer 'unknown' yerine 'ranging' yapıldı             
     regime_penalty: float = 1.0                
     regime_passed: bool = True                 
 
@@ -203,21 +203,25 @@ class SignalValidator:
         model_confidence: float,
         ic_direction: str = "NEUTRAL",
         ic_score: float = 0.0,
-        regime: str = "unknown",
+        regime: str = "ranging", # Varsayılan ranging
     ) -> ValidationResult:
         """Sinyali 4 istatistiksel kontrolle doğrula."""
+        
+        # Son bir güvenlik kontrolü: Eğer bir sebepten 'unknown' veya None geldiyse ranging yap
+        safe_regime = regime if regime and regime != "unknown" else "ranging"
+
         result = ValidationResult(
             original_confidence=model_confidence,
             ic_direction=ic_direction,
             model_direction=model_decision.value,
-            regime=regime,
+            regime=safe_regime,
         )
 
         # ── 1. Bootstrap CI ──
         self._check_bootstrap_stability(model, feature_vector, result)
 
         # ── 2. Regime Filter ──
-        self._check_regime(regime, result)
+        self._check_regime(safe_regime, result)
 
         # ── 3. Ensemble Agreement ──
         self._check_ensemble(model_decision, ic_direction, result)
@@ -241,37 +245,17 @@ class SignalValidator:
     ) -> None:
         """
         Bootstrap ile tahmin stabilitesini ölçer.
-        
-        Yöntem:
-        ------
-        1. Feature vektörünü base_values olarak çıkar
-        2. Her iterasyonda her feature'a KENDİ std'si × noise_fraction kadar noise ekle
-        3. Perturbed vektörle model tahmin yap
-        4. 500 tahminin %5-%95 percentile'ını al → CI
-        
-        Neden per-feature noise?
-        → Feature'lar farklı ölçeklerde (IC: 0-100, z-score: -3/+3, sin: -1/+1)
-        → Global std anlamsız; her feature kendi dağılımına göre pertürbe edilmeli
-        → LightGBM tree split'lerini geçebilecek büyüklükte noise gerekli
-        
-        CI Yorumlama:
-        → width < 0.10 → Çok stabil tahmin (güven bonusu)
-        → width 0.10-0.45 → Normal belirsizlik (GÜNCELLEME: Marj genişletildi)
-        → width > 0.45 → Yüksek belirsizlik (penaltı veya veto)
-        → CI 0.50'yi kapsıyor → Model yön konusunda kararsız (veto)
         """
         # ── Guard: Model yoksa veya eğitilmemişse atla ──
         if not HAS_LIGHTGBM or model is None or not model.is_trained:
-            result.bootstrap_passed = True     # Kontrol atla, geç
+            result.bootstrap_passed = True     
             return
 
         try:
             # ── 1. Base feature vektörünü çıkar ──
-            # Model'in beklediği sırayla feature değerlerini topla
-            base_values = []                   # [float, ...] → model feature sırası
+            base_values = []                   
             for col in model.feature_names:
-                val = 0.0                      # Varsayılan: 0 (NaN yerine)
-                # Feature'ı hangi grupta olduğuna göre bul
+                val = 0.0                      
                 if col in feature_vector.ic_features:
                     val = feature_vector.ic_features[col]
                 elif col in feature_vector.market_features:
@@ -289,10 +273,10 @@ class SignalValidator:
             base_values = np.array(base_values, dtype=np.float64)
 
             # ── 2. Per-feature noise ölçeği hesapla ──
-            MIN_NOISE_FLOOR = 0.05             # Minimum noise ölçeği (tüm feature'lar)
+            MIN_NOISE_FLOOR = 0.05             
 
-            n_features = len(base_values)      # Feature sayısı
-            feature_noise_scales = np.zeros(n_features)  # Her feature için ayrı noise scale
+            n_features = len(base_values)      
+            feature_noise_scales = np.zeros(n_features)  
 
             for idx, col in enumerate(model.feature_names):
                 if (self._feature_stds is not None        
@@ -349,7 +333,6 @@ class SignalValidator:
                     f"Bootstrap CI geniş: {ci_width:.3f} > 0.55 → tahmin belirsiz"
                 )
             elif contains_50:
-                # CI 0.50'yi kapsıyor → sadece logla, VETO YAPMA
                 result.bootstrap_passed = True
                 logger.info(
                     f"  ℹ️ Bootstrap CI 0.50'yi kapsıyor [{lower_bound:.2f}, {upper_bound:.2f}] "
@@ -365,7 +348,8 @@ class SignalValidator:
 
     def _check_regime(self, regime: str, result: ValidationResult) -> None:
         """Piyasa rejimine göre güven düzeltmesi."""
-        penalty = self.regime_penalties.get(regime, 0.90)  
+        # Regime zaten validator girişinde güvenli hale getirildiği için direkt alıyoruz
+        penalty = self.regime_penalties.get(regime, 0.85) # Bilinmeyen bir şey gelirse 0.85 ceza
         result.regime_penalty = penalty
 
         if regime == 'volatile' and penalty < 0.75:

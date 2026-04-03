@@ -297,35 +297,32 @@ class MLTradingPipeline:
     def _detect_regime(self, df: pd.DataFrame) -> str:
         """Piyasa rejimi tespiti: trending / ranging / volatile"""
         try:
-            # ADX_14 kolonunu bul — DMP_14 ve DMN_14'ü hariç tut
-            adx_col = None
-            for col in df.columns:
-                col_up = col.upper()
-                if col_up.startswith('ADX') and 'DMP' not in col_up and 'DMN' not in col_up:
-                    adx_col = col
-                    break
+            if 'close' not in df.columns or len(df) < 20:
+                return 'ranging'
 
-            if adx_col:
-                adx_series = df[adx_col].dropna()
-                if not adx_series.empty:
-                    adx = float(adx_series.iloc[-1])
-                    if adx > 25: return 'trending'
-                    if adx > 15: return 'ranging'
-                    return 'volatile'
+            # 1. Öncelik ADX indikatörü
+            adx_col = next((col for col in df.columns if col.upper().startswith('ADX') and 'DMP' not in col.upper() and 'DMN' not in col.upper()), None)
+            
+            if adx_col and not df[adx_col].dropna().empty:
+                adx = float(df[adx_col].dropna().iloc[-1])
+                if adx > 25: return 'trending'
+                if adx > 15: return 'ranging'
+                return 'volatile'
 
-            # FALLBACK: ADX yoksa volatilite bazlı tespit
-            if 'close' in df.columns and len(df) >= 20:
-                returns = df['close'].pct_change().tail(20)
-                vol = returns.std()
-                if vol is not None and not np.isnan(vol):
-                    if vol > 0.03: return 'volatile'
-                    elif vol > 0.01: return 'ranging'
-                    else: return 'trending'
-                        
+            # 2. Fallback (ADX hesaplanamazsa): Volatiliteye bak
+            returns = df['close'].pct_change().tail(20)
+            vol = float(returns.std())
+            
+            if pd.isna(vol):
+                return 'ranging'
+                
+            if vol > 0.03: return 'volatile'
+            elif vol > 0.01: return 'ranging'
+            else: return 'trending'
+            
         except Exception as e:
             logger.warning(f"  ⚠️ Rejim tespiti hatası: {e}")
-
-        return 'unknown'
+            return 'ranging' # Hata durumunda unknown dönmesini tamamen engelliyoruz
 
     def _analyze_coin(self, symbol: str, coin: str) -> CoinAnalysisResult:
         result = CoinAnalysisResult(coin=coin, full_symbol=symbol)
@@ -724,7 +721,8 @@ class MLTradingPipeline:
                         else:
                             df_son = df_yeni
                             
-                        df_son.to_excel(excel_path, index=False)
+                        # YENİ METOD BURADA ÇAĞIRILIYOR
+                        self._export_live_trades_to_xlsx(df_son, excel_path)
                         logger.info(f"📊 Canlı işlem Paper formatında Excel'e eklendi: {result.coin}")
                     except Exception as e:
                         logger.error(f"❌ Excel kayıt hatası: {e}")
@@ -793,7 +791,8 @@ class MLTradingPipeline:
             for trade in trades_to_check:
                 try:
                     fetch_symbol = trade.symbol if "USDT" in trade.symbol else f"{trade.symbol}/USDT"
-                    ohlcv = self.fetcher.fetch_ohlcv(fetch_symbol, timeframe="15m", limit=3)
+                    # Paper trader için de son 75 dk yerine sadece son 5 dakikayı kontrol et
+                    ohlcv = self.fetcher.fetch_ohlcv(fetch_symbol, timeframe="1m", limit=5)
                     
                     if ohlcv is not None and not ohlcv.empty:
                         max_high = float(ohlcv['high'].max())
@@ -881,34 +880,100 @@ class MLTradingPipeline:
         else:
             try:
                 closed_count = 0
-                
-                if not hasattr(self.trade_memory, 'open_trades'):
-                    return
-                if not self.trade_memory.open_trades:
-                    return
-                
+
                 try:
                     real_positions = self.executor.fetch_positions()
                 except Exception as e:
                     logger.error(f"   ❌ Binance pozisyon çekme hatası: {e}")
                     return
-                
-                active_symbols = {p['symbol'] for p in real_positions if p.get('contracts', 0) != 0}
-                
+
+                # =====================================================================
+                # 🛠️ GÜÇLÜ POZİSYON BÜYÜKLÜĞÜ VE SEMBOL EŞLEŞTİRMESİ
+                # =====================================================================
+                active_coins = set()
+                for p in real_positions:
+                    size_ccxt = p.get('contracts')
+                    size_raw = p.get('positionAmt')
+                    size_info = p.get('info', {}).get('positionAmt')
+
+                    is_active = False
+                    try:
+                        val = size_ccxt if size_ccxt is not None else (size_raw if size_raw is not None else size_info)
+                        size_val = float(val) if val is not None else 0.0
+
+                        if abs(size_val) > 0.0:
+                            is_active = True
+                    except (ValueError, TypeError):
+                        pass
+
+                    if size_ccxt is None and size_raw is None and size_info is None:
+                        is_active = True
+
+                    if is_active and p.get('symbol'):
+                        coin_name = str(p['symbol']).split('/')[0].split(':')[0].replace('USDT', '')
+                        active_coins.add(coin_name)
+
+                # Memory'de açık trade yoksa trade döngüsünü atla ama orphan check hâlâ çalışsın
+                if not hasattr(self.trade_memory, 'open_trades') or not self.trade_memory.open_trades:
+                    # Orphan check — memory boş olsa bile Binance'te kalmış emirleri temizle
+                    try:
+                        exchange = self.executor._get_exchange()
+                        if hasattr(exchange, 'options'):
+                            exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
+                        all_open_orders = exchange.fetch_open_orders()
+                        if all_open_orders:
+                            orphan_count = 0
+                            for order in all_open_orders:
+                                order_symbol = order.get('symbol', '')
+                                order_id     = order.get('id', '?')
+                                order_type   = order.get('type', '?')
+                                has_position = any(ac in order_symbol for ac in active_coins)
+                                if not has_position:
+                                    try:
+                                        exchange.cancel_order(order_id, order_symbol)
+                                        orphan_count += 1
+                                        logger.info(f"   🗑️ Orphan emir silindi: {order_symbol} | {order_type} | ID: {order_id}")
+                                    except Exception as cancel_err:
+                                        if 'Unknown order' in str(cancel_err) or 'UNKNOWN_ORDER' in str(cancel_err):
+                                            logger.debug(f"   ℹ️ Orphan emir zaten yok: {order_id}")
+                                        else:
+                                            logger.warning(f"   ⚠️ Orphan emir silinemedi: {order_symbol} {order_id}: {cancel_err}")
+                            if orphan_count > 0:
+                                logger.info(f"   🧹 {orphan_count} sahipsiz (orphan) emir temizlendi.")
+                    except Exception as orphan_err:
+                        logger.warning(f"   ⚠️ Orphan emir kontrolü (boş memory): {orphan_err}")
+                    return
+
                 for mem_id, mem_trade in list(self.trade_memory.open_trades.items()):
-                    if mem_trade.symbol not in active_symbols:
-                        logger.info(f"   🔍 {mem_trade.coin} pozisyonu kapalı bulundu → kapanış nedeni araştırılıyor...")
+                    mem_coin = str(mem_trade.coin).replace('USDT', '').split('/')[0].split(':')[0]
+                    
+                    opened_time = datetime.fromisoformat(mem_trade.opened_at)
+                    if opened_time.tzinfo is None:
+                        opened_time = opened_time.replace(tzinfo=timezone.utc)
+                    time_open_sec = (datetime.now(timezone.utc) - opened_time).total_seconds()
+
+                    if mem_coin not in active_coins:
+                        if time_open_sec <= 120:
+                            logger.debug(f"   ⏳ {mem_coin} borsa onayı bekleniyor... (Kalan: {int(120-time_open_sec)}s)")
+                            continue
+                            
+                        logger.info(f"   🔍 {mem_coin} pozisyonu kapalı bulundu → kapanış nedeni araştırılıyor...")
                         
                         close_reason = "Manuel / API"  
                         exit_price = mem_trade.entry_price  
                         
                         try:
-                            ohlcv = self.fetcher.fetch_ohlcv(mem_trade.symbol, timeframe="15m", limit=5)
+                            # 🛠️ DÜZELTME: Eski fiyatların karışmaması için 1 dakikalık mumlarla sadece son 5 dakikaya bak
+                            ohlcv = self.fetcher.fetch_ohlcv(mem_trade.symbol, timeframe="1m", limit=5)
                             
                             if ohlcv is not None and not ohlcv.empty:
                                 max_high = float(ohlcv['high'].max())
                                 min_low = float(ohlcv['low'].min())
                                 current_price = float(ohlcv['close'].iloc[-1])
+                                
+                                # Eğer mumlar iğneyi yakalayamazsa mesafeye göre hesap yap (Sağlamlaştırma)
+                                dist_tp = abs(current_price - float(mem_trade.tp_price))
+                                dist_sl = abs(current_price - float(mem_trade.sl_price))
                                 
                                 if mem_trade.direction == "LONG":
                                     if min_low <= mem_trade.sl_price:
@@ -918,7 +983,8 @@ class MLTradingPipeline:
                                         close_reason = "TP Hit"
                                         exit_price = mem_trade.tp_price
                                     else:
-                                        exit_price = current_price
+                                        close_reason = "TP Hit" if dist_tp < dist_sl else "SL Hit"
+                                        exit_price = mem_trade.tp_price if dist_tp < dist_sl else mem_trade.sl_price
                                 
                                 elif mem_trade.direction == "SHORT":
                                     if max_high >= mem_trade.sl_price:
@@ -928,10 +994,11 @@ class MLTradingPipeline:
                                         close_reason = "TP Hit"
                                         exit_price = mem_trade.tp_price
                                     else:
-                                        exit_price = current_price
+                                        close_reason = "TP Hit" if dist_tp < dist_sl else "SL Hit"
+                                        exit_price = mem_trade.tp_price if dist_tp < dist_sl else mem_trade.sl_price
                         
                         except Exception as ohlcv_err:
-                            logger.warning(f"   ⚠️ {mem_trade.coin} OHLCV kontrol hatası: {ohlcv_err}")
+                            logger.warning(f"   ⚠️ {mem_coin} OHLCV kontrol hatası: {ohlcv_err}")
                         
                         safe_entry = float(mem_trade.entry_price or 0)
                         safe_exit = float(exit_price or safe_entry)
@@ -946,18 +1013,18 @@ class MLTradingPipeline:
                         pnl_pct = (pnl_val / (safe_entry * safe_size)) * 100 * safe_leverage if (safe_entry * safe_size) > 0 else 0.0
                         
                         if close_reason == "SL Hit":
-                            self.cooldowns[mem_trade.coin] = datetime.now(timezone.utc) + timedelta(hours=2)
+                            self.cooldowns[mem_coin] = datetime.now(timezone.utc) + timedelta(hours=2)
                             self.cooldowns[mem_trade.symbol] = datetime.now(timezone.utc) + timedelta(hours=2)
-                            logger.info(f"   ❄️ {mem_trade.coin} SL oldu! 2 saat soğuma süresine alındı.")
+                            logger.info(f"   ❄️ {mem_coin} SL oldu! 2 saat soğuma süresine alındı.")
                         else:
-                            logger.info(f"   🎯 {mem_trade.coin} {close_reason}! Hedefe ulaşıldı.")
+                            logger.info(f"   🎯 {mem_coin} {close_reason}! Hedefe ulaşıldı.")
                         
                         try:
                             if hasattr(self.executor, 'cancel_all_orders'):
                                 self.executor.cancel_all_orders(mem_trade.symbol)
-                                logger.info(f"   🧹 {mem_trade.coin} için kalan emirler iptal edildi")
+                                logger.info(f"   🧹 {mem_coin} için kalan emirler iptal edildi")
                         except Exception as cancel_err:
-                            logger.warning(f"   ⚠️ {mem_trade.coin} emir temizleme hatası: {cancel_err}")
+                            logger.warning(f"   ⚠️ {mem_coin} emir temizleme hatası: {cancel_err}")
                         
                         try:
                             self.trade_memory.close_trade(
@@ -966,16 +1033,16 @@ class MLTradingPipeline:
                                 pnl         = pnl_val,
                                 exit_reason = close_reason,
                             )
-                            logger.info(f"   🧠 Memory güncellendi: {mem_trade.coin} → {close_reason} | PnL: ${pnl_val:+.2f}")
+                            logger.info(f"   🧠 Memory güncellendi: {mem_coin} → {close_reason} | PnL: ${pnl_val:+.2f}")
                         except Exception as mem_err:
-                            logger.error(f"   ❌ Memory güncelleme hatası: {mem_trade.coin} → {mem_err}")
+                            logger.error(f"   ❌ Memory güncelleme hatası: {mem_coin} → {mem_err}")
 
                         try:
                             if self.notifier.is_configured():
                                 pnl_emoji = "✅ KÂR" if pnl_val > 0 else "❌ ZARAR"
                                 msg = (f"{pnl_emoji} <b>({close_reason})</b>\n"
                                        f"━━━━━━━━━━━━━━━━━━━━━\n"
-                                       f"🪙 <b>Coin:</b> {mem_trade.coin}\n"
+                                       f"🪙 <b>Coin:</b> {mem_coin}\n"
                                        f"💲 <b>Çıkış:</b> ${safe_exit:,.4f}\n"
                                        f"💰 <b>PnL:</b> ${pnl_val:+.2f} ({pnl_pct:+.2f}%)\n"
                                        f"🏦 <b>Güncel Kasa:</b> ${self._balance:,.2f}")
@@ -1001,22 +1068,33 @@ class MLTradingPipeline:
                                     if col in df.columns:
                                         df[col] = df[col].astype(float)
                                 
-                                mask = (df['Coin'] == mem_trade.coin) & (df['Durum'] == 'open')
+                                mask = (df['Coin'] == mem_coin) & (df['Durum'] == 'open')
                                 
                                 if mask.any():
                                     idx = df[mask].index[-1]
                                     
-                                    df.at[idx, 'Tarih (Kapanış)'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                    kapanis_zamani = datetime.now()
+                                    df.at[idx, 'Tarih (Kapanış)'] = kapanis_zamani.strftime("%Y-%m-%dT%H:%M:%S.%f")
+                                    
+                                    # YENİ: Süre hesaplaması
+                                    try:
+                                        acilis_str = str(df.at[idx, 'Tarih (Açılış)'])
+                                        acilis_zamani = pd.to_datetime(acilis_str)
+                                        df.at[idx, 'Süre (dk)'] = int((kapanis_zamani - acilis_zamani).total_seconds() / 60)
+                                    except Exception:
+                                        df.at[idx, 'Süre (dk)'] = 0
+                                        
                                     df.at[idx, 'Çıkış ($)'] = safe_exit
                                     df.at[idx, 'Çıkış Nedeni'] = close_reason
                                     df.at[idx, 'PnL ($)'] = round(pnl_val, 4)
                                     df.at[idx, 'PnL (%)'] = round(pnl_pct, 2)
                                     df.at[idx, 'Durum'] = "closed"
                                     
-                                    df.to_excel(excel_path, index=False)
+                                    # YENİ METOD BURADA ÇAĞIRILIYOR
+                                    self._export_live_trades_to_xlsx(df, excel_path)
                                     logger.info(f"   📊 Excel güncellendi: {mem_trade.coin} ({close_reason}) | PnL: ${pnl_val:+.2f}")
                                 else:
-                                    logger.warning(f"   ⚠️ Excel'de 'open' statüsünde {mem_trade.coin} kaydı bulunamadı!")
+                                    logger.warning(f"   ⚠️ Excel'de 'open' statüsünde {mem_coin} kaydı bulunamadı!")
                         except Exception as e:
                             logger.error(f"   ❌ Excel güncelleme hatası: {e}", exc_info=True)
                                 
@@ -1027,6 +1105,10 @@ class MLTradingPipeline:
                 
                 try:
                     exchange = self.executor._get_exchange()
+                    
+                    if hasattr(exchange, 'options'):
+                        exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
+                    
                     all_open_orders = exchange.fetch_open_orders()
                     
                     if all_open_orders:
@@ -1037,8 +1119,8 @@ class MLTradingPipeline:
                             order_type   = order.get('type', '?')
                             
                             has_position = False
-                            for act_sym in active_symbols:
-                                if order_symbol == act_sym:
+                            for act_coin in active_coins:
+                                if act_coin in order_symbol: 
                                     has_position = True
                                     break
                             
@@ -1057,7 +1139,7 @@ class MLTradingPipeline:
                             logger.info(f"   🧹 {orphan_count} sahipsiz (orphan) emir temizlendi.")
                             
                 except Exception as orphan_err:
-                    logger.warning(f"   ⚠️ Orphan emir kontrolü başarısız (kritik değil): {orphan_err}")
+                    logger.warning(f"   ⚠️ Orphan emir kontrolü başarısız: {orphan_err}")
                     
             except Exception as e:
                 logger.error(f"   ❌ Canlı pozisyon kontrol/temizlik hatası: {e}", exc_info=True)
@@ -1268,14 +1350,15 @@ class MLTradingPipeline:
             class DummyAnalysis:
                 def __init__(self, sym):
                     self.symbol          = sym
-                    self.coin            = sym.split('/')[0]
+                    self.coin            = sym.split('/')[0] # 'BTC/USDT:USDT' gibi bir stringden 'BTC' kısmını ayırır.
                     self.price           = 0.0
                     self.change_24h      = 0.0
                     self.volume_24h      = 0.0
                     self.ic_confidence   = 65.0
                     self.ic_direction    = 'NEUTRAL'
                     self.significant_count = 10
-                    self.market_regime   = 'trending'
+                    # Model ilk kez eğitilirken geçmişte 'unknown' rejim görmemesi için varsayılan olarak 'trending' atıyoruz.
+                    self.market_regime   = 'trending' 
                     self.category_tops   = {}              
                     self.tf_rankings     = []
                     self.atr             = 0.0
@@ -1292,6 +1375,8 @@ class MLTradingPipeline:
 
             train_cat_tops = {}                                    
             all_scores = self.selector.evaluate_all_indicators(df_ind, target_col)
+            
+            # İndikatörleri istatistiksel özelliklerine göre kategorize edip grupluyoruz.
             CATEGORIES = {
                 'volume':  ['OBV', 'CMF', 'VPT', 'FI', 'EOM', 'ADI', 'NVI'],
                 'momentum':['RSI', 'Stoch', 'MFI', 'UO', 'MACD', 'PPO', 'ROC','TSI', 'CCI', 'Williams'],
@@ -1444,10 +1529,179 @@ class MLTradingPipeline:
                     f"Süre={report.elapsed:.1f}s")
         if report.ml_stats:
             s = report.ml_stats
-            logger.info(f"  ML: eğitildi={s.get('model_trained')} | "
-                        f"win={s.get('win_rate',0):.1f}% | "
+            # Win rate satırını tamamen kaldırdık
+            logger.info(f"   ML: eğitildi={s.get('model_trained')} | "
                         f"retrain#{s.get('retrain_count',0)}")
         logger.info(f"{'─'*50}\n")
+
+    def _export_live_trades_to_xlsx(self, df: pd.DataFrame, filepath: Path) -> None:
+        """Canlı işlemleri paper_trade formatında renklendirilmiş ve Summary ile Excel'e kaydeder."""
+        try:
+            from openpyxl import Workbook
+            from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+            from openpyxl.utils import get_column_letter
+        except ImportError:
+            df.to_excel(filepath, index=False) # Openpyxl yoksa standart formatta kaydet
+            return
+
+        try:
+            wb = Workbook()
+            ws_trades = wb.active
+            ws_trades.title = "Trades"
+
+            # ---- Stil Tanımları ----
+            header_font = Font(name='Arial', bold=True, color='FFFFFF', size=10)
+            header_fill = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
+            header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            data_font = Font(name='Arial', size=9)
+            green_font = Font(name='Arial', size=9, color='006100')
+            red_font = Font(name='Arial', size=9, color='9C0006')
+            green_fill = PatternFill(start_color='C6EFCE', end_color='C6EFCE', fill_type='solid')
+            red_fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')
+            long_fill = PatternFill(start_color='E2EFDA', end_color='E2EFDA', fill_type='solid')
+            short_fill = PatternFill(start_color='FCE4EC', end_color='FCE4EC', fill_type='solid')
+            thin_border = Border(
+                left=Side(style='thin', color='D9D9D9'), right=Side(style='thin', color='D9D9D9'),
+                top=Side(style='thin', color='D9D9D9'), bottom=Side(style='thin', color='D9D9D9')
+            )
+
+            # ---- Sütun Genişlikleri ve Formatları ----
+            columns_def = {
+                "ID": (10, None), "Tarih (Açılış)": (18, None), "Tarih (Kapanış)": (18, None),
+                "Coin": (8, None), "Yön": (8, None), "Giriş ($)": (12, '#,##0.00'), 
+                "Çıkış ($)": (12, '#,##0.00'), "Lot (Coin)": (12, '#,##0.000000'), 
+                "Hacim ($)": (12, '#,##0.00'), "Kaldıraç": (10, '0x'),
+                "SL ($)": (12, '#,##0.00'), "TP ($)": (12, '#,##0.00'), "R:R": (8, '0.00'),
+                "PnL ($)": (10, '#,##0.00;(#,##0.00);"-"'), "PnL (%)": (10, '0.00%'), 
+                "Fee ($)": (10, '#,##0.00'), "Net PnL ($)": (12, '#,##0.00;(#,##0.00);"-"'), 
+                "IC Güven": (10, '0.0'), "IC Yön": (8, None), "TF": (6, None), 
+                "Rejim": (14, None), "AI Karar": (10, None), "Durum": (10, None),
+                "Çıkış Nedeni": (14, None), "Süre (dk)": (10, '#,##0')
+            }
+
+            headers = list(df.columns)
+            
+            # Başlıkları Yaz
+            for col_idx, col_name in enumerate(headers, 1):
+                cell = ws_trades.cell(row=1, column=col_idx, value=col_name)
+                cell.font, cell.fill, cell.alignment = header_font, header_fill, header_alignment
+                width = columns_def.get(col_name, (12, None))[0]
+                ws_trades.column_dimensions[get_column_letter(col_idx)].width = width
+
+            ws_trades.freeze_panes = 'A2'
+
+            # Verileri Yaz ve Renklendir
+            for r_idx, row in enumerate(df.values, 2):
+                for c_idx, val in enumerate(row, 1):
+                    col_name = headers[c_idx-1]
+                    if pd.isna(val):
+                        val = ""
+                    
+                    # PnL % formatını Excel'in anlayacağı ondalığa çeviriyoruz (örn: %15 -> 0.15)
+                    if col_name == "PnL (%)" and isinstance(val, (int, float)) and val != "":
+                        val = val / 100.0
+
+                    cell = ws_trades.cell(row=r_idx, column=c_idx, value=val)
+                    cell.font, cell.border = data_font, thin_border
+                    
+                    fmt = columns_def.get(col_name, (12, None))[1]
+                    if fmt and val != "":
+                        cell.number_format = fmt
+
+                    if col_name == "Yön":
+                        if val == "LONG": cell.fill = long_fill
+                        elif val == "SHORT": cell.fill = short_fill
+                    
+                    if col_name in ["PnL ($)", "Net PnL ($)", "PnL (%)"] and val != "":
+                        try:
+                            if float(val) > 0: cell.font, cell.fill = green_font, green_fill
+                            elif float(val) < 0: cell.font, cell.fill = red_font, red_fill
+                        except ValueError: pass
+                    
+                    if col_name in ["Durum", "Çıkış Nedeni"] and isinstance(val, str):
+                        if "tp" in str(val).lower(): cell.fill = green_fill
+                        elif "sl" in str(val).lower(): cell.fill = red_fill
+
+            if len(df) > 0:
+                ws_trades.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(df) + 1}"
+
+            # ---- SUMMARY (ÖZET) SHEET ----
+            ws_summary = wb.create_sheet("Summary")
+            closed_df = df[df['Durum'] == 'closed']
+            total_trades = len(df)
+            closed_trades = len(closed_df)
+            open_trades = total_trades - closed_trades
+            
+            winning = len(closed_df[pd.to_numeric(closed_df['PnL ($)'], errors='coerce') > 0])
+            losing = len(closed_df[pd.to_numeric(closed_df['PnL ($)'], errors='coerce') <= 0])
+            win_rate = (winning / closed_trades * 100) if closed_trades > 0 else 0.0
+            
+            total_pnl = float(pd.to_numeric(closed_df['PnL ($)'], errors='coerce').sum()) if closed_trades > 0 else 0.0
+            gross_profit = float(pd.to_numeric(closed_df[pd.to_numeric(closed_df['PnL ($)'], errors='coerce') > 0]['PnL ($)'], errors='coerce').sum()) if closed_trades > 0 else 0.0
+            gross_loss = abs(float(pd.to_numeric(closed_df[pd.to_numeric(closed_df['PnL ($)'], errors='coerce') <= 0]['PnL ($)'], errors='coerce').sum())) if closed_trades > 0 else 0.0
+            profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
+            
+            avg_pnl = total_pnl / closed_trades if closed_trades > 0 else 0.0
+            avg_win = gross_profit / winning if winning > 0 else 0.0
+            avg_loss = gross_loss / losing if losing > 0 else 0.0
+            
+            avg_dur = pd.to_numeric(closed_df['Süre (dk)'], errors='coerce').mean() if (closed_trades > 0 and 'Süre (dk)' in closed_df.columns) else 0.0
+            avg_duration = float(avg_dur) if not pd.isna(avg_dur) else 0.0
+            
+            total_return = ((self._balance - self._initial_balance) / self._initial_balance * 100) if self._initial_balance > 0 else 0.0
+
+            title_font = Font(name='Arial', bold=True, size=14, color='2F5496')
+            section_font = Font(name='Arial', bold=True, size=11, color='2F5496')
+            label_font = Font(name='Arial', size=10)
+            value_font = Font(name='Arial', bold=True, size=10)
+
+            ws_summary['A1'] = '📊 CANLI İŞLEM PERFORMANS RAPORU'
+            ws_summary['A1'].font = title_font
+            ws_summary.merge_cells('A1:D1')
+            ws_summary['A2'] = f'Oluşturulma: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+            ws_summary['A2'].font = Font(name='Arial', size=9, italic=True, color='808080')
+            
+            ws_summary.column_dimensions['A'].width = 22
+            ws_summary.column_dimensions['B'].width = 15
+            
+            r = 4
+            ws_summary.cell(row=r, column=1, value='💰 BAKİYE').font = section_font
+            r += 1
+            for label, val in [('Başlangıç Bakiye', f"${self._initial_balance:.2f}"), ('Güncel Bakiye', f"${self._balance:.2f}"), ('Toplam Getiri', f"{total_return:+.1f}%"), ('Net PnL', f"${total_pnl:+.2f}")]:
+                ws_summary.cell(row=r, column=1, value=label).font = label_font
+                v_cell = ws_summary.cell(row=r, column=2, value=val)
+                v_cell.font = value_font
+                if 'Getiri' in label or 'PnL' in label:
+                    if '+' in val or (not '-' in val and float(val.replace('$','').replace('%','').replace('+','').strip() or 0) > 0):
+                        v_cell.font = Font(name='Arial', bold=True, size=10, color='006100')
+                    elif '-' in val: v_cell.font = Font(name='Arial', bold=True, size=10, color='9C0006')
+                r += 1
+
+            r += 1
+            ws_summary.cell(row=r, column=1, value='📈 TRADE İSTATİSTİKLERİ').font = section_font
+            r += 1
+            for label, val in [('Toplam Trade', str(total_trades)), ('Açık Pozisyon', str(open_trades)), ('Kapalı Trade', str(closed_trades)), ('Kazanan', str(winning)), ('Kaybeden', str(losing))]:
+                ws_summary.cell(row=r, column=1, value=label).font = label_font
+                ws_summary.cell(row=r, column=2, value=val).font = value_font
+                r += 1
+
+            r += 1
+            ws_summary.cell(row=r, column=1, value='📊 PERFORMANS METRİKLERİ').font = section_font
+            r += 1
+            for label, val in [('Win Rate', f"{win_rate:.1f}%"), ('Profit Factor', f"{profit_factor:.2f}"), ('Ort. PnL', f"${avg_pnl:.2f}"), ('Ort. Kazanç', f"${avg_win:.2f}"), ('Ort. Kayıp', f"-${avg_loss:.2f}"), ('Ort. Süre', f"{avg_duration:.0f} dk")]:
+                ws_summary.cell(row=r, column=1, value=label).font = label_font
+                ws_summary.cell(row=r, column=2, value=val).font = value_font
+                r += 1
+
+            try:
+                wb.save(str(filepath))
+            except PermissionError:
+                alt_path = filepath.with_stem(filepath.stem + f"_{datetime.now().strftime('%H%M%S')}")
+                wb.save(str(alt_path))
+                logger.warning(f"⚠️ Dosya kilitli, alternatif kaydedildi: {alt_path}")
+        except Exception as e:
+            logger.error(f"❌ Excel formatlama hatası: {e}")
+            df.to_excel(filepath, index=False)
 
     def print_performance(self) -> None:
         PerformanceAnalyzer(self.paper_trader).print_report(
