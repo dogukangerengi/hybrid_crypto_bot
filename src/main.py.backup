@@ -1107,14 +1107,7 @@ class MLTradingPipeline:
                             logger.error(f"   ❌ Excel güncelleme hatası: {e}", exc_info=True)
                                 
                         closed_count += 1
-
-                # YENİ: Memory'de olmayan ama Excel'de 'open' kalmış orphan işlemleri kapat
-                # (Bot restart sonrası memory sıfırlandığında oluşan bug için)
-                try:
-                    closed_count += self._reconcile_excel_orphans(active_coins)
-                except Exception as rec_err:
-                    logger.warning(f"   ⚠️ Excel reconcile hatası: {rec_err}")
-
+                            
                 if closed_count > 0:
                     logger.info(f"   🧹 {closed_count} işlemin kontrolü ve temizliği tamamlandı.")
                 
@@ -1550,61 +1543,21 @@ class MLTradingPipeline:
         logger.info(f"{'─'*50}\n")
 
     def _export_live_trades_to_xlsx(self, df: pd.DataFrame, filepath: Path) -> None:
-        """
-        Canlı işlemleri paper_trade formatında Excel'e kaydeder.
-
-        DÜZELTMELER:
-          • PnL (%) artık ham yüzde olarak kaydediliyor; format '0.00"%"' (Excel
-            otomatik *100 yapmıyor). Eski kod her save'de değeri 100'e bölüyordu →
-            ~67 kayıttan sonra 4.8e-135 gibi saçma değerler oluşuyordu.
-          • Her export öncesi closed satırlarda Fee=0 / Net PnL=0 olanlar otomatik
-            backfill ediliyor (Binance taker %0.04 her yön ile).
-        """
+        """Canlı işlemleri paper_trade formatında renklendirilmiş ve Summary ile Excel'e kaydeder."""
         try:
             from openpyxl import Workbook
             from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
             from openpyxl.utils import get_column_letter
         except ImportError:
-            df.to_excel(filepath, index=False)              # openpyxl yoksa fallback
+            df.to_excel(filepath, index=False) # Openpyxl yoksa standart formatta kaydet
             return
 
         try:
-            # ---------- BACKFILL: eski kapalı satırlarda Fee/Net PnL/PnL% eksikse hesapla ----------
-            TAKER = 0.0004                                  # Binance Futures taker komisyonu (%0.04)
-            if 'Durum' in df.columns:
-                # Sayısal kolonları float'a sabitle (int64 olursa ondalık atama hata verir)
-                for col in ('Giriş ($)', 'Çıkış ($)', 'Lot (Coin)', 'Kaldıraç',
-                            'PnL ($)', 'PnL (%)', 'Fee ($)', 'Net PnL ($)'):
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
-
-                closed_mask = df['Durum'] == 'closed'
-
-                # Fee==0 + PnL!=0 olan eski/bozuk satırları geriye dönük doldur
-                need_fix = closed_mask & (df['Fee ($)'].fillna(0) == 0) & (df['PnL ($)'].fillna(0) != 0)
-                if need_fix.any():
-                    e = df.loc[need_fix, 'Giriş ($)'].fillna(0)
-                    x = df.loc[need_fix, 'Çıkış ($)'].fillna(0)
-                    s = df.loc[need_fix, 'Lot (Coin)'].fillna(0)
-                    fee_calc = (e * s * TAKER) + (x * s * TAKER)
-                    df.loc[need_fix, 'Fee ($)']     = fee_calc.round(4)
-                    df.loc[need_fix, 'Net PnL ($)'] = (df.loc[need_fix, 'PnL ($)'] - fee_calc).round(4)
-
-                # PnL (%) bozulmuş (≈0 ama PnL$ var) satırları formülden yeniden hesapla
-                broken_pct = closed_mask & (df['PnL (%)'].abs().fillna(0) < 0.001) & (df['PnL ($)'].fillna(0) != 0)
-                if broken_pct.any():
-                    e = df.loc[broken_pct, 'Giriş ($)'].fillna(0)
-                    s = df.loc[broken_pct, 'Lot (Coin)'].fillna(0)
-                    lev = df.loc[broken_pct, 'Kaldıraç'].fillna(1)
-                    p = df.loc[broken_pct, 'PnL ($)'].fillna(0)
-                    notional = (e * s).replace(0, pd.NA)
-                    df.loc[broken_pct, 'PnL (%)'] = ((p / notional) * 100 * lev).fillna(0).round(2)
-
             wb = Workbook()
             ws_trades = wb.active
             ws_trades.title = "Trades"
 
-            # ---- Stil tanımları ----
+            # ---- Stil Tanımları ----
             header_font = Font(name='Arial', bold=True, color='FFFFFF', size=10)
             header_fill = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
             header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
@@ -1620,45 +1573,45 @@ class MLTradingPipeline:
                 top=Side(style='thin', color='D9D9D9'), bottom=Side(style='thin', color='D9D9D9')
             )
 
-            # ---- Sütun genişlikleri & formatları ----
-            # KRİTİK: PnL (%) formatı '0.00%' (çarpan var) DEĞİL, '0.00"%"' (text-percent)
+            # ---- Sütun Genişlikleri ve Formatları ----
             columns_def = {
                 "ID": (10, None), "Tarih (Açılış)": (18, None), "Tarih (Kapanış)": (18, None),
-                "Coin": (8, None), "Yön": (8, None), "Giriş ($)": (12, '#,##0.00'),
-                "Çıkış ($)": (12, '#,##0.00'), "Lot (Coin)": (12, '#,##0.000000'),
-                "Hacim ($)": (12, '#,##0.00'), "Kaldıraç": (10, '0"x"'),
+                "Coin": (8, None), "Yön": (8, None), "Giriş ($)": (12, '#,##0.00'), 
+                "Çıkış ($)": (12, '#,##0.00'), "Lot (Coin)": (12, '#,##0.000000'), 
+                "Hacim ($)": (12, '#,##0.00'), "Kaldıraç": (10, '0x'),
                 "SL ($)": (12, '#,##0.00'), "TP ($)": (12, '#,##0.00'), "R:R": (8, '0.00'),
-                "PnL ($)": (10, '#,##0.00;(#,##0.00);"-"'),
-                "PnL (%)": (10, '0.00"%"'),                  # <-- DÜZELTİLDİ (çarpan yok)
-                "Fee ($)": (10, '#,##0.00'),
-                "Net PnL ($)": (12, '#,##0.00;(#,##0.00);"-"'),
-                "IC Güven": (10, '0.0'), "IC Yön": (8, None), "TF": (6, None),
+                "PnL ($)": (10, '#,##0.00;(#,##0.00);"-"'), "PnL (%)": (10, '0.00%'), 
+                "Fee ($)": (10, '#,##0.00'), "Net PnL ($)": (12, '#,##0.00;(#,##0.00);"-"'), 
+                "IC Güven": (10, '0.0'), "IC Yön": (8, None), "TF": (6, None), 
                 "Rejim": (14, None), "AI Karar": (10, None), "Durum": (10, None),
                 "Çıkış Nedeni": (14, None), "Süre (dk)": (10, '#,##0')
             }
 
             headers = list(df.columns)
-
-            # Başlıkları yaz
+            
+            # Başlıkları Yaz
             for col_idx, col_name in enumerate(headers, 1):
                 cell = ws_trades.cell(row=1, column=col_idx, value=col_name)
                 cell.font, cell.fill, cell.alignment = header_font, header_fill, header_alignment
                 width = columns_def.get(col_name, (12, None))[0]
                 ws_trades.column_dimensions[get_column_letter(col_idx)].width = width
 
-            ws_trades.freeze_panes = 'A2'                 # başlık satırını sabitle
+            ws_trades.freeze_panes = 'A2'
 
-            # Verileri yaz ve renklendir
+            # Verileri Yaz ve Renklendir
             for r_idx, row in enumerate(df.values, 2):
                 for c_idx, val in enumerate(row, 1):
                     col_name = headers[c_idx-1]
                     if pd.isna(val):
                         val = ""
+                    
+                    # PnL % formatını Excel'in anlayacağı ondalığa çeviriyoruz (örn: %15 -> 0.15)
+                    if col_name == "PnL (%)" and isinstance(val, (int, float)) and val != "":
+                        val = val / 100.0
 
-                    # >>> ESKİ HATALI SATIR KALDIRILDI: PnL (%) artık /100 YAPILMIYOR
                     cell = ws_trades.cell(row=r_idx, column=c_idx, value=val)
                     cell.font, cell.border = data_font, thin_border
-
+                    
                     fmt = columns_def.get(col_name, (12, None))[1]
                     if fmt and val != "":
                         cell.number_format = fmt
@@ -1666,13 +1619,13 @@ class MLTradingPipeline:
                     if col_name == "Yön":
                         if val == "LONG": cell.fill = long_fill
                         elif val == "SHORT": cell.fill = short_fill
-
+                    
                     if col_name in ["PnL ($)", "Net PnL ($)", "PnL (%)"] and val != "":
                         try:
                             if float(val) > 0: cell.font, cell.fill = green_font, green_fill
                             elif float(val) < 0: cell.font, cell.fill = red_font, red_fill
-                        except (ValueError, TypeError): pass
-
+                        except ValueError: pass
+                    
                     if col_name in ["Durum", "Çıkış Nedeni"] and isinstance(val, str):
                         if "tp" in str(val).lower(): cell.fill = green_fill
                         elif "sl" in str(val).lower(): cell.fill = red_fill
@@ -1680,139 +1633,128 @@ class MLTradingPipeline:
             if len(df) > 0:
                 ws_trades.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(df) + 1}"
 
-            # ============ SUMMARY (ÖZET) SHEET ============
+            # ---- SUMMARY (ÖZET) SHEET ----
             ws_summary = wb.create_sheet("Summary")
             closed_df = df[df['Durum'] == 'closed'].copy()
             total_trades = len(df)
             closed_trades = len(closed_df)
             open_trades = total_trades - closed_trades
-
+            
             # Sütunların varlığından emin ol
             for col in ['PnL ($)', 'Net PnL ($)', 'Fee ($)']:
                 if col not in closed_df.columns:
                     closed_df[col] = 0.0
 
             # Verileri güvenli şekilde sayısala çevir
-            closed_df['PnL ($)']     = pd.to_numeric(closed_df['PnL ($)'], errors='coerce').fillna(0)
+            closed_df['PnL ($)'] = pd.to_numeric(closed_df['PnL ($)'], errors='coerce').fillna(0)
             closed_df['Net PnL ($)'] = pd.to_numeric(closed_df['Net PnL ($)'], errors='coerce').fillna(0)
-            closed_df['Fee ($)']     = pd.to_numeric(closed_df['Fee ($)'], errors='coerce').fillna(0)
-
-            # Win Rate: Net PnL üzerinden (Fee artık doğru olduğu için doğru çalışır)
-            winning  = int((closed_df['Net PnL ($)'] >  0).sum())
-            losing   = int((closed_df['Net PnL ($)'] <= 0).sum())
+            closed_df['Fee ($)'] = pd.to_numeric(closed_df['Fee ($)'], errors='coerce').fillna(0)
+            
+            # YENİ EKLENEN KISIM: Eski işlemlerde Net PnL yoksa normal PnL değerini kullan (Win Rate hatasını çözer)
+            mask_old_trades = (closed_df['Net PnL ($)'] == 0) & (closed_df['PnL ($)'] != 0)
+            closed_df.loc[mask_old_trades, 'Net PnL ($)'] = closed_df.loc[mask_old_trades, 'PnL ($)']
+            
+            winning = len(closed_df[closed_df['Net PnL ($)'] > 0])
+            losing = len(closed_df[closed_df['Net PnL ($)'] <= 0])
             win_rate = (winning / closed_trades * 100) if closed_trades > 0 else 0.0
-
-            total_pnl     = float(closed_df['PnL ($)'].sum())
-            total_net_pnl = float(closed_df['Net PnL ($)'].sum())
-            total_fee     = float(closed_df['Fee ($)'].sum())
-
-            gross_profit  = float(closed_df.loc[closed_df['Net PnL ($)'] >  0, 'Net PnL ($)'].sum())
-            gross_loss    = abs(float(closed_df.loc[closed_df['Net PnL ($)'] <= 0, 'Net PnL ($)'].sum()))
+            
+            total_pnl = float(closed_df['PnL ($)'].sum()) if closed_trades > 0 else 0.0
+            total_net_pnl = float(closed_df['Net PnL ($)'].sum()) if closed_trades > 0 else 0.0
+            total_fee = float(closed_df['Fee ($)'].sum()) if closed_trades > 0 else 0.0
+            
+            gross_profit = float(closed_df[closed_df['Net PnL ($)'] > 0]['Net PnL ($)'].sum()) if closed_trades > 0 else 0.0
+            gross_loss = abs(float(closed_df[closed_df['Net PnL ($)'] <= 0]['Net PnL ($)'].sum())) if closed_trades > 0 else 0.0
             profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else float('inf')
-
-            avg_pnl  = total_net_pnl / closed_trades if closed_trades > 0 else 0.0
-            avg_win  = gross_profit / winning if winning > 0 else 0.0
-            avg_loss = gross_loss   / losing  if losing  > 0 else 0.0
-
-            avg_dur = pd.to_numeric(closed_df['Süre (dk)'], errors='coerce').mean() \
-                      if (closed_trades > 0 and 'Süre (dk)' in closed_df.columns) else 0.0
+            
+            avg_pnl = total_net_pnl / closed_trades if closed_trades > 0 else 0.0
+            avg_win = gross_profit / winning if winning > 0 else 0.0
+            avg_loss = gross_loss / losing if losing > 0 else 0.0
+            
+            avg_dur = pd.to_numeric(closed_df['Süre (dk)'], errors='coerce').mean() if (closed_trades > 0 and 'Süre (dk)' in closed_df.columns) else 0.0
             avg_duration = float(avg_dur) if not pd.isna(avg_dur) else 0.0
+            
+            total_return = ((self._balance - self._initial_balance) / self._initial_balance * 100) if self._initial_balance > 0 else 0.0
 
-            total_return = ((self._balance - self._initial_balance) / self._initial_balance * 100) \
-                           if self._initial_balance > 0 else 0.0
-
-            # ---- Summary stilleri ----
-            title_font   = Font(name='Arial', bold=True, size=14, color='2F5496')
+            title_font = Font(name='Arial', bold=True, size=14, color='2F5496')
             section_font = Font(name='Arial', bold=True, size=11, color='2F5496')
-            label_font   = Font(name='Arial', size=10)
-            value_font   = Font(name='Arial', bold=True, size=10)
-            pos_font     = Font(name='Arial', bold=True, size=10, color='006100')
-            neg_font     = Font(name='Arial', bold=True, size=10, color='9C0006')
+            label_font = Font(name='Arial', size=10)
+            value_font = Font(name='Arial', bold=True, size=10)
 
             ws_summary['A1'] = '📊 CANLI İŞLEM PERFORMANS RAPORU'
             ws_summary['A1'].font = title_font
             ws_summary.merge_cells('A1:D1')
             ws_summary['A2'] = f'Oluşturulma: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
             ws_summary['A2'].font = Font(name='Arial', size=9, italic=True, color='808080')
-
+            
             ws_summary.column_dimensions['A'].width = 22
             ws_summary.column_dimensions['B'].width = 15
             ws_summary.column_dimensions['C'].width = 15
-
+            
             r = 4
-            # ---- Bakiye bölümü ----
             ws_summary.cell(row=r, column=1, value='💰 BAKİYE').font = section_font
             r += 1
-            bakiye_rows = [
-                ('Başlangıç Bakiye', f"${self._initial_balance:.2f}", None),
-                ('Güncel Bakiye',    f"${self._balance:.2f}",         None),
-                ('Toplam Getiri',    f"{total_return:+.2f}%",         total_return),
-                ('Net PnL',          f"${total_net_pnl:+.2f}",        total_net_pnl),
-                ('Toplam Fee',       f"${total_fee:.2f}",             None),
-            ]
-            for label, val, signed in bakiye_rows:
+            for label, val in [('Başlangıç Bakiye', f"${self._initial_balance:.2f}"), 
+                               ('Güncel Bakiye', f"${self._balance:.2f}"), 
+                               ('Toplam Getiri', f"{total_return:+.1f}%"), 
+                               ('Net PnL', f"${total_net_pnl:+.2f}"),
+                               ('Toplam Fee', f"${total_fee:.2f}")]:
                 ws_summary.cell(row=r, column=1, value=label).font = label_font
                 v_cell = ws_summary.cell(row=r, column=2, value=val)
                 v_cell.font = value_font
-                if signed is not None:
-                    if signed > 0:   v_cell.font = pos_font
-                    elif signed < 0: v_cell.font = neg_font
+                if 'Getiri' in label or 'PnL' in label:
+                    if '+' in val or (not '-' in val and float(val.replace('$','').replace('%','').replace('+','').strip() or 0) > 0):
+                        v_cell.font = Font(name='Arial', bold=True, size=10, color='006100')
+                    elif '-' in val: v_cell.font = Font(name='Arial', bold=True, size=10, color='9C0006')
                 r += 1
 
-            # ---- Trade istatistikleri ----
             r += 1
             ws_summary.cell(row=r, column=1, value='📈 TRADE İSTATİSTİKLERİ').font = section_font
             r += 1
-            for label, val in [('Toplam Trade',  str(total_trades)),
-                               ('Açık Pozisyon', str(open_trades)),
-                               ('Kapalı Trade',  str(closed_trades)),
-                               ('Kazanan',       str(winning)),
-                               ('Kaybeden',      str(losing))]:
+            for label, val in [('Toplam Trade', str(total_trades)), ('Açık Pozisyon', str(open_trades)), ('Kapalı Trade', str(closed_trades)), ('Kazanan', str(winning)), ('Kaybeden', str(losing))]:
                 ws_summary.cell(row=r, column=1, value=label).font = label_font
                 ws_summary.cell(row=r, column=2, value=val).font = value_font
                 r += 1
 
-            # ---- Performans metrikleri ----
             r += 1
             ws_summary.cell(row=r, column=1, value='📊 PERFORMANS METRİKLERİ').font = section_font
             r += 1
-            pf_str = f"{profit_factor:.2f}" if profit_factor != float('inf') else "∞"
-            for label, val in [('Win Rate',      f"{win_rate:.1f}%"),
-                               ('Profit Factor', pf_str),
-                               ('Ort. Net PnL',  f"${avg_pnl:.2f}"),
-                               ('Ort. Kazanç',   f"${avg_win:.2f}"),
-                               ('Ort. Kayıp',    f"-${avg_loss:.2f}"),
-                               ('Ort. Süre',     f"{avg_duration:.0f} dk")]:
+            for label, val in [('Win Rate', f"{win_rate:.1f}%"), ('Profit Factor', f"{profit_factor:.2f}"), ('Ort. Net PnL', f"${avg_pnl:.2f}"), ('Ort. Kazanç', f"${avg_win:.2f}"), ('Ort. Kayıp', f"-${avg_loss:.2f}"), ('Ort. Süre', f"{avg_duration:.0f} dk")]:
                 ws_summary.cell(row=r, column=1, value=label).font = label_font
                 ws_summary.cell(row=r, column=2, value=val).font = value_font
                 r += 1
 
-            # ---- Günlük PnL tablosu ----
+            # YENİ: Günlük PnL Tablosu Bölümü
             r += 2
             ws_summary.cell(row=r, column=1, value='📅 GÜNLÜK PNL').font = section_font
             r += 1
-            ws_summary.cell(row=r, column=1, value='Tarih').font        = Font(name='Arial', bold=True, size=10)
-            ws_summary.cell(row=r, column=2, value='Net PnL ($)').font  = Font(name='Arial', bold=True, size=10)
+            ws_summary.cell(row=r, column=1, value='Tarih').font = Font(name='Arial', bold=True, size=10)
+            ws_summary.cell(row=r, column=2, value='Net PnL ($)').font = Font(name='Arial', bold=True, size=10)
             ws_summary.cell(row=r, column=3, value='Trade Sayısı').font = Font(name='Arial', bold=True, size=10)
             r += 1
-
+            
             if closed_trades > 0 and 'Tarih (Kapanış)' in closed_df.columns:
                 try:
                     closed_df['Date_Only'] = pd.to_datetime(closed_df['Tarih (Kapanış)'], errors='coerce').dt.date
                     daily_stats = closed_df.dropna(subset=['Date_Only']).groupby('Date_Only').agg(
                         daily_pnl=('Net PnL ($)', 'sum'),
                         trade_count=('ID', 'count')
-                    ).reset_index().sort_values('Date_Only')
-
+                    ).reset_index()
+                    
                     for _, d_row in daily_stats.iterrows():
                         date_str = str(d_row['Date_Only'])
-                        d_pnl    = float(d_row['daily_pnl'])
-                        t_cnt    = int(d_row['trade_count'])
-
+                        d_pnl = float(d_row['daily_pnl'])
+                        t_cnt = int(d_row['trade_count'])
+                        
                         ws_summary.cell(row=r, column=1, value=date_str).font = label_font
+                        
                         pnl_cell = ws_summary.cell(row=r, column=2, value=f"${d_pnl:+.2f}")
-                        pnl_cell.font = pos_font if d_pnl > 0 else (neg_font if d_pnl < 0 else value_font)
-                        ws_summary.cell(row=r, column=3, value=t_cnt).font = label_font
+                        pnl_cell.font = value_font
+                        if d_pnl > 0:
+                            pnl_cell.font = Font(name='Arial', bold=True, size=10, color='006100')
+                        elif d_pnl < 0:
+                            pnl_cell.font = Font(name='Arial', bold=True, size=10, color='9C0006')
+                            
+                        ws_summary.cell(row=r, column=3, value=str(t_cnt)).font = label_font
                         r += 1
                 except Exception as e:
                     logger.error(f"Günlük PnL tablo hatası: {e}")
@@ -1826,167 +1768,6 @@ class MLTradingPipeline:
         except Exception as e:
             logger.error(f"❌ Excel formatlama hatası: {e}")
             df.to_excel(filepath, index=False)
-
-    def _reconcile_excel_orphans(self, active_coins: set) -> int:
-        """
-        Excel'de 'open' olarak duran ama:
-          • trade_memory.open_trades'de OLMAYAN
-          • Binance aktif pozisyonlarda (active_coins) OLMAYAN
-        işlemleri tespit eder; son 1m OHLCV'den TP/SL hangisi tetiklenmiş bulup
-        kapatır, Fee + Net PnL hesaplar, dosyayı yeniden kaydeder.
-
-        Bot restart sonrası memory sıfırlandığında oluşan 'orphan open' bug'ını çözer.
-
-        Returns: kapatılan satır sayısı
-        """
-        from pathlib import Path
-
-        closed_in_excel = 0
-        excel_path = Path("logs") / "live_trades.xlsx"
-        if not excel_path.exists():
-            return 0
-
-        try:
-            df = pd.read_excel(excel_path)
-        except Exception as e:
-            logger.warning(f"   ⚠️ Excel reconcile read error: {e}")
-            return 0
-
-        if 'Durum' not in df.columns:
-            return 0
-
-        # Memory'de bilinen coin'ler — bunları atla, normal close döngüsü ilgileniyor
-        mem_coins = set()
-        if hasattr(self, 'trade_memory') and hasattr(self.trade_memory, 'open_trades'):
-            for mt in self.trade_memory.open_trades.values():
-                c = str(getattr(mt, 'coin', '')).replace('USDT', '').split('/')[0].split(':')[0]
-                if c:
-                    mem_coins.add(c)
-
-        # Excel'de open olanlar
-        open_rows = df[df['Durum'] == 'open']
-        if open_rows.empty:
-            return 0
-
-        TAKER = 0.0004
-        changed = False
-
-        for idx, row in open_rows.iterrows():
-            coin = str(row.get('Coin', '')).strip()
-            if not coin:
-                continue
-
-            # Hâlâ Binance'te açık → atla
-            if coin in active_coins:
-                continue
-            # Memory'de takipte → normal close döngüsü ilgilenecek, atla
-            if coin in mem_coins:
-                continue
-
-            # Bu satır gerçek bir orphan: memory'de yok, Binance'te yok, ama Excel'de open
-            try:
-                entry     = float(row.get('Giriş ($)', 0) or 0)
-                size      = float(row.get('Lot (Coin)', 0) or 0)
-                leverage  = int(float(row.get('Kaldıraç', 1) or 1))
-                sl_price  = float(row.get('SL ($)', 0) or 0)
-                tp_price  = float(row.get('TP ($)', 0) or 0)
-                direction = str(row.get('Yön', 'LONG')).upper()
-
-                if entry <= 0 or size <= 0:
-                    logger.debug(f"   ⏭️ Orphan {coin}: yetersiz veri, atlandı")
-                    continue
-
-                # OHLCV'den hangi seviye tetiklenmiş bul (son 200 dakika)
-                symbol = f"{coin}/USDT:USDT"
-                close_reason = "Manuel / API"
-                exit_price   = entry
-
-                try:
-                    ohlcv = self.fetcher.fetch_ohlcv(symbol, timeframe="1m", limit=200)
-                    if ohlcv is not None and not ohlcv.empty:
-                        max_high = float(ohlcv['high'].max())
-                        min_low  = float(ohlcv['low'].min())
-                        last     = float(ohlcv['close'].iloc[-1])
-                        dist_tp  = abs(last - tp_price)
-                        dist_sl  = abs(last - sl_price)
-
-                        if direction == "LONG":
-                            if min_low <= sl_price:
-                                close_reason, exit_price = "SL Hit", sl_price
-                            elif max_high >= tp_price:
-                                close_reason, exit_price = "TP Hit", tp_price
-                            else:
-                                # Mum tarayıcı yakalayamadıysa mesafeye göre tahmin
-                                close_reason = "TP Hit" if dist_tp < dist_sl else "SL Hit"
-                                exit_price   = tp_price if dist_tp < dist_sl else sl_price
-                        else:  # SHORT
-                            if max_high >= sl_price:
-                                close_reason, exit_price = "SL Hit", sl_price
-                            elif min_low <= tp_price:
-                                close_reason, exit_price = "TP Hit", tp_price
-                            else:
-                                close_reason = "TP Hit" if dist_tp < dist_sl else "SL Hit"
-                                exit_price   = tp_price if dist_tp < dist_sl else sl_price
-                except Exception as oe:
-                    logger.warning(f"   ⚠️ Orphan {coin} OHLCV hatası: {oe}")
-
-                # PnL / Fee / Net PnL hesapla
-                if direction == "LONG":
-                    pnl_val = (exit_price - entry) * size
-                else:
-                    pnl_val = (entry - exit_price) * size
-                fee_val = (entry * size * TAKER) + (exit_price * size * TAKER)
-                net_pnl = pnl_val - fee_val
-                notional = entry * size
-                pnl_pct = (pnl_val / notional) * 100 * leverage if notional > 0 else 0.0
-
-                # DataFrame'i güncelle (dtype hatalarını önlemek için kolonları ayarla)
-                for col in ('Tarih (Kapanış)', 'Çıkış Nedeni', 'Durum'):
-                    if col in df.columns:
-                        df[col] = df[col].astype(object)
-                for col in ('Çıkış ($)', 'PnL ($)', 'PnL (%)', 'Fee ($)', 'Net PnL ($)'):
-                    if col in df.columns:
-                        df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
-
-                now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")
-                df.at[idx, 'Tarih (Kapanış)'] = now_str
-                df.at[idx, 'Çıkış ($)']       = round(exit_price, 6)
-                df.at[idx, 'PnL ($)']         = round(pnl_val, 4)
-                df.at[idx, 'PnL (%)']         = round(pnl_pct, 2)
-                df.at[idx, 'Fee ($)']         = round(fee_val, 4)
-                df.at[idx, 'Net PnL ($)']     = round(net_pnl, 4)
-                df.at[idx, 'Çıkış Nedeni']    = close_reason
-                df.at[idx, 'Durum']           = 'closed'
-
-                # Süre hesaplaması
-                try:
-                    acilis = pd.to_datetime(str(row.get('Tarih (Açılış)', '')))
-                    df.at[idx, 'Süre (dk)'] = int((datetime.now() - acilis.to_pydatetime()).total_seconds() / 60)
-                except Exception:
-                    pass
-
-                # SL ise cooldown'a al (try/except DIŞINDA — bare except hatasını önle)
-                if close_reason == "SL Hit":
-                    self.cooldowns[coin]   = datetime.now(timezone.utc) + timedelta(hours=2)
-                    self.cooldowns[symbol] = datetime.now(timezone.utc) + timedelta(hours=2)
-
-                logger.info(f"   🔧 ORPHAN kapatıldı: {coin} → {close_reason} | "
-                            f"PnL: ${pnl_val:+.2f} | Net: ${net_pnl:+.2f}")
-                closed_in_excel += 1
-                changed = True
-
-            except Exception as e:
-                logger.error(f"   ❌ Orphan reconcile {coin} hatası: {e}", exc_info=True)
-                continue
-
-        if changed:
-            try:
-                self._export_live_trades_to_xlsx(df, excel_path)
-                logger.info(f"   📊 Excel reconcile: {closed_in_excel} orphan işlem kapatıldı")
-            except Exception as e:
-                logger.error(f"   ❌ Excel reconcile save hatası: {e}")
-
-        return closed_in_excel
 
     def print_performance(self) -> None:
         PerformanceAnalyzer(self.paper_trader).print_report(
