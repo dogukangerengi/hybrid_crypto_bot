@@ -1,7 +1,14 @@
 # =============================================================================
-# MAIN.PY — ML-DRIVEN TRADING PIPELINE v2.1.3 (BINANCE VADELİ İŞLEMLER)
+# MAIN.PY — ML-DRIVEN TRADING PIPELINE v2.1.4 (BINANCE VADELİ İŞLEMLER)
 # =============================================================================
-# v2.1.3 Düzeltmeler:
+# v2.1.4 Değişiklikler:
+#   ✅ Günlük %6 kayıp limiti AKTİF edildi (UTC bazlı, ertesi güne kadar halt)
+#   ✅ Toplam margin limitleri (%60) ve per-trade margin (%25) AKTİF
+#   ✅ Kill switch canlı bakiye + güncel PnL ile hesaplanıyor
+#   ✅ risk_manager.update_state() her döngüde daily_pnl + used_margin ile besleniyor
+#   ✅ Günlük halt durumunda _execute_trade çağrıları reddediliyor
+#
+# v2.1.3 Değişiklikler:
 #   ✅ Tarama süresi 10 dakikaya düşürüldü.
 #   ✅ Cooldown için UTC saat dilimi hataları düzeltildi.
 #   ✅ Scheduler uyku modundayken 30 saniyede bir açık emir takibi eklendi.
@@ -63,7 +70,7 @@ logger = logging.getLogger(__name__)
 # SABİTLER
 # =============================================================================
 
-VERSION                = "2.1.3"
+VERSION                = "2.1.4"
 MAX_COINS_PER_CYCLE    = 30
 DEFAULT_FWD_PERIOD     = 6
 MAX_OPEN_POSITIONS     = 5
@@ -71,10 +78,10 @@ MAX_CONSECUTIVE_ERRORS = 5
 ERROR_COOLDOWN_SECONDS = 300
 
 DEFAULT_TIMEFRAMES = {
-    '15m': 1500,
+    '5m': 1500,
+    '15m': 1000,
     '30m': 1000,
     '1h' : 1000,
-    '2h' : 750,
 }
 
 IC_NO_TRADE = 12.0
@@ -90,6 +97,7 @@ class CycleStatus(Enum):
     NO_SIGNAL = "no_signal"
     ERROR     = "error"
     KILLED    = "killed"
+    HALTED    = "halted"   # Günlük kayıp limiti nedeniyle halt
 
 # =============================================================================
 # DATACLASS'LAR
@@ -97,17 +105,17 @@ class CycleStatus(Enum):
 
 @dataclass
 class CoinAnalysisResult:
-    coin:             str   = ""               
-    full_symbol:      str   = ""               
-    price:            float = 0.0              
-    change_24h:       float = 0.0              
-    volume_24h:       float = 0.0              
+    coin:             str   = ""
+    full_symbol:      str   = ""
+    price:            float = 0.0
+    change_24h:       float = 0.0
+    volume_24h:       float = 0.0
 
-    best_timeframe:   str   = ""               
-    ic_confidence:    float = 0.0              
-    ic_direction:     str   = ""               
-    significant_count: int  = 0                
-    market_regime:    str   = ""               
+    best_timeframe:   str   = ""
+    ic_confidence:    float = 0.0
+    ic_direction:     str   = ""
+    significant_count: int  = 0
+    market_regime:    str   = ""
 
     category_tops:    Dict  = field(default_factory=dict)
     tf_rankings:      List  = field(default_factory=list)
@@ -122,7 +130,7 @@ class CoinAnalysisResult:
 
     ml_result:        Optional[MLDecisionResult] = None
     val_result:       Optional[ValidationResult] = None
-    ml_skipped:       bool  = False            
+    ml_skipped:       bool  = False
 
     trade_executed:   bool  = False
     status:           str   = "pending"
@@ -145,6 +153,7 @@ class CycleReport:
     errors:           List[str]   = field(default_factory=list)
     elapsed:          float       = 0.0
     ml_stats:         Dict        = field(default_factory=dict)
+    daily_pnl:        float       = 0.0   # Bugünkü toplam kapalı PnL
 
 
 # =============================================================================
@@ -188,14 +197,23 @@ class MLTradingPipeline:
         self._consecutive_errors = 0
         self.cooldowns         = {}
 
+        # ── GÜNLÜK KAYIP LİMİTİ STATE (v2.1.4) ──────────────────────────
+        # UTC gününün başında bakiye snapshot'ı alınır.
+        # Gün içinde toplam kapalı trade PnL'i bu değerin -%6'sına inerse
+        # _daily_halt_until ertesi gün UTC 00:00 olarak set edilir.
+        self._daily_date: Optional[str]           = None   # Aktif gün (UTC YYYY-MM-DD)
+        self._daily_start_balance: float          = 0.0    # Gün başı bakiye
+        self._daily_realized_pnl: float           = 0.0    # Bugünkü gerçekleşen PnL
+        self._daily_halt_until: Optional[datetime] = None  # Halt bitiş zamanı (UTC)
+
         self._restore_cooldowns()
 
         logger.info(f"🚀 ML Trading Pipeline v{VERSION} (dry_run={dry_run})")
 
     def _restore_cooldowns(self):
         try:
-            now = datetime.now(timezone.utc) # UTC olarak güncellendi
-            
+            now = datetime.now(timezone.utc)
+
             if not self.dry_run:
                 memory_file = self.trade_memory.log_dir / "ml_trade_memory.json"
                 if memory_file.exists():
@@ -203,20 +221,19 @@ class MLTradingPipeline:
                     try:
                         with open(memory_file, 'r', encoding='utf-8') as f:
                             trades = json.load(f)
-                        
+
                         for trade in trades:
                             exit_reason = trade.get('exit_reason', '')
                             closed_at_str = trade.get('closed_at', '')
                             coin = trade.get('coin', '')
                             symbol = trade.get('symbol', '')
-                            
+
                             if exit_reason == "SL Hit" and closed_at_str and coin:
                                 try:
                                     closed_time = datetime.fromisoformat(closed_at_str)
-                                    # Zaman dilimi yoksa UTC ekle
                                     if closed_time.tzinfo is None:
                                         closed_time = closed_time.replace(tzinfo=timezone.utc)
-                                    
+
                                     if (now - closed_time).total_seconds() < 7200:
                                         kalan_sure = closed_time + timedelta(hours=2)
                                         self.cooldowns[coin] = kalan_sure
@@ -247,14 +264,14 @@ class MLTradingPipeline:
                                 closed_time = closed_at
                                 if closed_time.tzinfo is None:
                                     closed_time = closed_time.replace(tzinfo=timezone.utc)
-                            
+
                             if (now - closed_time).total_seconds() < 7200:
                                 kalan_sure = closed_time + timedelta(hours=2)
                                 self.cooldowns[symbol] = kalan_sure
                                 if full_symbol:
                                     self.cooldowns[full_symbol] = kalan_sure
                                 logger.info(f"   ❄️ HAFIZA GERİ YÜKLENDİ: {symbol} (Ceza bitişi: {kalan_sure.strftime('%H:%M:%S')})")
-                            
+
         except Exception as e:
             logger.error(f"Cooldown hafıza yükleme hatası: {e}")
 
@@ -269,22 +286,54 @@ class MLTradingPipeline:
                     self._balance = self._initial_balance = b.get('total', 0.0)
                 else:
                     self._balance = self._initial_balance = float(b)
-                
+
                 logger.info(f"💰 Canlı bakiye: ${self._balance:.2f}")
+
+            # ── Günlük state'i başlat (v2.1.4) ──
+            self._daily_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            self._daily_start_balance = self._balance
+            self._daily_realized_pnl = 0.0
+            logger.info(
+                f"📅 Günlük limit başlangıcı: {self._daily_date} | "
+                f"Start bakiye: ${self._daily_start_balance:.2f} | "
+                f"Max günlük kayıp: %{cfg.risk.daily_max_loss_pct}"
+            )
             return True
         except Exception as e:
             logger.error(f"❌ Bakiye hatası: {e}")
             return False
 
+    def _refresh_live_balance(self) -> None:
+        """Canlı modda Binance'ten güncel bakiyeyi çek (toplam = free + margin)."""
+        if self.dry_run:
+            self._balance = self.paper_trader.balance
+            return
+        try:
+            b = self.executor.fetch_balance()
+            if isinstance(b, dict):
+                new_balance = b.get('total', self._balance)
+                if new_balance > 0:
+                    self._balance = new_balance
+        except Exception as e:
+            logger.debug(f"Bakiye refresh hatası (kritik değil): {e}")
+
     def _check_kill_switch(self) -> bool:
+        """%15 kill switch drawdown kontrolü (canlı bakiye + günlük PnL ile)."""
         if self._kill_switch:
             return True
         if self._initial_balance <= 0:
             return False
-        dd = (self._initial_balance - self._balance) / self._initial_balance * 100
+
+        # Canlı bakiyeyi tazele
+        self._refresh_live_balance()
+
+        # Güncel equity = canlı bakiye (hâlihazırda realized PnL dahil)
+        current_equity = self._balance
+        dd = (self._initial_balance - current_equity) / self._initial_balance * 100
+
         if dd >= cfg.risk.kill_switch_drawdown_pct:
             self._kill_switch = True
-            logger.critical(f"🚨 KILL SWITCH! DD={dd:.1f}%")
+            logger.critical(f"🚨 KILL SWITCH! DD={dd:.1f}% (Initial: ${self._initial_balance:.2f} → Current: ${current_equity:.2f})")
             if self.notifier.is_configured():
                 self.notifier.send_risk_alert_sync(
                     alert_type="KILL_SWITCH",
@@ -294,35 +343,224 @@ class MLTradingPipeline:
             return True
         return False
 
+    # =========================================================================
+    # GÜNLÜK KAYIP LİMİTİ (v2.1.4)
+    # =========================================================================
+
+    def _reset_daily_state_if_new_day(self) -> None:
+        """
+        UTC gün değiştiyse günlük sayaçları sıfırla.
+        Aktif halt varsa ve bitiş zamanı geçtiyse onu da kaldırır.
+        """
+        now = datetime.now(timezone.utc)
+        today = now.strftime("%Y-%m-%d")
+
+        # Halt süresi dolduysa kaldır
+        if self._daily_halt_until and now >= self._daily_halt_until:
+            logger.info(f"🌅 Günlük halt süresi doldu ({self._daily_halt_until.strftime('%Y-%m-%d %H:%M UTC')}) — trade'e devam")
+            self._daily_halt_until = None
+
+        # Yeni gün mü?
+        if self._daily_date != today:
+            old_day = self._daily_date
+            # Yeni günün başlangıç bakiyesini güncel bakiye olarak snapshot'la
+            self._refresh_live_balance()
+            self._daily_date = today
+            self._daily_start_balance = self._balance
+            self._daily_realized_pnl = 0.0
+            logger.info(
+                f"📅 Yeni gün: {old_day} → {today} | "
+                f"Start bakiye: ${self._daily_start_balance:.2f}"
+            )
+
+    def _compute_daily_pnl(self) -> float:
+        """
+        Bugün (UTC) kapanan tüm trade'lerin toplam PnL'ini hesapla.
+        Canlı mod: ml_trade_memory.json
+        Paper mod: paper_trader.closed_trades
+        """
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        total = 0.0
+
+        try:
+            if not self.dry_run:
+                # Canlı: memory dosyasından oku
+                memory_file = self.trade_memory.log_dir / "ml_trade_memory.json"
+                if not memory_file.exists():
+                    return 0.0
+                import json
+                with open(memory_file, 'r', encoding='utf-8') as f:
+                    trades = json.load(f)
+                for t in trades:
+                    closed_at = t.get('closed_at', '')
+                    if not closed_at:
+                        continue
+                    # closed_at UTC ISO string olmalı
+                    try:
+                        closed_dt = datetime.fromisoformat(closed_at)
+                        if closed_dt.tzinfo is None:
+                            closed_dt = closed_dt.replace(tzinfo=timezone.utc)
+                        if closed_dt.strftime("%Y-%m-%d") == today:
+                            pnl = float(t.get('pnl', 0.0) or 0.0)
+                            total += pnl
+                    except (ValueError, TypeError):
+                        continue
+            else:
+                # Paper: paper_trader üzerinden
+                for trade in self.paper_trader.closed_trades:
+                    closed_at = getattr(trade, 'closed_at', None)
+                    if not closed_at:
+                        continue
+                    if isinstance(closed_at, str):
+                        try:
+                            closed_dt = datetime.fromisoformat(closed_at)
+                        except ValueError:
+                            continue
+                    else:
+                        closed_dt = closed_at
+                    if closed_dt.tzinfo is None:
+                        closed_dt = closed_dt.replace(tzinfo=timezone.utc)
+                    if closed_dt.strftime("%Y-%m-%d") == today:
+                        pnl = getattr(trade, 'net_pnl', None)
+                        if pnl is None:
+                            pnl = getattr(trade, 'pnl_absolute', 0.0) or 0.0
+                        total += float(pnl or 0.0)
+        except Exception as e:
+            logger.warning(f"⚠️ Daily PnL hesaplama hatası: {e}")
+            return self._daily_realized_pnl  # Son bilinen değer
+
+        return total
+
+    def _check_daily_loss_limit(self) -> bool:
+        """
+        Günlük %6 kayıp limitini kontrol et.
+        
+        Returns:
+            True  → halt aktif, döngü durdurulmalı
+            False → halt yok, trade'e devam
+        """
+        now = datetime.now(timezone.utc)
+
+        # Zaten halt aktifse
+        if self._daily_halt_until and now < self._daily_halt_until:
+            kalan = (self._daily_halt_until - now).total_seconds() / 60
+            logger.info(f"⏸️ Günlük halt aktif — kalan: {kalan:.0f} dk (bitiş: {self._daily_halt_until.strftime('%H:%M UTC')})")
+            return True
+
+        # Bugünkü gerçekleşen PnL
+        daily_pnl = self._compute_daily_pnl()
+        self._daily_realized_pnl = daily_pnl
+
+        if self._daily_start_balance <= 0:
+            return False
+
+        max_loss_pct = cfg.risk.daily_max_loss_pct / 100.0
+        daily_loss_ratio = -daily_pnl / self._daily_start_balance  # Pozitif sayı = kayıp
+
+        logger.info(
+            f"📊 Günlük PnL: ${daily_pnl:+.2f} "
+            f"({daily_loss_ratio*100:+.2f}% / limit: %{cfg.risk.daily_max_loss_pct}) "
+            f"| Start: ${self._daily_start_balance:.2f}"
+        )
+
+        if daily_loss_ratio >= max_loss_pct:
+            # Halt tetikle — ertesi gün UTC 00:00'a kadar
+            tomorrow = (now + timedelta(days=1)).replace(
+                hour=0, minute=0, second=0, microsecond=0
+            )
+            self._daily_halt_until = tomorrow
+
+            logger.critical(
+                f"🛑 GÜNLÜK KAYIP LİMİTİ AŞILDI! "
+                f"Kayıp: ${daily_pnl:+.2f} ({daily_loss_ratio*100:.1f}% ≥ %{cfg.risk.daily_max_loss_pct}) "
+                f"| Halt bitişi: {tomorrow.strftime('%Y-%m-%d %H:%M UTC')}"
+            )
+
+            if self.notifier.is_configured():
+                try:
+                    msg = (
+                        f"🛑 <b>GÜNLÜK KAYIP LİMİTİ!</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📉 Günlük PnL: ${daily_pnl:+.2f}\n"
+                        f"📊 Kayıp: {daily_loss_ratio*100:.2f}% (limit: %{cfg.risk.daily_max_loss_pct})\n"
+                        f"💰 Start: ${self._daily_start_balance:.2f}\n"
+                        f"💰 Current: ${self._balance:.2f}\n"
+                        f"⏰ Halt bitişi: {tomorrow.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"Yeni trade AÇILMAYACAK — mevcut açık pozisyonlar SL/TP ile takip ediliyor."
+                    )
+                    self.notifier.send_message_sync(msg)
+                except Exception as tg_err:
+                    logger.warning(f"Telegram bildirimi gönderilemedi: {tg_err}")
+            return True
+
+        return False
+
+    def _compute_used_margin(self) -> float:
+        """Açık pozisyonların toplam margin kullanımını hesapla."""
+        if self.dry_run:
+            total = 0.0
+            for trade in self.paper_trader.open_trades.values():
+                notional = trade.entry_price * trade.position_size
+                lev = max(trade.leverage, 1)
+                total += notional / lev
+            return total
+        try:
+            positions = self.executor.fetch_positions()
+            return sum(float(p.get('margin', 0) or 0) for p in positions)
+        except Exception:
+            return 0.0
+
+    def _sync_risk_manager(self) -> None:
+        """RiskManager'ın state'ini güncel bakiye, daily PnL, margin, pozisyon ile besle."""
+        try:
+            current_balance = self.paper_trader.balance if self.dry_run else self._balance
+            used_margin = self._compute_used_margin()
+
+            if self.dry_run:
+                open_count = len(self.paper_trader.open_trades)
+            else:
+                try:
+                    open_count = len(self.executor.fetch_positions())
+                except Exception:
+                    open_count = 0
+
+            self.risk_manager.update_state(
+                balance=current_balance,
+                used_margin=used_margin,
+                open_positions=open_count,
+                daily_pnl=self._daily_realized_pnl,
+            )
+        except Exception as e:
+            logger.debug(f"RiskManager sync hatası (kritik değil): {e}")
+
     def _detect_regime(self, df: pd.DataFrame) -> str:
         """Piyasa rejimi tespiti: trending / ranging / volatile"""
         try:
             if 'close' not in df.columns or len(df) < 20:
                 return 'ranging'
 
-            # 1. Öncelik ADX indikatörü
             adx_col = next((col for col in df.columns if col.upper().startswith('ADX') and 'DMP' not in col.upper() and 'DMN' not in col.upper()), None)
-            
+
             if adx_col and not df[adx_col].dropna().empty:
                 adx = float(df[adx_col].dropna().iloc[-1])
                 if adx > 25: return 'trending'
                 if adx > 15: return 'ranging'
                 return 'volatile'
 
-            # 2. Fallback (ADX hesaplanamazsa): Volatiliteye bak
             returns = df['close'].pct_change().tail(20)
             vol = float(returns.std())
-            
+
             if pd.isna(vol):
                 return 'ranging'
-                
+
             if vol > 0.03: return 'volatile'
             elif vol > 0.01: return 'ranging'
             else: return 'trending'
-            
+
         except Exception as e:
             logger.warning(f"  ⚠️ Rejim tespiti hatası: {e}")
-            return 'ranging' # Hata durumunda unknown dönmesini tamamen engelliyoruz
+            return 'ranging'
 
     def _analyze_coin(self, symbol: str, coin: str) -> CoinAnalysisResult:
         result = CoinAnalysisResult(coin=coin, full_symbol=symbol)
@@ -444,29 +682,23 @@ class MLTradingPipeline:
             result.category_tops = dynamic_cat_tops
 
             df_best = indicator_data[best_tf]
-            
-            # ── ATR değerini oku ──
-            # pandas-ta atr() → "ATRr_14" adıyla mutlak ATR değeri üretir
-            # (İsimdeki "r" ratio değil, pandas-ta'nın default isimlendirmesi)
+
             atr_found = False
             for atr_col in ['ATRr_14', 'ATR_14', 'ATRr_7', 'NATR_14', 'TRUERANGE_1']:
                 if atr_col in df_best.columns:
                     atr_series = df_best[atr_col].dropna()
                     if not atr_series.empty:
                         raw_val = float(atr_series.iloc[-1])
-                        
+
                         if atr_col == 'NATR_14':
-                            # NATR = Normalized ATR (yüzde cinsinden) → mutlaka çevir
                             result.atr = raw_val * result.price / 100
                         else:
-                            # ATRr_14, ATR_14, ATRr_7, TRUERANGE_1 = zaten mutlak $
                             result.atr = raw_val
-                        
+
                         result.atr_pct = (result.atr / result.price) * 100 if result.price > 0 else 0.0
                         atr_found = True
                         break
-            
-            # Hiçbir ATR kolonu yoksa high-low farkından hesapla
+
             if not atr_found and 'high' in df_best.columns and 'low' in df_best.columns:
                 hl_range = (df_best['high'] - df_best['low']).tail(14)
                 result.atr = float(hl_range.mean())
@@ -496,10 +728,8 @@ class MLTradingPipeline:
             )
             result.val_result = val_result
 
-            # Validator sonucunun is_valid veya is_approved özelliğini güvenli şekilde alıyoruz
             is_ok = getattr(val_result, 'is_valid', False) or getattr(val_result, 'is_approved', False)
-            
-            # Eğer onay çıkmadıysa işlemi reddet
+
             if not is_ok:
                 result.status = "rejected_by_validator"
                 return result
@@ -514,12 +744,19 @@ class MLTradingPipeline:
         return result
 
     def _execute_trade(self, result: CoinAnalysisResult) -> CoinAnalysisResult:
-        # UTC kontrolü eklendi
+        # ── Günlük halt kontrolü (v2.1.4) ──
+        now = datetime.now(timezone.utc)
+        if self._daily_halt_until and now < self._daily_halt_until:
+            result.status = "daily_halt"
+            logger.info(f"   🛑 {result.coin} atlandı: Günlük kayıp limiti aktif (halt: {self._daily_halt_until.strftime('%H:%M UTC')})")
+            return result
+
+        # UTC cooldown kontrolü
         if hasattr(self, 'cooldowns'):
             if result.coin in self.cooldowns or result.full_symbol in self.cooldowns:
                 cooldown_key = result.coin if result.coin in self.cooldowns else result.full_symbol
-                if datetime.now(timezone.utc) < self.cooldowns[cooldown_key]:
-                    kalan_dk = int((self.cooldowns[cooldown_key] - datetime.now(timezone.utc)).total_seconds() / 60)
+                if now < self.cooldowns[cooldown_key]:
+                    kalan_dk = int((self.cooldowns[cooldown_key] - now).total_seconds() / 60)
                     logger.info(f"   ❄️ {result.coin} işlemi REDDEDİLDİ: Soğuma süresinde (Kalan: {kalan_dk} dk)")
                     result.status = "cooldown"
                     return result
@@ -533,8 +770,8 @@ class MLTradingPipeline:
             logger.info(f"   🚫 {result.coin} API tarafından daha önce reddedildi. 1 saat soğumaya alınıyor.")
             if not hasattr(self, 'cooldowns'):
                  self.cooldowns = {}
-            self.cooldowns[result.coin] = datetime.now(timezone.utc) + timedelta(hours=1)
-            self.cooldowns[result.full_symbol] = datetime.now(timezone.utc) + timedelta(hours=1)
+            self.cooldowns[result.coin] = now + timedelta(hours=1)
+            self.cooldowns[result.full_symbol] = now + timedelta(hours=1)
             return result
 
         if result.status != "ready" or result.ml_result is None:
@@ -546,36 +783,38 @@ class MLTradingPipeline:
 
         try:
             try:
-                exchange = self.executor._get_exchange() 
+                exchange = self.executor._get_exchange()
                 ticker = exchange.fetch_ticker(result.full_symbol)
                 live_price = ticker['last']
-                
+
                 if live_price is None or live_price <= 0:
                     raise ValueError(f"Geçersiz canlı fiyat: {live_price}")
-                    
-                current_balance = self.paper_trader.balance if self.dry_run else self._balance
-                self.risk_manager.update_state(balance=current_balance)
-                
+
+                # RiskManager state'ini TAM güncel değerlerle besle (v2.1.4)
+                self._sync_risk_manager()
+
                 trade_calc = self.risk_manager.calculate_trade(
                     symbol      = result.full_symbol,
                     direction   = direction,
                     entry_price = live_price,
                     atr         = result.atr,
                 )
-                
+
                 if not trade_calc.is_approved():
-                    logger.warning(f"   ⚠️ {result.coin} yeni canlı fiyatla riskten geçemedi.")
+                    logger.warning(
+                        f"   ⚠️ {result.coin} riskten geçemedi: "
+                        f"{trade_calc.rejection_reasons}"
+                    )
                     result.status = "risk_rejected"
                     return result
-                    
+
                 result.price         = live_price
                 result.sl_price      = trade_calc.stop_loss.price
                 result.tp_price      = trade_calc.take_profit.price
-                # TradeCalculation objesi: position.size, position.leverage, take_profit.risk_reward
                 result.position_size = trade_calc.position.size
                 result.leverage      = trade_calc.position.leverage
                 result.risk_reward   = trade_calc.take_profit.risk_reward
-                
+
             except Exception as live_err:
                 logger.error(f"   ❌ {result.coin} canlı fiyat çekme hatası: {live_err}")
                 result.status = "live_price_error"
@@ -593,10 +832,10 @@ class MLTradingPipeline:
                     symbol        = result.coin,
                     full_symbol   = result.full_symbol,
                     direction     = direction,
-                    entry_price   = result.price,          
-                    stop_loss     = result.sl_price,        
-                    take_profit   = result.tp_price,        
-                    position_size = result.position_size,  
+                    entry_price   = result.price,
+                    stop_loss     = result.sl_price,
+                    take_profit   = result.tp_price,
+                    position_size = result.position_size,
                     leverage      = result.leverage,
                     ic_confidence = result.ic_confidence,
                     ic_direction  = result.ic_direction,
@@ -605,7 +844,7 @@ class MLTradingPipeline:
                 )
                 result.trade_executed = True
                 result.status = "executed"
-                
+
                 if self.notifier.is_configured():
                     msg = (f"🧪 <b>SANAL İŞLEM AÇILDI</b>\n"
                            f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -653,18 +892,18 @@ class MLTradingPipeline:
                         symbol_for_check
                     )
                 except Exception:
-                    has_existing_orders = False  
+                    has_existing_orders = False
 
                 exec_res = self.executor.execute_trade(
                     trade_calc,
-                    skip_sl=has_existing_orders,  
-                    skip_tp=has_existing_orders,  
+                    skip_sl=has_existing_orders,
+                    skip_tp=has_existing_orders,
                 )
 
                 if exec_res.success:
                     result.trade_executed = True
                     result.status = "executed"
-                    
+
                     if self.notifier.is_configured():
                         msg = (f"🔴 <b>CANLI İŞLEM AÇILDI</b>\n"
                                f"━━━━━━━━━━━━━━━━━━━━━\n"
@@ -680,13 +919,13 @@ class MLTradingPipeline:
                         import pandas as pd
                         from pathlib import Path
                         import uuid
-                        
+
                         log_dir = Path("logs")
                         log_dir.mkdir(parents=True, exist_ok=True)
                         excel_path = log_dir / "live_trades.xlsx"
-                        
+
                         islem_hacmi = exec_res.actual_entry * result.position_size
-                        
+
                         yeni_islem = {
                             "ID": str(uuid.uuid4())[:8],
                             "Tarih (Açılış)": datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f"),
@@ -714,16 +953,15 @@ class MLTradingPipeline:
                             "Çıkış Nedeni": "",
                             "Süre (dk)": ""
                         }
-                        
+
                         df_yeni = pd.DataFrame([yeni_islem])
-                        
+
                         if excel_path.exists():
                             df_mevcut = pd.read_excel(excel_path)
                             df_son = pd.concat([df_mevcut, df_yeni], ignore_index=True)
                         else:
                             df_son = df_yeni
-                            
-                        # YENİ METOD BURADA ÇAĞIRILIYOR
+
                         self._export_live_trades_to_xlsx(df_son, excel_path)
                         logger.info(f"📊 Canlı işlem Paper formatında Excel'e eklendi: {result.coin}")
                     except Exception as e:
@@ -734,8 +972,8 @@ class MLTradingPipeline:
                     logger.error(f"   ❌ Canlı işlem açılamadı: {exec_res.error}")
                     if not hasattr(self, 'cooldowns'):
                         self.cooldowns = {}
-                    self.cooldowns[result.coin] = datetime.now(timezone.utc) + timedelta(hours=1)
-                    self.cooldowns[result.full_symbol] = datetime.now(timezone.utc) + timedelta(hours=1)
+                    self.cooldowns[result.coin] = now + timedelta(hours=1)
+                    self.cooldowns[result.full_symbol] = now + timedelta(hours=1)
                     logger.info(f"   🚫 {result.coin} API tarafından reddedildiği için 1 saat soğumaya alındı.")
 
             if result.trade_executed:
@@ -777,34 +1015,32 @@ class MLTradingPipeline:
         return result
 
     def _check_open_positions(self):
-        # Arka planda 30 saniyede bir kontrol yapılacağı için terminal kalabalığı yaratmaması adına log seviyesi debug yapıldı
         logger.debug("\n🔍 Açık pozisyonlar kontrol ediliyor...")
-        
+
         if self.dry_run:
-            from paper_trader import TradeStatus  
-            open_trades_dict = self.paper_trader.open_trades 
-            
+            from paper_trader import TradeStatus
+            open_trades_dict = self.paper_trader.open_trades
+
             if not open_trades_dict:
                 return
 
             closed_count = 0
             trades_to_check = list(open_trades_dict.values())
-            
+
             for trade in trades_to_check:
                 try:
                     fetch_symbol = trade.symbol if "USDT" in trade.symbol else f"{trade.symbol}/USDT"
-                    # Paper trader için de son 75 dk yerine sadece son 5 dakikayı kontrol et
                     ohlcv = self.fetcher.fetch_ohlcv(fetch_symbol, timeframe="1m", limit=5)
-                    
+
                     if ohlcv is not None and not ohlcv.empty:
                         max_high = float(ohlcv['high'].max())
                         min_low = float(ohlcv['low'].min())
                         current_price = float(ohlcv['close'].iloc[-1])
-                        
+
                         close_reason = None
                         exit_price = None
                         status = None
-                        
+
                         if trade.direction == "LONG":
                             if min_low <= trade.stop_loss:
                                 close_reason = "SL Hit"
@@ -823,7 +1059,7 @@ class MLTradingPipeline:
                                 close_reason = "TP Hit"
                                 exit_price = trade.take_profit
                                 status = TradeStatus.CLOSED_TP
-                        
+
                         if close_reason:
                             if close_reason == "SL Hit":
                                 self.cooldowns[trade.symbol] = datetime.now(timezone.utc) + timedelta(hours=2)
@@ -831,21 +1067,21 @@ class MLTradingPipeline:
                                 logger.info(f"   ❄️ {trade.symbol} SL oldu! 2 saat soğuma süresine alındı.")
                             else:
                                 logger.info(f"   🎯 {trade.symbol} {close_reason}! Hedefe ulaşıldı.")
-                            
+
                             try:
                                 if hasattr(self.executor, 'cancel_all_orders'):
                                     self.executor.cancel_all_orders(trade.full_symbol)
                                     logger.info(f"   🧹 {trade.symbol} için kalan emirler iptal edildi")
                             except Exception as cancel_err:
                                 logger.warning(f"   ⚠️ {trade.symbol} emir iptal hatası: {cancel_err}")
-                            
+
                             self.paper_trader._close_trade(trade, exit_price, status, close_reason)
                             closed_count += 1
                             logger.info(f"   ✅ {trade.symbol} işlemi kapandı! Neden: {close_reason} | Fiyat: ${exit_price:,.4f}")
 
                             if self.notifier.is_configured():
                                 pnl_emoji = "✅ KÂR" if trade.net_pnl > 0 else "❌ ZARAR"
-                                
+
                                 msg = (f"{pnl_emoji} <b>({close_reason})</b>\n"
                                        f"━━━━━━━━━━━━━━━━━━━━━\n"
                                        f"🪙 <b>Coin:</b> {trade.symbol}\n"
@@ -853,17 +1089,17 @@ class MLTradingPipeline:
                                        f"💰 <b>Net PnL:</b> ${trade.net_pnl:+.2f} ({trade.pnl_percent:+.2f}%)\n"
                                        f"🏦 <b>Güncel Kasa:</b> ${self.paper_trader.balance:,.2f}")
                                 self.notifier.send_message_sync(msg)
-                            
+
                             try:
                                 matched = False
                                 for mem_id, mem_trade in list(self.trade_memory.open_trades.items()):
                                     if mem_trade.symbol == trade.full_symbol or mem_trade.coin == trade.symbol:
                                         actual_pnl = trade.pnl_absolute if trade.pnl_absolute else 0.0
                                         self.trade_memory.close_trade(
-                                            trade_id=mem_id,             
-                                            exit_price=exit_price,       
-                                            pnl=actual_pnl,              
-                                            exit_reason=close_reason,    
+                                            trade_id=mem_id,
+                                            exit_price=exit_price,
+                                            pnl=actual_pnl,
+                                            exit_reason=close_reason,
                                         )
                                         matched = True
                                         logger.info(f"   🧠 Memory güncellendi: {trade.symbol} → {close_reason} | PnL: ${actual_pnl:+.2f}")
@@ -875,7 +1111,7 @@ class MLTradingPipeline:
 
                 except Exception as e:
                     logger.error(f"   ❌ {trade.symbol} pozisyon kontrolünde hata: {e}")
-            
+
             if closed_count > 0:
                 logger.info(f"   Mevcut Bakiye: ${self.paper_trader.balance:.2f}")
 
@@ -889,9 +1125,6 @@ class MLTradingPipeline:
                     logger.error(f"   ❌ Binance pozisyon çekme hatası: {e}")
                     return
 
-                # =====================================================================
-                # 🛠️ GÜÇLÜ POZİSYON BÜYÜKLÜĞÜ VE SEMBOL EŞLEŞTİRMESİ
-                # =====================================================================
                 active_coins = set()
                 for p in real_positions:
                     size_ccxt = p.get('contracts')
@@ -915,9 +1148,7 @@ class MLTradingPipeline:
                         coin_name = str(p['symbol']).split('/')[0].split(':')[0].replace('USDT', '')
                         active_coins.add(coin_name)
 
-                # Memory'de açık trade yoksa trade döngüsünü atla ama orphan check hâlâ çalışsın
                 if not hasattr(self.trade_memory, 'open_trades') or not self.trade_memory.open_trades:
-                    # Orphan check — memory boş olsa bile Binance'te kalmış emirleri temizle
                     try:
                         exchange = self.executor._get_exchange()
                         if hasattr(exchange, 'options'):
@@ -948,7 +1179,7 @@ class MLTradingPipeline:
 
                 for mem_id, mem_trade in list(self.trade_memory.open_trades.items()):
                     mem_coin = str(mem_trade.coin).replace('USDT', '').split('/')[0].split(':')[0]
-                    
+
                     opened_time = datetime.fromisoformat(mem_trade.opened_at)
                     if opened_time.tzinfo is None:
                         opened_time = opened_time.replace(tzinfo=timezone.utc)
@@ -958,25 +1189,23 @@ class MLTradingPipeline:
                         if time_open_sec <= 120:
                             logger.debug(f"   ⏳ {mem_coin} borsa onayı bekleniyor... (Kalan: {int(120-time_open_sec)}s)")
                             continue
-                            
+
                         logger.info(f"   🔍 {mem_coin} pozisyonu kapalı bulundu → kapanış nedeni araştırılıyor...")
-                        
-                        close_reason = "Manuel / API"  
-                        exit_price = mem_trade.entry_price  
-                        
+
+                        close_reason = "Manuel / API"
+                        exit_price = mem_trade.entry_price
+
                         try:
-                            # 🛠️ DÜZELTME: Eski fiyatların karışmaması için 1 dakikalık mumlarla sadece son 5 dakikaya bak
                             ohlcv = self.fetcher.fetch_ohlcv(mem_trade.symbol, timeframe="1m", limit=5)
-                            
+
                             if ohlcv is not None and not ohlcv.empty:
                                 max_high = float(ohlcv['high'].max())
                                 min_low = float(ohlcv['low'].min())
                                 current_price = float(ohlcv['close'].iloc[-1])
-                                
-                                # Eğer mumlar iğneyi yakalayamazsa mesafeye göre hesap yap (Sağlamlaştırma)
+
                                 dist_tp = abs(current_price - float(mem_trade.tp_price))
                                 dist_sl = abs(current_price - float(mem_trade.sl_price))
-                                
+
                                 if mem_trade.direction == "LONG":
                                     if min_low <= mem_trade.sl_price:
                                         close_reason = "SL Hit"
@@ -987,7 +1216,7 @@ class MLTradingPipeline:
                                     else:
                                         close_reason = "TP Hit" if dist_tp < dist_sl else "SL Hit"
                                         exit_price = mem_trade.tp_price if dist_tp < dist_sl else mem_trade.sl_price
-                                
+
                                 elif mem_trade.direction == "SHORT":
                                     if max_high >= mem_trade.sl_price:
                                         close_reason = "SL Hit"
@@ -998,40 +1227,39 @@ class MLTradingPipeline:
                                     else:
                                         close_reason = "TP Hit" if dist_tp < dist_sl else "SL Hit"
                                         exit_price = mem_trade.tp_price if dist_tp < dist_sl else mem_trade.sl_price
-                        
+
                         except Exception as ohlcv_err:
                             logger.warning(f"   ⚠️ {mem_coin} OHLCV kontrol hatası: {ohlcv_err}")
-                        
+
                         safe_entry = float(mem_trade.entry_price or 0)
                         safe_exit = float(exit_price or safe_entry)
                         safe_size = float(mem_trade.position_size or 0)
                         safe_leverage = int(mem_trade.leverage or 1)
-                        
+
                         if mem_trade.direction == "LONG":
                             pnl_val = (safe_exit - safe_entry) * safe_size
                         else:
                             pnl_val = (safe_entry - safe_exit) * safe_size
-                        
-                        # YENİ: Binance standart Taker (Piyasa Alıcı) komisyonu %0.04 üzerinden Fee hesaplanıyor
+
                         fee_val = (safe_entry * safe_size * 0.0004) + (safe_exit * safe_size * 0.0004)
                         net_pnl_val = pnl_val - fee_val
-                        
+
                         pnl_pct = (pnl_val / (safe_entry * safe_size)) * 100 * safe_leverage if (safe_entry * safe_size) > 0 else 0.0
-                        
+
                         if close_reason == "SL Hit":
                             self.cooldowns[mem_coin] = datetime.now(timezone.utc) + timedelta(hours=2)
                             self.cooldowns[mem_trade.symbol] = datetime.now(timezone.utc) + timedelta(hours=2)
                             logger.info(f"   ❄️ {mem_coin} SL oldu! 2 saat soğuma süresine alındı.")
                         else:
                             logger.info(f"   🎯 {mem_coin} {close_reason}! Hedefe ulaşıldı.")
-                        
+
                         try:
                             if hasattr(self.executor, 'cancel_all_orders'):
                                 self.executor.cancel_all_orders(mem_trade.symbol)
                                 logger.info(f"   🧹 {mem_coin} için kalan emirler iptal edildi")
                         except Exception as cancel_err:
                             logger.warning(f"   ⚠️ {mem_coin} emir temizleme hatası: {cancel_err}")
-                        
+
                         try:
                             self.trade_memory.close_trade(
                                 trade_id    = mem_id,
@@ -1055,61 +1283,57 @@ class MLTradingPipeline:
                                 self.notifier.send_message_sync(msg)
                         except Exception as tg_err:
                             logger.warning(f"   ⚠️ Telegram bildirimi gönderilemedi: {tg_err}")
-                        
+
                         try:
                             from pathlib import Path
                             import pandas as pd
-                            
+
                             log_dir = Path("logs")
                             excel_path = log_dir / "live_trades.xlsx"
-                            
+
                             if excel_path.exists():
                                 df = pd.read_excel(excel_path)
-                                
+
                                 for col in ['Tarih (Kapanış)', 'Çıkış Nedeni', 'Durum']:
                                     if col in df.columns:
                                         df[col] = df[col].astype(object)
-                                        
+
                                 for col in ['Çıkış ($)', 'PnL ($)', 'PnL (%)']:
                                     if col in df.columns:
                                         df[col] = df[col].astype(float)
-                                
+
                                 mask = (df['Coin'] == mem_coin) & (df['Durum'] == 'open')
-                                
+
                                 if mask.any():
                                     idx = df[mask].index[-1]
-                                    
+
                                     kapanis_zamani = datetime.now()
                                     df.at[idx, 'Tarih (Kapanış)'] = kapanis_zamani.strftime("%Y-%m-%dT%H:%M:%S.%f")
-                                    
-                                    # YENİ: Süre hesaplaması
+
                                     try:
                                         acilis_str = str(df.at[idx, 'Tarih (Açılış)'])
                                         acilis_zamani = pd.to_datetime(acilis_str)
                                         df.at[idx, 'Süre (dk)'] = int((kapanis_zamani - acilis_zamani).total_seconds() / 60)
                                     except Exception:
                                         df.at[idx, 'Süre (dk)'] = 0
-                                        
+
                                     df.at[idx, 'Çıkış ($)'] = safe_exit
                                     df.at[idx, 'Çıkış Nedeni'] = close_reason
                                     df.at[idx, 'PnL ($)'] = round(pnl_val, 4)
                                     df.at[idx, 'PnL (%)'] = round(pnl_pct, 2)
-                                    df.at[idx, 'Fee ($)'] = round(fee_val, 4)          # YENİ
-                                    df.at[idx, 'Net PnL ($)'] = round(net_pnl_val, 4)  # YENİ
+                                    df.at[idx, 'Fee ($)'] = round(fee_val, 4)
+                                    df.at[idx, 'Net PnL ($)'] = round(net_pnl_val, 4)
                                     df.at[idx, 'Durum'] = "closed"
-                                    
-                                    # YENİ METOD BURADA ÇAĞIRILIYOR
+
                                     self._export_live_trades_to_xlsx(df, excel_path)
                                     logger.info(f"   📊 Excel güncellendi: {mem_trade.coin} ({close_reason}) | PnL: ${pnl_val:+.2f}")
                                 else:
                                     logger.warning(f"   ⚠️ Excel'de 'open' statüsünde {mem_coin} kaydı bulunamadı!")
                         except Exception as e:
                             logger.error(f"   ❌ Excel güncelleme hatası: {e}", exc_info=True)
-                                
+
                         closed_count += 1
 
-                # YENİ: Memory'de olmayan ama Excel'de 'open' kalmış orphan işlemleri kapat
-                # (Bot restart sonrası memory sıfırlandığında oluşan bug için)
                 try:
                     closed_count += self._reconcile_excel_orphans(active_coins)
                 except Exception as rec_err:
@@ -1117,28 +1341,28 @@ class MLTradingPipeline:
 
                 if closed_count > 0:
                     logger.info(f"   🧹 {closed_count} işlemin kontrolü ve temizliği tamamlandı.")
-                
+
                 try:
                     exchange = self.executor._get_exchange()
-                    
+
                     if hasattr(exchange, 'options'):
                         exchange.options["warnOnFetchOpenOrdersWithoutSymbol"] = False
-                    
+
                     all_open_orders = exchange.fetch_open_orders()
-                    
+
                     if all_open_orders:
                         orphan_count = 0
                         for order in all_open_orders:
                             order_symbol = order.get('symbol', '')
                             order_id     = order.get('id', '?')
                             order_type   = order.get('type', '?')
-                            
+
                             has_position = False
                             for act_coin in active_coins:
-                                if act_coin in order_symbol: 
+                                if act_coin in order_symbol:
                                     has_position = True
                                     break
-                            
+
                             if not has_position:
                                 try:
                                     exchange.cancel_order(order_id, order_symbol)
@@ -1149,13 +1373,13 @@ class MLTradingPipeline:
                                         logger.debug(f"   ℹ️ Orphan emir zaten yok: {order_id}")
                                     else:
                                         logger.warning(f"   ⚠️ Orphan emir silinemedi: {order_symbol} {order_id}: {cancel_err}")
-                        
+
                         if orphan_count > 0:
                             logger.info(f"   🧹 {orphan_count} sahipsiz (orphan) emir temizlendi.")
-                            
+
                 except Exception as orphan_err:
                     logger.warning(f"   ⚠️ Orphan emir kontrolü başarısız: {orphan_err}")
-                    
+
             except Exception as e:
                 logger.error(f"   ❌ Canlı pozisyon kontrol/temizlik hatası: {e}", exc_info=True)
 
@@ -1168,12 +1392,28 @@ class MLTradingPipeline:
                     f"| v{VERSION} | {'PAPER' if self.dry_run else 'CANLI'}")
         logger.info(f"{'═'*60}")
 
+        # ── Günlük state sıfırlama (gün değişimi kontrolü) ──
+        self._reset_daily_state_if_new_day()
+
+        # ── Kill switch (canlı bakiye refresh edilir) ──
         if self._check_kill_switch():
             report.status = CycleStatus.KILLED
             return report
 
         try:
+            # ── Açık pozisyon takibi ÖNCE çalışır: yeni kapanan trade'ler varsa
+            #    daily_pnl doğru hesaplansın. ──
             self._check_open_positions()
+
+            # ── Günlük kayıp limiti kontrolü (v2.1.4) ──
+            if self._check_daily_loss_limit():
+                report.status = CycleStatus.HALTED
+                report.daily_pnl = self._daily_realized_pnl
+                report.balance = self._balance
+                report.paper_balance = self.paper_trader.balance
+                report.elapsed = time.time() - start
+                self._log_cycle_summary(report)
+                return report
 
             logger.info(f"\n📡 Coin taraması (top {self.top_n})...")
             coins = self.scanner.scan(top_n=self.top_n)
@@ -1187,7 +1427,7 @@ class MLTradingPipeline:
 
             logger.info(f"\n🔬 ML analizi ({len(coins)} coin)...")
             results = []
-            
+
             if self.dry_run:
                 open_coins = [trade.symbol for trade in self.paper_trader.open_trades.values()]
             else:
@@ -1197,8 +1437,7 @@ class MLTradingPipeline:
                 if c.coin in open_coins:
                     logger.info(f"   ⏭️ {c.coin} atlanıyor (Zaten açık pozisyon var)")
                     continue
-                
-                # UTC Cooldown Kontrolü
+
                 if c.coin in self.cooldowns or c.symbol in self.cooldowns:
                     cooldown_key = c.coin if c.coin in self.cooldowns else c.symbol
                     if datetime.now(timezone.utc) < self.cooldowns[cooldown_key]:
@@ -1210,9 +1449,9 @@ class MLTradingPipeline:
                             del self.cooldowns[c.coin]
                         if c.symbol in self.cooldowns:
                             del self.cooldowns[c.symbol]
-                    
+
                 r = self._analyze_coin(c.symbol, c.coin)
-                
+
                 results.append(r)
                 report.total_analyzed += 1
                 if r.ic_confidence >= IC_TRADE:
@@ -1221,6 +1460,10 @@ class MLTradingPipeline:
             logger.info(f"\n💹 Execution...")
             for r in results:
                 if r.status == "ready":
+                    # ── Her execute öncesi tekrar halt kontrolü (güvenlik) ──
+                    if self._daily_halt_until and datetime.now(timezone.utc) < self._daily_halt_until:
+                        logger.info("   🛑 Döngü ortasında günlük halt devreye girdi — kalan sinyaller iptal")
+                        break
                     r = self._execute_trade(r)
                     if r.trade_executed:
                         report.total_traded += 1
@@ -1228,6 +1471,7 @@ class MLTradingPipeline:
             report.coins        = results
             report.paper_balance= self.paper_trader.balance
             report.balance      = self._balance
+            report.daily_pnl    = self._daily_realized_pnl
 
             pt_stats = self.paper_trader.get_summary()
             total_closed = pt_stats.get("closed_trades", 0)
@@ -1235,18 +1479,18 @@ class MLTradingPipeline:
 
             retrain_threshold = 30
             current_retrain_count = getattr(self.lgbm_model, 'retrain_count', 0)
-            
+
             if total_closed >= retrain_threshold:
                 target_retrain_count = total_closed // retrain_threshold
-                
+
                 if target_retrain_count > current_retrain_count:
                     logger.info(f"\n🧠 [RETRAIN] {total_closed} kapalı işleme ulaşıldı! Model kendi tecrübelerinden yeniden eğitiliyor...")
                     try:
                         if hasattr(self, 'retrain_from_experience'):
-                            self.retrain_from_experience() 
+                            self.retrain_from_experience()
                     except Exception as e:
                         logger.error(f"Eğitim tetiklenemedi: {e}")
-                    
+
                     self.lgbm_model.retrain_count = target_retrain_count
 
             next_target = ((total_closed // retrain_threshold) + 1) * retrain_threshold
@@ -1278,44 +1522,44 @@ class MLTradingPipeline:
 
     def retrain_from_experience(self):
         logger.info("🧠 Kendi tecrübelerinden öğrenme (Retrain) başlatılıyor...")
-        
+
         try:
             memory_file = self.trade_memory.log_dir / "ml_trade_memory.json"
             if not memory_file.exists():
                 logger.warning("   ⚠️ Trade hafızası bulunamadı, standart BTC eğitimine dönülüyor.")
                 return self.initial_train()
-                
+
             import json
             with open(memory_file, 'r', encoding='utf-8') as f:
                 trades = json.load(f)
-                
+
             closed_trades = [t for t in trades if t.get('exit_reason') or t.get('pnl', 0) != 0]
-            
+
             if len(closed_trades) < 30:
                 logger.warning(f"   ⚠️ Yeterli kapalı işlem yok ({len(closed_trades)} < 30), standart eğitime dönülüyor.")
                 return self.initial_train()
 
             rows_X = []
             rows_y = []
-            
+
             for t in closed_trades:
                 fv = t.get('feature_snapshot', {})
                 if not fv:
                     continue
-                    
+
                 direction = t.get('direction', '')
                 exit_reason = t.get('exit_reason', '')
                 pnl = t.get('pnl', 0.0)
-                
+
                 won = (exit_reason == "TP Hit" or pnl > 0)
-                
+
                 if direction == "LONG":
                     target = 1 if won else 0
                 elif direction == "SHORT":
                     target = 0 if won else 1
                 else:
                     continue
-                    
+
                 rows_X.append(fv)
                 rows_y.append(target)
 
@@ -1324,19 +1568,19 @@ class MLTradingPipeline:
 
             win_ratio = sum(rows_y) / len(rows_y) * 100
             logger.info(f"   📥 Hafızadan {len(rows_X)} adet gerçek işlem tecrübesi yüklendi. (Piyasa yönü=LONG oranı: %{win_ratio:.1f})")
-            
+
             X_experience = pd.DataFrame(rows_X).replace([np.inf, -np.inf], np.nan)
             y_experience = pd.Series(rows_y)
-            
+
             metrics = self.lgbm_model.train(X_experience, y_experience)
-            
+
             logger.info(f"✅ Gerçek işlemlerden öğrenildi! Yeni Win Rate: %{metrics.accuracy*100:.1f}")
             return True
 
         except Exception as e:
             logger.error(f"❌ Tecrübeden öğrenme (Retrain) hatası: {e}", exc_info=True)
             return False
-    
+
     def initial_train(self, symbol: str = "BTC/USDT:USDT") -> bool:
         logger.info(f"🎓 İlk eğitim: {symbol} 1h verisi kullanılıyor...")
 
@@ -1365,16 +1609,15 @@ class MLTradingPipeline:
             class DummyAnalysis:
                 def __init__(self, sym):
                     self.symbol          = sym
-                    self.coin            = sym.split('/')[0] # 'BTC/USDT:USDT' gibi bir stringden 'BTC' kısmını ayırır.
+                    self.coin            = sym.split('/')[0]
                     self.price           = 0.0
                     self.change_24h      = 0.0
                     self.volume_24h      = 0.0
                     self.ic_confidence   = 65.0
                     self.ic_direction    = 'NEUTRAL'
                     self.significant_count = 10
-                    # Model ilk kez eğitilirken geçmişte 'unknown' rejim görmemesi için varsayılan olarak 'trending' atıyoruz.
-                    self.market_regime   = 'trending' 
-                    self.category_tops   = {}              
+                    self.market_regime   = 'trending'
+                    self.category_tops   = {}
                     self.tf_rankings     = []
                     self.atr             = 0.0
                     self.atr_pct         = 0.0
@@ -1388,10 +1631,9 @@ class MLTradingPipeline:
             rows_X = []
             rows_y = []
 
-            train_cat_tops = {}                                    
+            train_cat_tops = {}
             all_scores = self.selector.evaluate_all_indicators(df_ind, target_col)
-            
-            # İndikatörleri istatistiksel özelliklerine göre kategorize edip grupluyoruz.
+
             CATEGORIES = {
                 'volume':  ['OBV', 'CMF', 'VPT', 'FI', 'EOM', 'ADI', 'NVI'],
                 'momentum':['RSI', 'Stoch', 'MFI', 'UO', 'MACD', 'PPO', 'ROC','TSI', 'CCI', 'Williams'],
@@ -1435,7 +1677,7 @@ class MLTradingPipeline:
                                             matched.append(s)
                                             break
                         cat_scores = matched
-                        
+
                     if cat_scores:
                         top = max(cat_scores, key=lambda s: abs(s.ic_mean))
                         dynamic_cat_tops = {}
@@ -1457,11 +1699,11 @@ class MLTradingPipeline:
                                                 matched.append(s)
                                                 break
                                 cat_scores = matched
-                                
+
                             if cat_scores:
                                 top = max(cat_scores, key=lambda s: abs(s.ic_mean))
                                 dynamic_cat_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
-                    
+
                     analysis_stub.category_tops = dynamic_cat_tops
 
                 fv = self.feature_eng.build_features(
@@ -1491,14 +1733,14 @@ class MLTradingPipeline:
             y = pd.Series(rows_y)
 
             metrics = self.lgbm_model.train(X, y)
-            
+
             try:
                 from pathlib import Path
-                
+
                 report_dir = Path("logs/reports")
                 report_dir.mkdir(parents=True, exist_ok=True)
                 report_path = report_dir / "model_egitim_raporu.xlsx"
-                
+
                 with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
                     df_metrics = pd.DataFrame([{
                         "Tarih": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1509,7 +1751,7 @@ class MLTradingPipeline:
                         "F1 Skoru": getattr(metrics, 'f1', 0.0)
                     }])
                     df_metrics.to_excel(writer, sheet_name="1_Genel_Metrikler", index=False)
-                    
+
                     if hasattr(self.lgbm_model, 'model') and self.lgbm_model.model is not None:
                         importance = self.lgbm_model.model.feature_importances_
                         df_imp = pd.DataFrame({
@@ -1517,12 +1759,12 @@ class MLTradingPipeline:
                             "Önem Puanı": importance
                         }).sort_values(by="Önem Puanı", ascending=False)
                         df_imp.to_excel(writer, sheet_name="2_Kolon_Onemleri", index=False)
-                    
+
                     df_raw = X.copy()
                     df_raw['TARGET_SONUC'] = y.values
                     df_raw['TARGET_ACIKLAMA'] = df_raw['TARGET_SONUC'].apply(lambda x: "KÂR (1)" if x == 1 else "ZARAR (0)")
                     df_raw.to_excel(writer, sheet_name="3_Gecmis_Ham_Veri", index=False)
-                    
+
                 logger.info(f"📊 Detaylı Eğitim Raporu Excel olarak kaydedildi: {report_path}")
             except Exception as ex:
                 logger.error(f"⚠️ Excel raporu oluşturulurken hata: {ex}")
@@ -1536,7 +1778,7 @@ class MLTradingPipeline:
 
     def _log_cycle_summary(self, report: CycleReport) -> None:
         emoji = {"success":"✅","partial":"⚡","no_signal":"😴",
-                 "error":"❌","killed":"⛔"}.get(report.status.value, "❓")
+                 "error":"❌","killed":"⛔","halted":"🛑"}.get(report.status.value, "❓")
         logger.info(f"\n{'─'*50}")
         logger.info(f"  {emoji} Döngü | Taranan={report.total_scanned} "
                     f"IC-geçen={report.total_above_gate} "
@@ -1544,35 +1786,35 @@ class MLTradingPipeline:
                     f"Süre={report.elapsed:.1f}s")
         if report.ml_stats:
             s = report.ml_stats
-            # Win rate satırını tamamen kaldırdık
             logger.info(f"   ML: eğitildi={s.get('model_trained')} | "
                         f"retrain#{s.get('retrain_count',0)}")
+        # Günlük PnL bilgisi (v2.1.4)
+        if self._daily_start_balance > 0:
+            loss_pct = (-self._daily_realized_pnl / self._daily_start_balance) * 100
+            halt_str = ""
+            if self._daily_halt_until:
+                halt_str = f" | HALT → {self._daily_halt_until.strftime('%H:%M UTC')}"
+            logger.info(
+                f"   Günlük: PnL=${self._daily_realized_pnl:+.2f} "
+                f"({loss_pct:+.2f}% / limit: %{cfg.risk.daily_max_loss_pct}){halt_str}"
+            )
         logger.info(f"{'─'*50}\n")
 
     def _export_live_trades_to_xlsx(self, df: pd.DataFrame, filepath: Path) -> None:
         """
         Canlı işlemleri paper_trade formatında Excel'e kaydeder.
-
-        DÜZELTMELER:
-          • PnL (%) artık ham yüzde olarak kaydediliyor; format '0.00"%"' (Excel
-            otomatik *100 yapmıyor). Eski kod her save'de değeri 100'e bölüyordu →
-            ~67 kayıttan sonra 4.8e-135 gibi saçma değerler oluşuyordu.
-          • Her export öncesi closed satırlarda Fee=0 / Net PnL=0 olanlar otomatik
-            backfill ediliyor (Binance taker %0.04 her yön ile).
         """
         try:
             from openpyxl import Workbook
             from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
             from openpyxl.utils import get_column_letter
         except ImportError:
-            df.to_excel(filepath, index=False)              # openpyxl yoksa fallback
+            df.to_excel(filepath, index=False)
             return
 
         try:
-            # ---------- BACKFILL: eski kapalı satırlarda Fee/Net PnL/PnL% eksikse hesapla ----------
-            TAKER = 0.0004                                  # Binance Futures taker komisyonu (%0.04)
+            TAKER = 0.0004
             if 'Durum' in df.columns:
-                # Sayısal kolonları float'a sabitle (int64 olursa ondalık atama hata verir)
                 for col in ('Giriş ($)', 'Çıkış ($)', 'Lot (Coin)', 'Kaldıraç',
                             'PnL ($)', 'PnL (%)', 'Fee ($)', 'Net PnL ($)'):
                     if col in df.columns:
@@ -1580,7 +1822,6 @@ class MLTradingPipeline:
 
                 closed_mask = df['Durum'] == 'closed'
 
-                # Fee==0 + PnL!=0 olan eski/bozuk satırları geriye dönük doldur
                 need_fix = closed_mask & (df['Fee ($)'].fillna(0) == 0) & (df['PnL ($)'].fillna(0) != 0)
                 if need_fix.any():
                     e = df.loc[need_fix, 'Giriş ($)'].fillna(0)
@@ -1590,7 +1831,6 @@ class MLTradingPipeline:
                     df.loc[need_fix, 'Fee ($)']     = fee_calc.round(4)
                     df.loc[need_fix, 'Net PnL ($)'] = (df.loc[need_fix, 'PnL ($)'] - fee_calc).round(4)
 
-                # PnL (%) bozulmuş (≈0 ama PnL$ var) satırları formülden yeniden hesapla
                 broken_pct = closed_mask & (df['PnL (%)'].abs().fillna(0) < 0.001) & (df['PnL ($)'].fillna(0) != 0)
                 if broken_pct.any():
                     e = df.loc[broken_pct, 'Giriş ($)'].fillna(0)
@@ -1604,7 +1844,6 @@ class MLTradingPipeline:
             ws_trades = wb.active
             ws_trades.title = "Trades"
 
-            # ---- Stil tanımları ----
             header_font = Font(name='Arial', bold=True, color='FFFFFF', size=10)
             header_fill = PatternFill(start_color='2F5496', end_color='2F5496', fill_type='solid')
             header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
@@ -1620,8 +1859,6 @@ class MLTradingPipeline:
                 top=Side(style='thin', color='D9D9D9'), bottom=Side(style='thin', color='D9D9D9')
             )
 
-            # ---- Sütun genişlikleri & formatları ----
-            # KRİTİK: PnL (%) formatı '0.00%' (çarpan var) DEĞİL, '0.00"%"' (text-percent)
             columns_def = {
                 "ID": (10, None), "Tarih (Açılış)": (18, None), "Tarih (Kapanış)": (18, None),
                 "Coin": (8, None), "Yön": (8, None), "Giriş ($)": (12, '#,##0.00'),
@@ -1629,7 +1866,7 @@ class MLTradingPipeline:
                 "Hacim ($)": (12, '#,##0.00'), "Kaldıraç": (10, '0"x"'),
                 "SL ($)": (12, '#,##0.00'), "TP ($)": (12, '#,##0.00'), "R:R": (8, '0.00'),
                 "PnL ($)": (10, '#,##0.00;(#,##0.00);"-"'),
-                "PnL (%)": (10, '0.00"%"'),                  # <-- DÜZELTİLDİ (çarpan yok)
+                "PnL (%)": (10, '0.00"%"'),
                 "Fee ($)": (10, '#,##0.00'),
                 "Net PnL ($)": (12, '#,##0.00;(#,##0.00);"-"'),
                 "IC Güven": (10, '0.0'), "IC Yön": (8, None), "TF": (6, None),
@@ -1639,23 +1876,20 @@ class MLTradingPipeline:
 
             headers = list(df.columns)
 
-            # Başlıkları yaz
             for col_idx, col_name in enumerate(headers, 1):
                 cell = ws_trades.cell(row=1, column=col_idx, value=col_name)
                 cell.font, cell.fill, cell.alignment = header_font, header_fill, header_alignment
                 width = columns_def.get(col_name, (12, None))[0]
                 ws_trades.column_dimensions[get_column_letter(col_idx)].width = width
 
-            ws_trades.freeze_panes = 'A2'                 # başlık satırını sabitle
+            ws_trades.freeze_panes = 'A2'
 
-            # Verileri yaz ve renklendir
             for r_idx, row in enumerate(df.values, 2):
                 for c_idx, val in enumerate(row, 1):
                     col_name = headers[c_idx-1]
                     if pd.isna(val):
                         val = ""
 
-                    # >>> ESKİ HATALI SATIR KALDIRILDI: PnL (%) artık /100 YAPILMIYOR
                     cell = ws_trades.cell(row=r_idx, column=c_idx, value=val)
                     cell.font, cell.border = data_font, thin_border
 
@@ -1680,24 +1914,20 @@ class MLTradingPipeline:
             if len(df) > 0:
                 ws_trades.auto_filter.ref = f"A1:{get_column_letter(len(headers))}{len(df) + 1}"
 
-            # ============ SUMMARY (ÖZET) SHEET ============
             ws_summary = wb.create_sheet("Summary")
             closed_df = df[df['Durum'] == 'closed'].copy()
             total_trades = len(df)
             closed_trades = len(closed_df)
             open_trades = total_trades - closed_trades
 
-            # Sütunların varlığından emin ol
             for col in ['PnL ($)', 'Net PnL ($)', 'Fee ($)']:
                 if col not in closed_df.columns:
                     closed_df[col] = 0.0
 
-            # Verileri güvenli şekilde sayısala çevir
             closed_df['PnL ($)']     = pd.to_numeric(closed_df['PnL ($)'], errors='coerce').fillna(0)
             closed_df['Net PnL ($)'] = pd.to_numeric(closed_df['Net PnL ($)'], errors='coerce').fillna(0)
             closed_df['Fee ($)']     = pd.to_numeric(closed_df['Fee ($)'], errors='coerce').fillna(0)
 
-            # Win Rate: Net PnL üzerinden (Fee artık doğru olduğu için doğru çalışır)
             winning  = int((closed_df['Net PnL ($)'] >  0).sum())
             losing   = int((closed_df['Net PnL ($)'] <= 0).sum())
             win_rate = (winning / closed_trades * 100) if closed_trades > 0 else 0.0
@@ -1721,7 +1951,6 @@ class MLTradingPipeline:
             total_return = ((self._balance - self._initial_balance) / self._initial_balance * 100) \
                            if self._initial_balance > 0 else 0.0
 
-            # ---- Summary stilleri ----
             title_font   = Font(name='Arial', bold=True, size=14, color='2F5496')
             section_font = Font(name='Arial', bold=True, size=11, color='2F5496')
             label_font   = Font(name='Arial', size=10)
@@ -1740,7 +1969,6 @@ class MLTradingPipeline:
             ws_summary.column_dimensions['C'].width = 15
 
             r = 4
-            # ---- Bakiye bölümü ----
             ws_summary.cell(row=r, column=1, value='💰 BAKİYE').font = section_font
             r += 1
             bakiye_rows = [
@@ -1759,7 +1987,6 @@ class MLTradingPipeline:
                     elif signed < 0: v_cell.font = neg_font
                 r += 1
 
-            # ---- Trade istatistikleri ----
             r += 1
             ws_summary.cell(row=r, column=1, value='📈 TRADE İSTATİSTİKLERİ').font = section_font
             r += 1
@@ -1772,7 +1999,6 @@ class MLTradingPipeline:
                 ws_summary.cell(row=r, column=2, value=val).font = value_font
                 r += 1
 
-            # ---- Performans metrikleri ----
             r += 1
             ws_summary.cell(row=r, column=1, value='📊 PERFORMANS METRİKLERİ').font = section_font
             r += 1
@@ -1787,7 +2013,6 @@ class MLTradingPipeline:
                 ws_summary.cell(row=r, column=2, value=val).font = value_font
                 r += 1
 
-            # ---- Günlük PnL tablosu ----
             r += 2
             ws_summary.cell(row=r, column=1, value='📅 GÜNLÜK PNL').font = section_font
             r += 1
@@ -1829,15 +2054,7 @@ class MLTradingPipeline:
 
     def _reconcile_excel_orphans(self, active_coins: set) -> int:
         """
-        Excel'de 'open' olarak duran ama:
-          • trade_memory.open_trades'de OLMAYAN
-          • Binance aktif pozisyonlarda (active_coins) OLMAYAN
-        işlemleri tespit eder; son 1m OHLCV'den TP/SL hangisi tetiklenmiş bulup
-        kapatır, Fee + Net PnL hesaplar, dosyayı yeniden kaydeder.
-
-        Bot restart sonrası memory sıfırlandığında oluşan 'orphan open' bug'ını çözer.
-
-        Returns: kapatılan satır sayısı
+        Excel'de 'open' olarak duran ama memory'de ve Binance'te olmayan trade'leri kapatır.
         """
         from pathlib import Path
 
@@ -1855,7 +2072,6 @@ class MLTradingPipeline:
         if 'Durum' not in df.columns:
             return 0
 
-        # Memory'de bilinen coin'ler — bunları atla, normal close döngüsü ilgileniyor
         mem_coins = set()
         if hasattr(self, 'trade_memory') and hasattr(self.trade_memory, 'open_trades'):
             for mt in self.trade_memory.open_trades.values():
@@ -1863,7 +2079,6 @@ class MLTradingPipeline:
                 if c:
                     mem_coins.add(c)
 
-        # Excel'de open olanlar
         open_rows = df[df['Durum'] == 'open']
         if open_rows.empty:
             return 0
@@ -1876,14 +2091,11 @@ class MLTradingPipeline:
             if not coin:
                 continue
 
-            # Hâlâ Binance'te açık → atla
             if coin in active_coins:
                 continue
-            # Memory'de takipte → normal close döngüsü ilgilenecek, atla
             if coin in mem_coins:
                 continue
 
-            # Bu satır gerçek bir orphan: memory'de yok, Binance'te yok, ama Excel'de open
             try:
                 entry     = float(row.get('Giriş ($)', 0) or 0)
                 size      = float(row.get('Lot (Coin)', 0) or 0)
@@ -1896,7 +2108,6 @@ class MLTradingPipeline:
                     logger.debug(f"   ⏭️ Orphan {coin}: yetersiz veri, atlandı")
                     continue
 
-                # OHLCV'den hangi seviye tetiklenmiş bul (son 200 dakika)
                 symbol = f"{coin}/USDT:USDT"
                 close_reason = "Manuel / API"
                 exit_price   = entry
@@ -1916,10 +2127,9 @@ class MLTradingPipeline:
                             elif max_high >= tp_price:
                                 close_reason, exit_price = "TP Hit", tp_price
                             else:
-                                # Mum tarayıcı yakalayamadıysa mesafeye göre tahmin
                                 close_reason = "TP Hit" if dist_tp < dist_sl else "SL Hit"
                                 exit_price   = tp_price if dist_tp < dist_sl else sl_price
-                        else:  # SHORT
+                        else:
                             if max_high >= sl_price:
                                 close_reason, exit_price = "SL Hit", sl_price
                             elif min_low <= tp_price:
@@ -1930,7 +2140,6 @@ class MLTradingPipeline:
                 except Exception as oe:
                     logger.warning(f"   ⚠️ Orphan {coin} OHLCV hatası: {oe}")
 
-                # PnL / Fee / Net PnL hesapla
                 if direction == "LONG":
                     pnl_val = (exit_price - entry) * size
                 else:
@@ -1940,7 +2149,6 @@ class MLTradingPipeline:
                 notional = entry * size
                 pnl_pct = (pnl_val / notional) * 100 * leverage if notional > 0 else 0.0
 
-                # DataFrame'i güncelle (dtype hatalarını önlemek için kolonları ayarla)
                 for col in ('Tarih (Kapanış)', 'Çıkış Nedeni', 'Durum'):
                     if col in df.columns:
                         df[col] = df[col].astype(object)
@@ -1958,14 +2166,12 @@ class MLTradingPipeline:
                 df.at[idx, 'Çıkış Nedeni']    = close_reason
                 df.at[idx, 'Durum']           = 'closed'
 
-                # Süre hesaplaması
                 try:
                     acilis = pd.to_datetime(str(row.get('Tarih (Açılış)', '')))
                     df.at[idx, 'Süre (dk)'] = int((datetime.now() - acilis.to_pydatetime()).total_seconds() / 60)
                 except Exception:
                     pass
 
-                # SL ise cooldown'a al (try/except DIŞINDA — bare except hatasını önle)
                 if close_reason == "SL Hit":
                     self.cooldowns[coin]   = datetime.now(timezone.utc) + timedelta(hours=2)
                     self.cooldowns[symbol] = datetime.now(timezone.utc) + timedelta(hours=2)
@@ -1999,7 +2205,6 @@ class MLTradingPipeline:
 # SCHEDULER
 # =============================================================================
 
-# Varsayılan çalışma süresi 10 dakika olarak güncellendi
 def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 10) -> None:
     pipeline._is_running = True
 
@@ -2031,19 +2236,19 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 10) -> No
             break
 
         logger.info(f"⏰ Sonraki Tarama: {(datetime.now()+timedelta(minutes=interval_minutes)).strftime('%H:%M:%S')}")
-        
-        # Bot uyurken de açık işlemleri (TP/SL) takip etmesi için özel döngü
+
         for i in range(interval_minutes * 60):
             if not pipeline._is_running:
                 break
-            
-            # Her 30 saniyede bir Binance API'yi yokla ve askıda kalanları temizle
+
             if i > 0 and i % 30 == 0:
                 try:
                     pipeline._check_open_positions()
+                    # Uyku sırasında da gün geçmiş mi / halt bitmiş mi kontrol et
+                    pipeline._reset_daily_state_if_new_day()
                 except Exception:
                     pass
-                    
+
             time.sleep(1)
 
     logger.info("🏁 Scheduler kapatıldı.")
@@ -2054,11 +2259,10 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 10) -> No
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="ML Crypto Bot v2.1.3")
+    parser = argparse.ArgumentParser(description="ML Crypto Bot v2.1.4")
     parser.add_argument("--live",     action="store_true", help="Canlı trade (ÖNERİLEN)")
     parser.add_argument("--top",      type=int, default=20, help="Top N coin")
     parser.add_argument("--schedule", action="store_true", help="Scheduler modu")
-    # Interval varsayılan değeri 10 dakikaya düşürüldü
     parser.add_argument("-i","--interval", type=int, default=10, help="Aralık (dk)")
     parser.add_argument("--report",   action="store_true", help="Performans raporu")
     parser.add_argument("--train",    action="store_true", help="Sadece eğitim")

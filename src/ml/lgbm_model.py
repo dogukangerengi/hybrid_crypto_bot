@@ -270,10 +270,10 @@ class LGBMSignalModel:
                     'num_leaves': 7,                   # 2^3 - 1 = 7 (max_depth ile tutarlı)
                     'learning_rate': 0.05,             # Yavaş öğrenme — daha stabil
                     'min_child_samples': 10,           # Her yaprakta min 10 sample
-                    'reg_alpha': 1.0,                  # L1 regularization (feature selection etkisi)
-                    'reg_lambda': 2.0,                 # L2 regularization (ağırlık shrinkage)
+                    'reg_alpha': 0.1,                  # L1 Lasso cezasını azalttık. Modelin ic_ skorlarını sıfırlamasını engeller.
+                    'reg_lambda': 1.0,                 # L2 Ridge cezasını azalttık. Ağırlıkların aşırı baskılanmasını önler.
                     'subsample': 0.8,                  # Her ağaçta %80 sample kullan (bagging)
-                    'colsample_bytree': 0.8,           # Her ağaçta %80 feature kullan
+                    'colsample_bytree': 0.2,           # (GÜNCELLENDİ) Ağaç her dalda kolonların sadece %20'sini görür.
                     'min_split_gain': 0.01,            # Minimum split kazancı
                     'random_state': self.seed,         # Tekrarlanabilirlik
                     'verbose': -1,                     # LightGBM sessiz mod
@@ -288,10 +288,10 @@ class LGBMSignalModel:
                 'num_leaves': 20,                      # Daha fazla yaprak
                 'learning_rate': 0.03,                 # Daha yavaş öğrenme
                 'min_child_samples': 5,                # Daha ince granülarite
-                'reg_alpha': 0.5,                      # Orta L1
+                'reg_alpha': 0.1,                      # Büyük veride de L1 cezasını düşürdük.
                 'reg_lambda': 1.0,                     # Orta L2
                 'subsample': 0.85,                     # %85 sample bagging
-                'colsample_bytree': 0.85,              # %85 feature bagging
+                'colsample_bytree': 0.2,               # (GÜNCELLENDİ) ic_ skorlarını kullanmaya zorlamak için agresif bagging (0.2).
                 'min_split_gain': 0.005,               # Daha düşük split eşiği
                 'random_state': self.seed,             # Tekrarlanabilirlik
                 'verbose': -1,                         # Sessiz mod
@@ -306,7 +306,7 @@ class LGBMSignalModel:
                     'learning_rate': 0.05,             # Yavaş öğrenme
                     'min_samples_leaf': 10,            # Min yaprak sample (lgb: min_child_samples)
                     'subsample': 0.8,                  # Stochastic gradient boosting
-                    'max_features': 0.8,               # Feature bagging (lgb: colsample_bytree)
+                    'max_features': 0.2,               # (GÜNCELLENDİ) Feature bagging.
                     'random_state': self.seed,         # Tekrarlanabilirlik
                 }
             return {
@@ -315,7 +315,7 @@ class LGBMSignalModel:
                 'learning_rate': 0.03,                 # Daha yavaş öğrenme
                 'min_samples_leaf': 5,                 # Daha ince granülarite
                 'subsample': 0.85,                     # %85 stochastic
-                'max_features': 0.85,                  # %85 feature
+                'max_features': 0.2,                   # (GÜNCELLENDİ) Feature bagging.
                 'random_state': self.seed,             # Tekrarlanabilirlik
             }
 

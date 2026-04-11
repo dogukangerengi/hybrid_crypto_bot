@@ -28,14 +28,14 @@ exchange:
 # -----------------------------------------------------------------------------
 risk:
   risk_per_trade_pct: 2.0                    # İşlem başına max risk (%)
-  max_open_positions: 10                      # Max açık pozisyon
+  max_open_positions: 5                      # Max açık pozisyon
   max_margin_per_trade_pct: 25.0             # İşlem başına max margin (%)
   max_total_margin_pct: 60.0                 # Toplam max margin (%)
   min_leverage: 2                            # Min kaldıraç
   max_leverage: 20                           # Max kaldıraç
   min_risk_reward_ratio: 1.5                 # Min RR oranı
-  max_sl_pct: 8.0                            # Max SL mesafesi (%)
-  daily_max_loss_pct: 6.0                    # Günlük max kayıp (%)
+  max_sl_pct: 6.0                            # Max SL mesafesi (%)
+  daily_max_loss_pct: 10.0                    # Günlük max kayıp (%)
   kill_switch_drawdown_pct: 15.0             # Kill switch DD (%)
 
 # -----------------------------------------------------------------------------
@@ -56,11 +56,10 @@ analysis:
   # Daha fazla veri = daha güvenilir IC (büyük örneklem)
   # Çok fazla = rejim değişikliği riski (non-stationarity)
   timeframes:
-    "15m": 1500                              # Day trading kısa vade
-    "30m": 1000                              # Trend konfirmasyonu
-    "1h":  1000                              # İntraday trend (ana TF)
-    "2h":  750                               # Swing noktaları
-    "4h":  500                               # Büyük resim
+    "5m": 1500                               # Çok hızlı işlemler için mikro trend
+    "15m": 1000                              # Kısa vadeli momentum
+    "30m": 1000                              # İntraday (gün içi) trend konfirmasyonu
+    "1h":  1000                               # Büyük resim ve ana yön
 
   # IC bazlı TF sıralama ağırlıkları
   # Composite score = weighted sum of these metrics
