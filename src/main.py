@@ -2,7 +2,7 @@
 # MAIN.PY — ML-DRIVEN TRADING PIPELINE v2.1.4 (BINANCE VADELİ İŞLEMLER)
 # =============================================================================
 # v2.1.4 Değişiklikler:
-#   ✅ Günlük %6 kayıp limiti AKTİF edildi (UTC bazlı, ertesi güne kadar halt)
+#   ✅ Günlük %6 kayıp limiti AKTİF edildi (TR yerel saati, 00:00 TR'e kadar halt)
 #   ✅ Toplam margin limitleri (%60) ve per-trade margin (%25) AKTİF
 #   ✅ Kill switch canlı bakiye + güncel PnL ile hesaplanıyor
 #   ✅ risk_manager.update_state() her döngüde daily_pnl + used_margin ile besleniyor
@@ -32,6 +32,14 @@ from enum import Enum
 from execution.risk_manager import RiskManager
 import numpy as np
 import pandas as pd
+
+# =============================================================================
+# YEREL SAAT DİLİMİ (Istanbul / Türkiye)
+# =============================================================================
+# Günlük kayıp limiti sayacı yerel geceyarısı (00:00 TR) ile sıfırlansın diye
+# tüm "günlük" hesaplamalar bu timezone üzerinden yapılır.
+# TR yaz saati uygulamasını kaldırdığı için sabit UTC+3 offset güvenlidir.
+LOCAL_TZ = timezone(timedelta(hours=3), name="TRT")
 
 # ── .env yükle ────────────────────────────────────────────────────────────────
 from dotenv import load_dotenv
@@ -77,6 +85,13 @@ MAX_OPEN_POSITIONS     = 5
 MAX_CONSECUTIVE_ERRORS = 5
 ERROR_COOLDOWN_SECONDS = 300
 
+# ── TIMEOUT EXIT (Time-Based Stop) ──
+# 24 saatten fazla açık kalmış pozisyonlar piyasa fiyatından kapatılır.
+# Mantık: Sinyal edge'i bayatlamış, slot fırsat maliyeti artıyor.
+# Kâr ile kapanan TIMEOUT trade'leri model retrain'inde WIN olarak öğrenilir
+# (trade_memory pnl > 0 ise outcome=WIN atar, exit_reason'a bakmaz).
+MAX_TRADE_AGE_HOURS    = 24
+
 DEFAULT_TIMEFRAMES = {
     '5m': 1500,
     '15m': 1000,
@@ -116,6 +131,7 @@ class CoinAnalysisResult:
     ic_direction:     str   = ""
     significant_count: int  = 0
     market_regime:    str   = ""
+    top_ic:           float = 0.0   # ← FIX 2: en güçlü tek indikatörün |IC| değeri
 
     category_tops:    Dict  = field(default_factory=dict)
     tf_rankings:      List  = field(default_factory=list)
@@ -200,11 +216,11 @@ class MLTradingPipeline:
         # ── GÜNLÜK KAYIP LİMİTİ STATE (v2.1.4) ──────────────────────────
         # UTC gününün başında bakiye snapshot'ı alınır.
         # Gün içinde toplam kapalı trade PnL'i bu değerin -%6'sına inerse
-        # _daily_halt_until ertesi gün UTC 00:00 olarak set edilir.
-        self._daily_date: Optional[str]           = None   # Aktif gün (UTC YYYY-MM-DD)
+        # _daily_halt_until ertesi gün 00:00 TR olarak set edilir (iç saklamada UTC-aware).
+        self._daily_date: Optional[str]           = None   # Aktif gün (TR YYYY-MM-DD)
         self._daily_start_balance: float          = 0.0    # Gün başı bakiye
         self._daily_realized_pnl: float           = 0.0    # Bugünkü gerçekleşen PnL
-        self._daily_halt_until: Optional[datetime] = None  # Halt bitiş zamanı (UTC)
+        self._daily_halt_until: Optional[datetime] = None  # Halt bitiş zamanı (UTC-aware datetime)
 
         self._restore_cooldowns()
 
@@ -290,11 +306,12 @@ class MLTradingPipeline:
                 logger.info(f"💰 Canlı bakiye: ${self._balance:.2f}")
 
             # ── Günlük state'i başlat (v2.1.4) ──
-            self._daily_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            # Yerel saat (TR) üzerinden bugünün tarihini al → 00:00 TR'de sıfırlanır
+            self._daily_date = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
             self._daily_start_balance = self._balance
             self._daily_realized_pnl = 0.0
             logger.info(
-                f"📅 Günlük limit başlangıcı: {self._daily_date} | "
+                f"📅 Günlük limit başlangıcı: {self._daily_date} (TR) | "
                 f"Start bakiye: ${self._daily_start_balance:.2f} | "
                 f"Max günlük kayıp: %{cfg.risk.daily_max_loss_pct}"
             )
@@ -349,18 +366,26 @@ class MLTradingPipeline:
 
     def _reset_daily_state_if_new_day(self) -> None:
         """
-        UTC gün değiştiyse günlük sayaçları sıfırla.
+        Yerel saate (TR) göre gün değiştiyse günlük sayaçları sıfırla.
+        00:00 TR (yani 21:00 UTC) saatinde yeni gün başlar.
         Aktif halt varsa ve bitiş zamanı geçtiyse onu da kaldırır.
         """
-        now = datetime.now(timezone.utc)
-        today = now.strftime("%Y-%m-%d")
+        # Halt için UTC karşılaştırması (datetime aware karşılaştırma için)
+        now_utc = datetime.now(timezone.utc)
+        # Tarih kıyaslaması için yerel saat (TR)
+        today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
 
         # Halt süresi dolduysa kaldır
-        if self._daily_halt_until and now >= self._daily_halt_until:
-            logger.info(f"🌅 Günlük halt süresi doldu ({self._daily_halt_until.strftime('%Y-%m-%d %H:%M UTC')}) — trade'e devam")
+        if self._daily_halt_until and now_utc >= self._daily_halt_until:
+            # Halt bitiş zamanını kullanıcıya TR saatiyle göster
+            halt_end_tr = self._daily_halt_until.astimezone(LOCAL_TZ)
+            logger.info(
+                f"🌅 Günlük halt süresi doldu "
+                f"({halt_end_tr.strftime('%Y-%m-%d %H:%M TR')}) — trade'e devam"
+            )
             self._daily_halt_until = None
 
-        # Yeni gün mü?
+        # Yeni gün mü? (TR saatine göre)
         if self._daily_date != today:
             old_day = self._daily_date
             # Yeni günün başlangıç bakiyesini güncel bakiye olarak snapshot'la
@@ -369,17 +394,18 @@ class MLTradingPipeline:
             self._daily_start_balance = self._balance
             self._daily_realized_pnl = 0.0
             logger.info(
-                f"📅 Yeni gün: {old_day} → {today} | "
+                f"📅 Yeni gün: {old_day} → {today} (TR) | "
                 f"Start bakiye: ${self._daily_start_balance:.2f}"
             )
 
     def _compute_daily_pnl(self) -> float:
         """
-        Bugün (UTC) kapanan tüm trade'lerin toplam PnL'ini hesapla.
+        Bugün (yerel saat TR) kapanan tüm trade'lerin toplam PnL'ini hesapla.
         Canlı mod: ml_trade_memory.json
         Paper mod: paper_trader.closed_trades
         """
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        # "Bugün" tanımı TR saatine göre (00:00 TR - 23:59 TR arası)
+        today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
         total = 0.0
 
         try:
@@ -400,7 +426,9 @@ class MLTradingPipeline:
                         closed_dt = datetime.fromisoformat(closed_at)
                         if closed_dt.tzinfo is None:
                             closed_dt = closed_dt.replace(tzinfo=timezone.utc)
-                        if closed_dt.strftime("%Y-%m-%d") == today:
+                        # ⏱️ Yerel saate çevirip TR gününe göre karşılaştır
+                        closed_dt_local = closed_dt.astimezone(LOCAL_TZ)
+                        if closed_dt_local.strftime("%Y-%m-%d") == today:
                             pnl = float(t.get('pnl', 0.0) or 0.0)
                             total += pnl
                     except (ValueError, TypeError):
@@ -420,7 +448,9 @@ class MLTradingPipeline:
                         closed_dt = closed_at
                     if closed_dt.tzinfo is None:
                         closed_dt = closed_dt.replace(tzinfo=timezone.utc)
-                    if closed_dt.strftime("%Y-%m-%d") == today:
+                    # ⏱️ Yerel saate çevirip TR gününe göre karşılaştır
+                    closed_dt_local = closed_dt.astimezone(LOCAL_TZ)
+                    if closed_dt_local.strftime("%Y-%m-%d") == today:
                         pnl = getattr(trade, 'net_pnl', None)
                         if pnl is None:
                             pnl = getattr(trade, 'pnl_absolute', 0.0) or 0.0
@@ -433,18 +463,23 @@ class MLTradingPipeline:
 
     def _check_daily_loss_limit(self) -> bool:
         """
-        Günlük %6 kayıp limitini kontrol et.
+        Günlük %X kayıp limitini kontrol et.
         
         Returns:
             True  → halt aktif, döngü durdurulmalı
             False → halt yok, trade'e devam
         """
-        now = datetime.now(timezone.utc)
+        now_utc = datetime.now(timezone.utc)
 
         # Zaten halt aktifse
-        if self._daily_halt_until and now < self._daily_halt_until:
-            kalan = (self._daily_halt_until - now).total_seconds() / 60
-            logger.info(f"⏸️ Günlük halt aktif — kalan: {kalan:.0f} dk (bitiş: {self._daily_halt_until.strftime('%H:%M UTC')})")
+        if self._daily_halt_until and now_utc < self._daily_halt_until:
+            kalan = (self._daily_halt_until - now_utc).total_seconds() / 60
+            # Halt bitişini TR saatiyle göster (kullanıcı dostu)
+            halt_end_tr = self._daily_halt_until.astimezone(LOCAL_TZ)
+            logger.info(
+                f"⏸️ Günlük halt aktif — kalan: {kalan:.0f} dk "
+                f"(bitiş: {halt_end_tr.strftime('%H:%M TR')})"
+            )
             return True
 
         # Bugünkü gerçekleşen PnL
@@ -464,16 +499,20 @@ class MLTradingPipeline:
         )
 
         if daily_loss_ratio >= max_loss_pct:
-            # Halt tetikle — ertesi gün UTC 00:00'a kadar
-            tomorrow = (now + timedelta(days=1)).replace(
+            # ⏰ Halt tetikle — YEREL GECEYARISINA kadar (00:00 TR)
+            # Önce yerel saati al, sonra yerel'de ertesi günün 00:00'ına ayarla,
+            # en son UTC'ye geri çevir ki datetime karşılaştırmaları tutarlı kalsın.
+            now_local = datetime.now(LOCAL_TZ)
+            tomorrow_local_midnight = (now_local + timedelta(days=1)).replace(
                 hour=0, minute=0, second=0, microsecond=0
             )
-            self._daily_halt_until = tomorrow
+            # İç saklamada UTC (kodun geri kalanı UTC-aware datetime kullanıyor)
+            self._daily_halt_until = tomorrow_local_midnight.astimezone(timezone.utc)
 
             logger.critical(
                 f"🛑 GÜNLÜK KAYIP LİMİTİ AŞILDI! "
                 f"Kayıp: ${daily_pnl:+.2f} ({daily_loss_ratio*100:.1f}% ≥ %{cfg.risk.daily_max_loss_pct}) "
-                f"| Halt bitişi: {tomorrow.strftime('%Y-%m-%d %H:%M UTC')}"
+                f"| Halt bitişi: {tomorrow_local_midnight.strftime('%Y-%m-%d %H:%M TR')}"
             )
 
             if self.notifier.is_configured():
@@ -485,7 +524,7 @@ class MLTradingPipeline:
                         f"📊 Kayıp: {daily_loss_ratio*100:.2f}% (limit: %{cfg.risk.daily_max_loss_pct})\n"
                         f"💰 Start: ${self._daily_start_balance:.2f}\n"
                         f"💰 Current: ${self._balance:.2f}\n"
-                        f"⏰ Halt bitişi: {tomorrow.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                        f"⏰ Halt bitişi: {tomorrow_local_midnight.strftime('%Y-%m-%d %H:%M TR')}\n"
                         f"━━━━━━━━━━━━━━━━━━━━━\n"
                         f"Yeni trade AÇILMAYACAK — mevcut açık pozisyonlar SL/TP ile takip ediliyor."
                     )
@@ -562,8 +601,15 @@ class MLTradingPipeline:
             logger.warning(f"  ⚠️ Rejim tespiti hatası: {e}")
             return 'ranging'
 
-    def _analyze_coin(self, symbol: str, coin: str) -> CoinAnalysisResult:
+    def _analyze_coin(self, symbol: str, coin: str, scan_result=None) -> CoinAnalysisResult:
         result = CoinAnalysisResult(coin=coin, full_symbol=symbol)
+
+        # ── FIX 1: Scanner'dan gelen 24h market verilerini kopyala ──
+        # mkt_change_24h ve mkt_volume_24h_log feature'ları için gerekli.
+        # Önceden bu alanlar default 0 kalıyordu → feature engineer hep 0 üretiyordu.
+        if scan_result is not None:
+            result.change_24h = float(getattr(scan_result, 'change_24h', 0.0) or 0.0)
+            result.volume_24h = float(getattr(scan_result, 'volume_24h', 0.0) or 0.0)
 
         try:
             all_data = {}
@@ -612,10 +658,18 @@ class MLTradingPipeline:
                 if len(significant) == 0:
                     significant = scores[:2]
 
+                # ── FIX 3: feature_engineer ctf_* feature'ları için 'score' ve 'direction' bekliyor ──
+                # Önceden sadece 'avg_ic' ve 'sig_count' vardı → feature_engineer 'score'u bulamıyordu
+                # → ctf_best_score, ctf_avg_score, ctf_score_std, ctf_score_spread hep 0 oluyordu.
+                tf_avg_signed = sum(s.ic_mean for s in valid_scores) / len(valid_scores)
+                tf_dir = 'LONG' if tf_avg_signed > 0 else ('SHORT' if tf_avg_signed < 0 else 'NEUTRAL')
+
                 tf_rankings.append({
                     'tf': tf,
                     'avg_ic': avg_ic,
+                    'score': avg_ic * 100,                                          # ← FIX 3
                     'sig_count': len([s for s in scores if s.is_significant]),
+                    'direction': tf_dir,                                            # ← FIX 3
                 })
 
                 if avg_ic > best_ic:
@@ -628,6 +682,12 @@ class MLTradingPipeline:
 
             result.best_timeframe = best_tf
             result.tf_rankings    = sorted(tf_rankings, key=lambda x: x['avg_ic'], reverse=True)
+
+            # ── FIX 2: top_ic — en güçlü tek indikatörün mutlak IC değeri ──
+            # feature_engineer 'ic_top_abs' feature'ı bunu okuyor.
+            # Önceden CoinAnalysisResult'ta top_ic field'ı yoktu → hep 0 dönüyordu.
+            if best_scores:
+                result.top_ic = max(abs(s.ic_mean) for s in best_scores if not np.isnan(s.ic_mean))
 
             ic_scores = [s.ic_mean for s in best_scores]
             ic_signal_dir = "NEUTRAL"
@@ -748,7 +808,7 @@ class MLTradingPipeline:
         now = datetime.now(timezone.utc)
         if self._daily_halt_until and now < self._daily_halt_until:
             result.status = "daily_halt"
-            logger.info(f"   🛑 {result.coin} atlandı: Günlük kayıp limiti aktif (halt: {self._daily_halt_until.strftime('%H:%M UTC')})")
+            logger.info(f"   🛑 {result.coin} atlandı: Günlük kayıp limiti aktif (halt: {self._daily_halt_until.astimezone(LOCAL_TZ).strftime('%H:%M TR')})")
             return result
 
         # UTC cooldown kontrolü
@@ -984,6 +1044,21 @@ class MLTradingPipeline:
                     except Exception:
                         pass
 
+                # ── FIX 4: Risk feature'larını gerçek hesaplanmış değerlerle override et ──
+                # Feature vektörü _analyze_coin sonunda (predict çağrısında) oluşturulduğunda
+                # risk değerleri henüz hesaplanmamıştı (hepsi 0 idi). Trade fiilen açıldıktan
+                # sonra elimizde gerçek SL/TP/leverage/size var → snapshot'a yazıyoruz.
+                try:
+                    fv_dict['risk_atr_pct']     = float(result.atr_pct or 0.0)
+                    fv_dict['risk_rr_ratio']    = float(result.risk_reward or 0.0)
+                    if result.price > 0 and result.sl_price > 0:
+                        fv_dict['risk_sl_distance_pct'] = abs(result.price - result.sl_price) / result.price * 100
+                    fv_dict['risk_leverage']    = float(result.leverage or 0)
+                    if result.position_size and result.position_size > 0:
+                        fv_dict['risk_position_size_log'] = float(np.log10(result.position_size + 1))
+                except Exception as e:
+                    logger.debug(f"Risk feature override hatası (kritik değil): {e}")
+
                 mem_rec = self.trade_memory.open_trade(
                     symbol           = result.full_symbol,
                     coin             = result.coin,
@@ -1184,6 +1259,157 @@ class MLTradingPipeline:
                     if opened_time.tzinfo is None:
                         opened_time = opened_time.replace(tzinfo=timezone.utc)
                     time_open_sec = (datetime.now(timezone.utc) - opened_time).total_seconds()
+                    age_hours = time_open_sec / 3600
+
+                    # ── TIMEOUT EXIT (24 saat kuralı) ──
+                    # Pozisyon Binance'te HÂLÂ AÇIK ve 24 saatten uzun süredir asılıysa
+                    # piyasa fiyatından zorla kapat. Kâr veya zarar farketmez.
+                    # Mantık: edge bayatladı, slot fırsat maliyeti artıyor.
+                    # Kâr ile kapanırsa model bunu WIN olarak öğrenir (trade_memory pnl>0 → WIN).
+                    # Zarar ile kapanırsa LOSS olarak öğrenir.
+                    if mem_coin in active_coins and age_hours >= MAX_TRADE_AGE_HOURS:
+                        logger.info(
+                            f"   ⏰ {mem_coin} TIMEOUT (yaş={age_hours:.1f}h ≥ {MAX_TRADE_AGE_HOURS}h) "
+                            f"→ piyasa fiyatından kapatılıyor..."
+                        )
+
+                        try:
+                            # 1) Güncel piyasa fiyatını çek
+                            exchange = self.executor._get_exchange()
+                            ticker = exchange.fetch_ticker(mem_trade.symbol)
+                            timeout_exit_price = float(ticker.get('last') or 0.0)
+
+                            if timeout_exit_price <= 0:
+                                logger.warning(f"   ⚠️ {mem_coin} TIMEOUT: geçersiz fiyat ({timeout_exit_price}), atlanıyor")
+                                continue
+
+                            # 2) Pozisyonu market order ile kapat (close_position reduce_only=True kullanır)
+                            #    BinanceExecutor.close_position içinde LONG → sell, SHORT → buy mantığı var
+                            try:
+                                close_result = self.executor.close_position(
+                                    symbol=mem_trade.symbol,
+                                    side=mem_trade.direction.lower(),
+                                    amount=mem_trade.position_size,
+                                )
+                                if not close_result.success:
+                                    logger.error(f"   ❌ {mem_coin} TIMEOUT close hatası: {close_result.error}")
+                                    continue
+                                # Gerçek fill fiyatı varsa onu kullan
+                                if close_result.price and close_result.price > 0:
+                                    timeout_exit_price = float(close_result.price)
+                            except Exception as close_err:
+                                logger.error(f"   ❌ {mem_coin} TIMEOUT market close exception: {close_err}")
+                                continue
+
+                            # 3) Kalan SL/TP emirlerini iptal et (orphan kalmasınlar)
+                            try:
+                                if hasattr(self.executor, 'cancel_all_orders'):
+                                    self.executor.cancel_all_orders(mem_trade.symbol)
+                                    logger.info(f"   🧹 {mem_coin} TIMEOUT sonrası SL/TP emirleri iptal edildi")
+                            except Exception as cancel_err:
+                                logger.warning(f"   ⚠️ {mem_coin} TIMEOUT emir temizleme hatası: {cancel_err}")
+
+                            # 4) PnL hesapla
+                            safe_entry = float(mem_trade.entry_price or 0)
+                            safe_size = float(mem_trade.position_size or 0)
+                            safe_leverage = int(mem_trade.leverage or 1)
+
+                            if mem_trade.direction == "LONG":
+                                pnl_val = (timeout_exit_price - safe_entry) * safe_size
+                            else:
+                                pnl_val = (safe_entry - timeout_exit_price) * safe_size
+
+                            fee_val = (safe_entry * safe_size * 0.0004) + (timeout_exit_price * safe_size * 0.0004)
+                            net_pnl_val = pnl_val - fee_val
+                            pnl_pct = (pnl_val / (safe_entry * safe_size)) * 100 * safe_leverage \
+                                      if (safe_entry * safe_size) > 0 else 0.0
+
+                            close_reason_timeout = "TIMEOUT"
+
+                            # 5) TIMEOUT cooldown YOK — edge bayatlaması, başarısızlık değil
+                            #    (SL Hit'te 2 saat cooldown var, TIMEOUT'ta yok bilinçli)
+
+                            # 6) Memory güncelle
+                            try:
+                                self.trade_memory.close_trade(
+                                    trade_id    = mem_id,
+                                    exit_price  = timeout_exit_price,
+                                    pnl         = pnl_val,
+                                    exit_reason = close_reason_timeout,
+                                )
+                                outcome_str = "KÂR" if pnl_val > 0 else "ZARAR"
+                                logger.info(
+                                    f"   🧠 Memory güncellendi: {mem_coin} → TIMEOUT/{outcome_str} | "
+                                    f"PnL: ${pnl_val:+.2f}"
+                                )
+                            except Exception as mem_err:
+                                logger.error(f"   ❌ Memory güncelleme hatası: {mem_coin} → {mem_err}")
+
+                            # 7) Telegram bildirimi
+                            try:
+                                if self.notifier.is_configured():
+                                    pnl_emoji = "✅ KÂR" if pnl_val > 0 else "❌ ZARAR"
+                                    msg = (f"⏰ <b>TIMEOUT EXIT ({pnl_emoji})</b>\n"
+                                           f"━━━━━━━━━━━━━━━━━━━━━\n"
+                                           f"🪙 <b>Coin:</b> {mem_coin}\n"
+                                           f"⏱️ <b>Yaş:</b> {age_hours:.1f}h\n"
+                                           f"💲 <b>Çıkış:</b> ${timeout_exit_price:,.4f}\n"
+                                           f"💰 <b>PnL:</b> ${pnl_val:+.2f} ({pnl_pct:+.2f}%)\n"
+                                           f"🏦 <b>Güncel Kasa:</b> ${self._balance:,.2f}")
+                                    self.notifier.send_message_sync(msg)
+                            except Exception as tg_err:
+                                logger.warning(f"   ⚠️ Telegram bildirimi gönderilemedi: {tg_err}")
+
+                            # 8) Excel güncelleme
+                            try:
+                                from pathlib import Path
+                                log_dir = Path("logs")
+                                excel_path = log_dir / "live_trades.xlsx"
+
+                                if excel_path.exists():
+                                    df = pd.read_excel(excel_path)
+
+                                    for col in ['Tarih (Kapanış)', 'Çıkış Nedeni', 'Durum']:
+                                        if col in df.columns:
+                                            df[col] = df[col].astype(object)
+                                    for col in ['Çıkış ($)', 'PnL ($)', 'PnL (%)']:
+                                        if col in df.columns:
+                                            df[col] = df[col].astype(float)
+
+                                    mask = (df['Coin'] == mem_coin) & (df['Durum'] == 'open')
+
+                                    if mask.any():
+                                        idx = df[mask].index[-1]
+                                        kapanis_zamani = datetime.now()
+                                        df.at[idx, 'Tarih (Kapanış)'] = kapanis_zamani.strftime("%Y-%m-%dT%H:%M:%S.%f")
+                                        try:
+                                            acilis_str = str(df.at[idx, 'Tarih (Açılış)'])
+                                            acilis_zamani = pd.to_datetime(acilis_str)
+                                            df.at[idx, 'Süre (dk)'] = int((kapanis_zamani - acilis_zamani).total_seconds() / 60)
+                                        except Exception:
+                                            df.at[idx, 'Süre (dk)'] = 0
+
+                                        df.at[idx, 'Çıkış ($)']    = timeout_exit_price
+                                        df.at[idx, 'Çıkış Nedeni'] = close_reason_timeout
+                                        df.at[idx, 'PnL ($)']      = round(pnl_val, 4)
+                                        df.at[idx, 'PnL (%)']      = round(pnl_pct, 2)
+                                        df.at[idx, 'Fee ($)']      = round(fee_val, 4)
+                                        df.at[idx, 'Net PnL ($)']  = round(net_pnl_val, 4)
+                                        df.at[idx, 'Durum']        = "closed"
+
+                                        self._export_live_trades_to_xlsx(df, excel_path)
+                                        logger.info(f"   📊 Excel güncellendi (TIMEOUT): {mem_coin} | PnL: ${pnl_val:+.2f}")
+                                    else:
+                                        logger.warning(f"   ⚠️ Excel'de 'open' statüsünde {mem_coin} kaydı bulunamadı!")
+                            except Exception as e:
+                                logger.error(f"   ❌ TIMEOUT Excel güncelleme hatası: {e}", exc_info=True)
+
+                            # TIMEOUT işlemi tamamlandı, bu trade için döngü iterasyonunu bitir
+                            continue
+
+                        except Exception as timeout_err:
+                            logger.error(f"   ❌ {mem_coin} TIMEOUT prosedürü hatası: {timeout_err}", exc_info=True)
+                            continue
 
                     if mem_coin not in active_coins:
                         if time_open_sec <= 120:
@@ -1450,7 +1676,7 @@ class MLTradingPipeline:
                         if c.symbol in self.cooldowns:
                             del self.cooldowns[c.symbol]
 
-                r = self._analyze_coin(c.symbol, c.coin)
+                r = self._analyze_coin(c.symbol, c.coin, scan_result=c)   # ← FIX 1: scanner verisi geçiriliyor
 
                 results.append(r)
                 report.total_analyzed += 1
@@ -1573,6 +1799,49 @@ class MLTradingPipeline:
             y_experience = pd.Series(rows_y)
 
             metrics = self.lgbm_model.train(X_experience, y_experience)
+
+            # ── BONUS FIX: Excel raporu yaz (initial_train ile aynı format) ──
+            # Önceden sadece initial_train (sabit dummy feature'larla yapılan warm start)
+            # Excel yazıyordu. retrain_from_experience gerçek trade verisiyle eğitiyor
+            # ama sonucu Excel'e yansıtmıyordu → gerçek feature dağılımı ve importance
+            # tablosu görünmüyordu. Bu blok her retrain sonrası raporu günceller.
+            try:
+                from pathlib import Path
+
+                report_dir = Path("logs/reports")
+                report_dir.mkdir(parents=True, exist_ok=True)
+                report_path = report_dir / "model_egitim_raporu.xlsx"
+
+                with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
+                    df_metrics = pd.DataFrame([{
+                        "Tarih": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Kaynak": "retrain_from_experience",
+                        "Eğitim Satır Sayısı": len(X_experience),
+                        "Kazanma Oranı (Win Rate)": f"{y_experience.mean():.1%}",
+                        "Doğruluk (Accuracy)": metrics.accuracy,
+                        "AUC Skoru": metrics.auc_roc,
+                        "F1 Skoru": getattr(metrics, 'f1', 0.0)
+                    }])
+                    df_metrics.to_excel(writer, sheet_name="1_Genel_Metrikler", index=False)
+
+                    if hasattr(self.lgbm_model, 'model') and self.lgbm_model.model is not None:
+                        importance = self.lgbm_model.model.feature_importances_
+                        df_imp = pd.DataFrame({
+                            "Feature (Kolon)": X_experience.columns,
+                            "Önem Puanı": importance
+                        }).sort_values(by="Önem Puanı", ascending=False)
+                        df_imp.to_excel(writer, sheet_name="2_Kolon_Onemleri", index=False)
+
+                    df_raw = X_experience.copy()
+                    df_raw['TARGET_SONUC'] = y_experience.values
+                    df_raw['TARGET_ACIKLAMA'] = df_raw['TARGET_SONUC'].apply(
+                        lambda x: "KÂR (1)" if x == 1 else "ZARAR (0)"
+                    )
+                    df_raw.to_excel(writer, sheet_name="3_Gecmis_Ham_Veri", index=False)
+
+                logger.info(f"📊 Retrain raporu Excel olarak kaydedildi: {report_path}")
+            except Exception as ex:
+                logger.error(f"⚠️ Retrain Excel raporu hatası (kritik değil): {ex}")
 
             logger.info(f"✅ Gerçek işlemlerden öğrenildi! Yeni Win Rate: %{metrics.accuracy*100:.1f}")
             return True
@@ -1793,7 +2062,7 @@ class MLTradingPipeline:
             loss_pct = (-self._daily_realized_pnl / self._daily_start_balance) * 100
             halt_str = ""
             if self._daily_halt_until:
-                halt_str = f" | HALT → {self._daily_halt_until.strftime('%H:%M UTC')}"
+                halt_str = f" | HALT → {self._daily_halt_until.astimezone(LOCAL_TZ).strftime('%H:%M TR')}"
             logger.info(
                 f"   Günlük: PnL=${self._daily_realized_pnl:+.2f} "
                 f"({loss_pct:+.2f}% / limit: %{cfg.risk.daily_max_loss_pct}){halt_str}"

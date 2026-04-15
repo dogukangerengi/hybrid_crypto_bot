@@ -212,7 +212,7 @@ class BinanceExecutor:
             },
             'contract_size': float(market.get('contractSize', 1.0)),
             # Binance'de leverage bilgisi genelde limits altındadır
-            'max_leverage': int(market.get('limits', {}).get('leverage', {}).get('max', 125)),
+            'max_leverage': int(market.get('limits', {}).get('leverage', {}).get('max') or 125),
         }
         self._market_cache[symbol] = info
         return info
