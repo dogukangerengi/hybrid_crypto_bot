@@ -667,9 +667,9 @@ class MLTradingPipeline:
                 tf_rankings.append({
                     'tf': tf,
                     'avg_ic': avg_ic,
-                    'score': avg_ic * 100,                                          # ← FIX 3
+                    'score': avg_ic * 100,                                         # ← FIX 3
                     'sig_count': len([s for s in scores if s.is_significant]),
-                    'direction': tf_dir,                                            # ← FIX 3
+                    'direction': tf_dir,                                           # ← FIX 3
                 })
 
                 if avg_ic > best_ic:
@@ -728,12 +728,15 @@ class MLTradingPipeline:
                     for s in best_scores:
                         s_lower = s.name.lower()
                         if not cat_scores:
-                            for ci in cat_ind_lower:
-                                if s_lower.startswith(ci + '_') or s_lower.startswith(ci):
-                                    if len(ci) >= 3:
-                                        matched.append(s)
-                                        break
-                    cat_scores = matched
+                                for ci in cat_ind_lower:
+                                    if s_lower.startswith(ci + '_') or s_lower.startswith(ci):
+                                        if len(ci) >= 3:
+                                            matched.append(s)
+                                            break
+                        if 'matched' in locals():
+                            cat_scores = matched
+                        else:
+                            cat_scores = []
 
                 if cat_scores:
                     top = max(cat_scores, key=lambda s: abs(s.ic_mean))
@@ -1090,6 +1093,8 @@ class MLTradingPipeline:
         return result
 
     def _check_open_positions(self):
+        import pandas as pd  # <--- ÇÖZÜM: FONKSİYONUN EN BAŞINA EKLİYORUZ
+        
         logger.debug("\n🔍 Açık pozisyonlar kontrol ediliyor...")
 
         if self.dry_run:
@@ -1364,7 +1369,6 @@ class MLTradingPipeline:
                             # 8) Excel güncelleme
                             try:
                                 from pathlib import Path
-                                import pandas as pd # <-- HATA BURADAYDI, EKLENDİ
                                 log_dir = Path("logs")
                                 excel_path = log_dir / "live_trades.xlsx"
 
@@ -1514,7 +1518,6 @@ class MLTradingPipeline:
 
                         try:
                             from pathlib import Path
-                            import pandas as pd
 
                             log_dir = Path("logs")
                             excel_path = log_dir / "live_trades.xlsx"
@@ -1781,28 +1784,17 @@ class MLTradingPipeline:
                 pnl = t.get('pnl', 0.0)
 
                 # Yeni R-Multiple (Risk Çarpanı) Hesaplaması
-                # pnl: Net kazanç/zarar dolar bazında (örn: +1.5$, -1.0$)
-                # 282 işlemde varsayılan RR oranı 1.5 olduğu için riskin ortalama 1 birim olduğunu kabul ediyoruz.
-                # Eğer açık bir trade objesinde spesifik bir "initial_risk" değişkeni olsaydı pnl/initial_risk yapardık.
-                # Burada pnl'nin kendisini veya yönsel kâr/zararı doğrudan r_multiple olarak kullanacağız.
-
                 if exit_reason == "TP Hit":
                     r_multiple = 1.5  # Take Profit vurulduysa 1.5 R kazanç
                 elif exit_reason == "SL Hit":
                     r_multiple = -1.0 # Stop Loss vurulduysa 1.0 R kayıp
                 else:
-                    # Timeout veya erken kapanış durumları (pnl'yi kaba bir R olarak varsay)
-                    # Yönüne göre zarar/kârı ayarla
                     if pnl != 0:
-                        # Normalize etmek için kaba bir değer, botun 10$'lık bakiyede ~%2 risk aldığı varsayılırsa:
-                        r_multiple = pnl / 0.16 # Ortalama $0.16 lık risk alınmış (daha önceki rapora istinaden)
-                        
-                        # Limitle (en fazla -2R veya +2R olsun ki modeli bozmasın)
+                        r_multiple = pnl / 0.16 
                         r_multiple = max(-2.0, min(2.0, r_multiple))
                     else:
                         r_multiple = 0.0
                 
-                # Hedef değişkenimiz artık binary (1/0) değil, sürekli bir R çarpanı.
                 target = float(r_multiple)
 
                 rows_X.append(fv)
@@ -1822,11 +1814,6 @@ class MLTradingPipeline:
             # TRAIN KISMI GÜNCELLENDİ
             metrics = self.lgbm_model.train(X_experience, y_experience, directions=dir_experience)
 
-            # ── BONUS FIX: Excel raporu yaz (initial_train ile aynı format) ──
-            # Önceden sadece initial_train (sabit dummy feature'larla yapılan warm start)
-            # Excel yazıyordu. retrain_from_experience gerçek trade verisiyle eğitiyor
-            # ama sonucu Excel'e yansıtmıyordu → gerçek feature dağılımı ve importance
-            # tablosu görünmüyordu. Bu blok her retrain sonrası raporu günceller.
             try:
                 from pathlib import Path
 
@@ -1835,40 +1822,53 @@ class MLTradingPipeline:
                 report_path = report_dir / "model_egitim_raporu.xlsx"
 
                 with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
+                    # --- 1. SAYFA: GENEL METRİKLER ---
+                    z_score = (metrics.spearman_ic * np.sqrt(metrics.n_train_samples - 3)) if metrics.n_train_samples > 3 else 0.0
+                    
                     df_metrics = pd.DataFrame([{
                         "Tarih": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "Kaynak": "retrain_from_experience",
                         "Eğitim Satır Sayısı": len(X_experience),
-                        "Kazanma Oranı (Win Rate)": f"{sum(1 for y in y_experience if float(y) > 0) / max(1, len(y_experience)) * 100:.1f}%",
-                        "Doğruluk (Accuracy)": metrics.accuracy,
-                        "AUC Skoru": metrics.auc_roc,
-                        "F1 Skoru": getattr(metrics, 'f1', 0.0)
+                        "Kazanma Oranı (Win Rate)": f"{sum(1 for val in y_experience if float(val) > 0) / max(1, len(y_experience)) * 100:.1f}%",
+                        "Spearman IC Skoru": round(metrics.spearman_ic, 4),
+                        "Bilgi Oranı (IR)": round(metrics.information_ratio, 2),
+                        "Z-Skoru": round(z_score, 2),
+                        "Long-Short Spread (R)": round(metrics.long_short_spread, 3),
+                        "MAE (Hata Payı)": round(metrics.mae, 4)
                     }])
                     df_metrics.to_excel(writer, sheet_name="1_Genel_Metrikler", index=False)
 
-                    # Modelin feature_importances_ (Önem Puanları) özelliği var mı diye kontrol ediyoruz
-                    # Önem puanlarını kapsayıcının içinden veya kendi metodundan çekiyoruz
-                    if hasattr(self.lgbm_model, 'feature_importances_') or (hasattr(self.lgbm_model, 'model') and hasattr(self.lgbm_model.model, 'feature_importances_')):
+                    # --- 2. SAYFA: KOLON ÖNEMLERİ (GÜVENLİ BLOK) ---
+                    try:
+                        importance = None
+                        kalan_kolonlar = None
+                        
+                        if hasattr(self.lgbm_model, 'feature_importances_'):
+                            importance = self.lgbm_model.feature_importances_() if callable(self.lgbm_model.feature_importances_) else self.lgbm_model.feature_importances_
+                        elif hasattr(self.lgbm_model, 'model') and hasattr(self.lgbm_model.model, 'feature_importances_'):
+                            importance = self.lgbm_model.model.feature_importances_
                             
-                            # Puanları al (Eğer property veya fonksiyon ise ona göre çağır)
-                            if hasattr(self.lgbm_model, 'feature_importances_'):
-                                importance = self.lgbm_model.feature_importances_() if callable(self.lgbm_model.feature_importances_) else self.lgbm_model.feature_importances_
-                            else:
-                                importance = self.lgbm_model.model.feature_importances_
-                                
-                            # Modelin elemeden geçirdiği ve geriye kalan sağlam kolonların isimlerini alıyoruz
-                            if hasattr(self.lgbm_model, 'feature_names'):
+                        if importance is not None:
+                            if hasattr(self.lgbm_model, 'feature_names') and self.lgbm_model.feature_names:
                                 kalan_kolonlar = self.lgbm_model.feature_names
                             else:
-                                kalan_kolonlar = X.columns[:len(importance)]
+                                kalan_kolonlar = X_experience.columns[:len(importance)]
                             
-                            df_imp = pd.DataFrame({
-                                "Feature (Kolon)": kalan_kolonlar,
-                                "Önem Puanı": importance
-                            }).sort_values(by="Önem Puanı", ascending=False)
+                            if len(kalan_kolonlar) == len(importance):
+                                df_imp = pd.DataFrame({
+                                    "Feature (Kolon)": kalan_kolonlar,
+                                    "Önem Puanı": importance
+                                }).sort_values(by="Önem Puanı", ascending=False)
+                            else:
+                                df_imp = pd.DataFrame({"Hata": [f"Uyuşmazlık! Kolon:{len(kalan_kolonlar)}, Puan:{len(importance)}"]})
+                        else:
+                            df_imp = pd.DataFrame({"Bilgi": ["Model önem puanı üretmedi"]})
                             
-                            df_imp.to_excel(writer, sheet_name="2_Kolon_Onemleri", index=False)
+                        df_imp.to_excel(writer, sheet_name="2_Kolon_Onemleri", index=False)
+                    except Exception as e:
+                        pd.DataFrame({"Hata": [str(e)]}).to_excel(writer, sheet_name="2_Kolon_Onemleri", index=False)
 
+                    # --- 3. SAYFA: GEÇMİŞ HAM VERİ ---
                     df_raw = X_experience.copy()
                     df_raw['TARGET_SONUC'] = y_experience.values
                     df_raw['TARGET_ACIKLAMA'] = df_raw['TARGET_SONUC'].apply(
@@ -1877,10 +1877,12 @@ class MLTradingPipeline:
                     df_raw.to_excel(writer, sheet_name="3_Gecmis_Ham_Veri", index=False)
 
                 logger.info(f"📊 Retrain raporu Excel olarak kaydedildi: {report_path}")
+            
             except Exception as ex:
-                logger.error(f"⚠️ Retrain Excel raporu hatası (kritik değil): {ex}")
+                logger.error(f"⚠️ Excel raporu oluşturulurken hata (kritik değil): {ex}")
 
-            logger.info(f"✅ Gerçek işlemlerden öğrenildi! Yeni Win Rate: %{metrics.accuracy*100:.1f}")
+            gercek_win_rate = sum(1 for val in y_experience if float(val) > 0) / max(1, len(y_experience)) * 100
+            logger.info(f"✅ Gerçek işlemlerden öğrenildi! Yeni Win Rate: %{gercek_win_rate:.1f}")
             return True
 
         except Exception as e:
@@ -1985,7 +1987,10 @@ class MLTradingPipeline:
                                         if len(ci) >= 3:
                                             matched.append(s)
                                             break
-                        cat_scores = matched
+                        if 'matched' in locals():
+                            cat_scores = matched
+                        else:
+                            cat_scores = []
 
                     if cat_scores:
                         top = max(cat_scores, key=lambda s: abs(s.ic_mean))
@@ -1996,24 +2001,21 @@ class MLTradingPipeline:
                                 for ci in cat_indicators
                             )]
                             if not cat_scores:
-                                cat_ind_lower = [x.lower() for x in cat_indicators]
-                                matched = []
-                                for s in all_scores:
-                                    s_lower = s.name.lower()
-                                    if not cat_scores:
-                                        continue
-                                    for ci in cat_ind_lower:
-                                        if s_lower.startswith(ci + '_') or s_lower.startswith(ci):
-                                            if len(ci) >= 3:
-                                                matched.append(s)
-                                                break
-                                cat_scores = matched
+                                for ci in cat_ind_lower:
+                                    if s_lower.startswith(ci + '_') or s_lower.startswith(ci):
+                                        if len(ci) >= 3:
+                                            matched.append(s)
+                                            break
+                        if 'matched' in locals():
+                            cat_scores = matched
+                        else:
+                            cat_scores = []
 
-                            if cat_scores:
-                                top = max(cat_scores, key=lambda s: abs(s.ic_mean))
-                                dynamic_cat_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
+                if cat_scores:
+                    top = max(cat_scores, key=lambda s: abs(s.ic_mean))
+                    dynamic_cat_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
 
-                    analysis_stub.category_tops = dynamic_cat_tops
+                analysis_stub.category_tops = dynamic_cat_tops
 
                 fv = self.feature_eng.build_features(
                     analysis=analysis_stub,
@@ -2054,39 +2056,53 @@ class MLTradingPipeline:
                 report_path = report_dir / "model_egitim_raporu.xlsx"
 
                 with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
+                    # --- 1. SAYFA: GENEL METRİKLER ---
+                    z_score = (metrics.spearman_ic * np.sqrt(metrics.n_train_samples - 3)) if metrics.n_train_samples > 3 else 0.0
+                    
                     df_metrics = pd.DataFrame([{
                         "Tarih": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Kaynak": "initial_train",
                         "Eğitim Satır Sayısı": len(X),
-                        "Kazanma Oranı (Win Rate)": f"{y.mean():.1%}",
-                        "Doğruluk (Accuracy)": metrics.accuracy,
-                        "AUC Skoru": metrics.auc_roc,
-                        "F1 Skoru": getattr(metrics, 'f1', 0.0)
+                        "Kazanma Oranı (Win Rate)": f"{sum(1 for val in y if float(val) > 0) / max(1, len(y)) * 100:.1f}%",
+                        "Spearman IC Skoru": round(metrics.spearman_ic, 4),
+                        "Bilgi Oranı (IR)": round(metrics.information_ratio, 2),
+                        "Z-Skoru": round(z_score, 2),
+                        "Long-Short Spread (R)": round(metrics.long_short_spread, 3),
+                        "MAE (Hata Payı)": round(metrics.mae, 4)
                     }])
                     df_metrics.to_excel(writer, sheet_name="1_Genel_Metrikler", index=False)
 
-                    # Modelin feature_importances_ (Önem Puanları) özelliği var mı diye kontrol ediyoruz
-                    # Önem puanlarını kapsayıcının içinden veya kendi metodundan çekiyoruz
-                    if hasattr(self.lgbm_model, 'feature_importances_') or (hasattr(self.lgbm_model, 'model') and hasattr(self.lgbm_model.model, 'feature_importances_')):
+                    # --- 2. SAYFA: KOLON ÖNEMLERİ (GÜVENLİ BLOK) ---
+                    try:
+                        importance = None
+                        kalan_kolonlar = None
+                        
+                        if hasattr(self.lgbm_model, 'feature_importances_'):
+                            importance = self.lgbm_model.feature_importances_() if callable(self.lgbm_model.feature_importances_) else self.lgbm_model.feature_importances_
+                        elif hasattr(self.lgbm_model, 'model') and hasattr(self.lgbm_model.model, 'feature_importances_'):
+                            importance = self.lgbm_model.model.feature_importances_
                             
-                            # Puanları al (Eğer property veya fonksiyon ise ona göre çağır)
-                            if hasattr(self.lgbm_model, 'feature_importances_'):
-                                importance = self.lgbm_model.feature_importances_() if callable(self.lgbm_model.feature_importances_) else self.lgbm_model.feature_importances_
-                            else:
-                                importance = self.lgbm_model.model.feature_importances_
-                                
-                            # Modelin elemeden geçirdiği ve geriye kalan sağlam kolonların isimlerini alıyoruz
-                            if hasattr(self.lgbm_model, 'feature_names'):
+                        if importance is not None:
+                            if hasattr(self.lgbm_model, 'feature_names') and self.lgbm_model.feature_names:
                                 kalan_kolonlar = self.lgbm_model.feature_names
                             else:
                                 kalan_kolonlar = X.columns[:len(importance)]
                             
-                            df_imp = pd.DataFrame({
-                                "Feature (Kolon)": kalan_kolonlar,
-                                "Önem Puanı": importance
-                            }).sort_values(by="Önem Puanı", ascending=False)
+                            if len(kalan_kolonlar) == len(importance):
+                                df_imp = pd.DataFrame({
+                                    "Feature (Kolon)": kalan_kolonlar,
+                                    "Önem Puanı": importance
+                                }).sort_values(by="Önem Puanı", ascending=False)
+                            else:
+                                df_imp = pd.DataFrame({"Hata": [f"Uyuşmazlık! Kolon:{len(kalan_kolonlar)}, Puan:{len(importance)}"]})
+                        else:
+                            df_imp = pd.DataFrame({"Bilgi": ["Model önem puanı üretmedi"]})
                             
-                            df_imp.to_excel(writer, sheet_name="2_Kolon_Onemleri", index=False)
+                        df_imp.to_excel(writer, sheet_name="2_Kolon_Onemleri", index=False)
+                    except Exception as e:
+                        pd.DataFrame({"Hata": [str(e)]}).to_excel(writer, sheet_name="2_Kolon_Onemleri", index=False)
 
+                    # --- 3. SAYFA: GEÇMİŞ HAM VERİ ---
                     df_raw = X.copy()
                     df_raw['TARGET_SONUC'] = y.values
                     df_raw['TARGET_ACIKLAMA'] = df_raw['TARGET_SONUC'].apply(
@@ -2095,10 +2111,12 @@ class MLTradingPipeline:
                     df_raw.to_excel(writer, sheet_name="3_Gecmis_Ham_Veri", index=False)
 
                 logger.info(f"📊 Detaylı Eğitim Raporu Excel olarak kaydedildi: {report_path}")
+            
             except Exception as ex:
-                logger.error(f"⚠️ Excel raporu oluşturulurken hata: {ex}")
+                logger.error(f"⚠️ Excel raporu oluşturulurken hata (kritik değil): {ex}")
 
-            logger.info(f"✅ İlk eğitim tamamlandı | Metrik: AUC={metrics.auc_roc:.3f}, Acc={metrics.accuracy:.2f}")
+            gercek_win_rate = sum(1 for val in y if float(val) > 0) / max(1, len(y)) * 100
+            logger.info(f"✅ İlk eğitim tamamlandı | Gerçek Win Rate: %{gercek_win_rate:.1f} | IC Skoru: {metrics.spearman_ic:.4f}")
             return True
 
         except Exception as e:
