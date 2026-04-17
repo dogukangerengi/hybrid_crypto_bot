@@ -441,8 +441,8 @@ class SignalValidator:
 
         result.adjusted_confidence = round(max(0, min(100, adjusted)), 1)
 
-        if result.adjusted_confidence < 45.0:
-            result.veto_reasons.append(f"Güvenlik barajı aşılamadı: %{result.adjusted_confidence:.1f} < %45.0")
+        if result.adjusted_confidence < 40.0:
+            result.veto_reasons.append(f"Güvenlik barajı aşılamadı: %{result.adjusted_confidence:.1f} < %40.0")
             
         if result.veto_reasons:
             result.is_valid = False
