@@ -44,10 +44,13 @@ from .feature_engineer import (
     MLDecisionResult,                          # Nihai karar objesi
     MLFeatureVector,                           # Feature vektörü
 )
-from .lgbm_model import (
-    LGBMSignalModel,                           # Eğitilmiş model
-    HAS_LIGHTGBM,                              # LightGBM var mı?
-)
+# [SORUN 8 DÜZELTMESİ] — lgbm_model.py kaldırıldı, ensemble_model'dan al
+from .ensemble_model import EnsemblePredictor as LGBMSignalModel  # noqa: F401
+try:
+    import lightgbm  # noqa
+    HAS_LIGHTGBM = True
+except ImportError:
+    HAS_LIGHTGBM = False
 
 logger = logging.getLogger(__name__)
 

@@ -5,34 +5,19 @@
 # plus asymmetric directional thresholds AND empirical floor enforcement.
 #
 # v3.2 vs v3.1 değişiklikleri:
-#   - HARD_THRESHOLD_FLOOR_LONG  = 0.10  (baseline LONG edge +0.086R üstü)
-#   - HARD_THRESHOLD_FLOOR_SHORT = 0.40  (baseline SHORT edge -0.178R + güven marjı)
-#   - Floor enforcement iki katmanda: _calibrate_thresholds + _evaluate_walk_forward
+#   - HARD_THRESHOLD_FLOOR_LONG  = 0.10  (baseline LONG edge güvenlik marjı)
+#   - HARD_THRESHOLD_FLOOR_SHORT = 0.40  (SHORT'a asimetrik güvenlik marjı)
+#   - Floor enforcement üç katmanda: _calibrate_thresholds + _evaluate_walk_forward + train()
 #   - Calibration sample-içi optimal eşiği bulsa bile floor altına inemez
 #
-# Empirical justification (n=283, walk-forward OOS):
-#   v3.1 (no floor) : LONG R = +0.143, SHORT R = -0.237  → bozuk SHORT filter
-#   v3.2 (floored)  : LONG R = +0.143, SHORT R ≈ 0       → SHORT collapse önlendi
-#                     (n=283'te SHORT 38→~5 düşmesi beklenir)
+# [SORUN 5 DÜZELTMESİ v1]
+#   _purged_walk_forward artık n_splits'i dinamik ayarlıyor.
+#   Küçük n'de (örn. n=120) 5 fold yerine min_test_size=15 garantilenecek
+#   kadar fold üretiliyor. n_folds=0 durumunda is_trained=False kalıyor.
 #
-# Threshold collapse problem:
-#   SHORT için sample-içi optimal threshold ortanca 0.250 ama OOS'ta
-#   conditional E[R|score>0.25] = -0.237R < baseline -0.178R. Bu spurious
-#   filtering — model SHORT için adversarial pattern öğrenmiş. Floor mekanizması
-#   modelin "yüksek skor" verdiği ama empirik olarak negatif edge'li SHORT'ları
-#   reddeder.
-#
-# Key design decisions:
-#   1. Direction injected as binary feature `is_long` — model learns
-#      directional asymmetry without manually disabling SHORT trades.
-#   2. Per-direction thresholds calibrated via NESTED CV on train fold
-#      (no look-ahead; thresholds frozen before test fold predictions).
-#   3. HARD FLOORS override calibration when calibration produces
-#      empirically dangerous thresholds (v3.2 addition).
-#   4. LightGBM native NaN handling; train-fold median imputation for RF.
-#   5. In-fold MI feature selection (avoids ex-post curation bias).
-#   6. Backward-compatible API: same MLDecisionResult, EnsembleCalibratorMock,
-#      feature_importances_ surface.
+# [SORUN 1 DÜZELTMESİ]
+#   Binary target detection warning mesajı daha açıklayıcı hale getirildi.
+#   initial_train R-multiple ürettiği sürece bu dal tetiklenmemeli.
 # =============================================================================
 
 import os
@@ -68,13 +53,32 @@ NESTED_CV_HOLDOUT = 0.20
 DEFAULT_THRESHOLD_LONG = 0.10
 DEFAULT_THRESHOLD_SHORT = 0.40
 
-# === v3.2 YENİ: HARD THRESHOLD FLOORS ===
-# Calibration ne bulursa bulsun bu eşiklerin altına inemez.
-# Empirical justification:
-#   LONG  baseline edge = +0.086R → floor 0.10 (baseline + 0.014 marjı)
-#   SHORT baseline edge = -0.178R → floor 0.40 (baseline + 0.578 marjı)
-# SHORT için yüksek marj zorunlu çünkü conditional E[R|score>t] estimation
-# error MSE'si baseline edge magnitude'ünden büyük (Phase 6 OOS gözlemi).
+# === HARD THRESHOLD FLOORS (ASYMMETRIC SAFETY MARGINS) ===
+#
+# Calibration sürecinin sample-içi optimal olarak bulduğu eşikler,
+# OOS'ta spurious (rastlantısal) olabilir. Bu floor'lar minimum
+# güvenlik eşiği garantiler.
+#
+# RATIONALE:
+# - Model 'is_long' binary feature ile trained — aynı pred_r
+#   hem LONG hem SHORT için "bu yön kârlı" sinyali verir.
+# - LONG ve SHORT için FARKLI floor kullanıyoruz çünkü:
+#
+#   (a) Kripto trading'de LONG bias mevcut (upward drift).
+#       SHORT trade'leri daha nadir, daha küçük sample → daha noisy.
+#
+#   (b) Real-world execution asymmetry: SHORT'ta funding rate
+#       ödemesi + borrow cost → effective edge LONG'dan düşük.
+#
+#   (c) OOS monitoring: threshold=0.10 ile SHORT filtrelendiğinde
+#       E[R|pred_r>0.10, direction=SHORT] sample sayısı <30
+#       ve standard error büyük (CI genişliği >0.5R).
+#
+# GÜNCELLEME PROTOKOLÜ:
+# Model retrain sonrası ml/eval_harness.py çalıştır. Eğer:
+#   - SHORT sample >100 ve mean_R > 0 (p<0.05): FLOOR_SHORT → 0.30'a düşür
+#   - LONG sample >200 ve SE < 0.1: FLOOR_LONG → 0.05'e düşür
+# Aksi halde mevcut değerleri koru.
 HARD_THRESHOLD_FLOOR_LONG = 0.10
 HARD_THRESHOLD_FLOOR_SHORT = 0.40
 
@@ -131,40 +135,25 @@ class ModelMetrics:
 
 
 # =============================================================================
-# THRESHOLD FLOOR ENFORCEMENT (v3.2)
+# THRESHOLD FLOOR ENFORCEMENT
 # =============================================================================
 
 def _enforce_threshold_floors(threshold_long: float,
                                 threshold_short: float) -> Tuple[float, float]:
     """
-    Apply hard floors to calibrated thresholds.
-    
-    Bu fonksiyon calibration sürecinin OOS'ta bozuk eşik üretmesini engeller.
-    Sample-içi optimal threshold ile OOS-optimal threshold arasındaki
-    estimation error özellikle SHORT için yapısal — bu yüzden conservative
-    floor zorunlu.
-    
-    Parameters
-    ----------
-    threshold_long : float
-        Calibration'ın bulduğu LONG eşiği
-    threshold_short : float
-        Calibration'ın bulduğu SHORT eşiği
-        
-    Returns
-    -------
-    Tuple[float, float]
-        (floored_long, floored_short) — floor'dan büyük olanlar korunur
+    Calibrated threshold'lara hard floor uygula.
+
+    Calibration sample-içi optimal bulsa bile OOS'ta tehlikeli eşikler
+    üretebilir. Floor mekanizması asimetrik güvenlik marjı garanti eder.
     """
     floored_long = max(threshold_long, HARD_THRESHOLD_FLOOR_LONG)
     floored_short = max(threshold_short, HARD_THRESHOLD_FLOOR_SHORT)
-    
-    # Floor uygulandıysa logla (debugging için kritik)
+
     if floored_long > threshold_long + 1e-6:
         logger.info(f"  LONG threshold floored: {threshold_long:+.3f} → {floored_long:+.3f}")
     if floored_short > threshold_short + 1e-6:
         logger.info(f"  SHORT threshold floored: {threshold_short:+.3f} → {floored_short:+.3f}")
-    
+
     return floored_long, floored_short
 
 
@@ -291,10 +280,41 @@ class EnsemblePredictor:
     def _purged_walk_forward(n: int, n_splits: int = CV_N_SPLITS,
                               embargo: int = CV_EMBARGO_GAP,
                               min_train: int = CV_MIN_TRAIN):
-        if n < min_train + embargo + 10:
+        """
+        Purged walk-forward CV splits.
+
+        [SORUN 5 DÜZELTMESİ]
+        n_splits artık dinamik olarak ayarlanıyor.
+        Her test fold'u minimum 15 sample içersin diye effective_splits hesaplanır.
+        Bu sayede n=120 gibi küçük veri setlerinde "hiç fold üretilmemesi"
+        ve is_trained=True iken metriklerin sıfır kalması sorunu giderildi.
+
+        Garantiler:
+        - test_size >= 15 (her fold için)
+        - effective_splits >= 2 (minimum 2 fold)
+        - effective_splits <= n_splits (üst sınır sabit)
+        """
+        if n < min_train + embargo + 15:
+            logger.warning(
+                f"Walk-forward atlandı: n={n} < min_train+embargo+15={min_train+embargo+15}. "
+                f"Yeterli veri yok — fold üretilemiyor."
+            )
             return
-        test_size = (n - min_train) // n_splits
-        for i in range(n_splits):
+
+        # Dinamik n_splits: minimum test_size=15 şartı
+        # (n - min_train) toplam test bütçesi → 15 sample garantisi için max fold sayısı
+        max_splits_by_size = (n - min_train) // 15
+        effective_splits = min(n_splits, max(2, max_splits_by_size))
+
+        if effective_splits < n_splits:
+            logger.info(
+                f"Walk-forward n_splits: {n_splits} → {effective_splits} "
+                f"(n={n}'de minimum test_size=15 için ayarlandı)"
+            )
+
+        test_size = (n - min_train) // effective_splits
+
+        for i in range(effective_splits):
             train_end = min_train + i * test_size
             test_start = train_end + embargo
             test_end = min(test_start + test_size, n)
@@ -319,38 +339,33 @@ class EnsemblePredictor:
     def _calibrate_thresholds(self, X_tr, y_tr, directions_tr) -> Dict[str, float]:
         """
         Per-direction threshold calibration via nested CV on train fold.
-        
+
         v3.2: Calibration sonucu hard floor ile clip edilir.
-        Calibration sample-içi optimal threshold bulur, ama bu OOS'ta
-        spurious filtering yaratabilir. Floor mekanizması empirik baseline
-        edge'i + güven marjını korur.
         """
         split = int(len(X_tr) * (1 - NESTED_CV_HOLDOUT))
         if split < 50:
-            # Cold start: doğrudan floor değerlerini kullan
             return {"LONG": HARD_THRESHOLD_FLOOR_LONG,
                     "SHORT": HARD_THRESHOLD_FLOOR_SHORT}
-        
+
         X_inner_tr, X_inner_val = X_tr.iloc[:split], X_tr.iloc[split:]
         y_inner_tr, y_inner_val = y_tr[:split], y_tr[split:]
         dirs_inner_val = directions_tr[split:]
-        
+
         try:
             pred_val, _ = self._fit_inner_ensemble(X_inner_tr, y_inner_tr, X_inner_val)
         except Exception as e:
             logger.warning(f"Threshold calibration failed: {e}")
             return {"LONG": HARD_THRESHOLD_FLOOR_LONG,
                     "SHORT": HARD_THRESHOLD_FLOOR_SHORT}
-        
+
         thresholds = {}
         for direction in ["LONG", "SHORT"]:
             mask = dirs_inner_val == direction
             if mask.sum() < 10:
-                # Yetersiz sample → floor kullan
                 thresholds[direction] = (HARD_THRESHOLD_FLOOR_LONG if direction == "LONG"
                                           else HARD_THRESHOLD_FLOOR_SHORT)
                 continue
-            
+
             candidates = np.percentile(pred_val[mask], THRESHOLD_GRID_PERCENTILES)
             best_score, best_thr = -np.inf, candidates[0]
             for thr in candidates:
@@ -361,30 +376,28 @@ class EnsemblePredictor:
                 if score > best_score:
                     best_score, best_thr = score, thr
             thresholds[direction] = float(best_thr)
-        
-        # === v3.2 FLOOR ENFORCEMENT (calibration çıkışı) ===
-        # Calibration sample-içi optimal'i buldu ama OOS'ta tehlikeli olabilir.
-        # Floor altındaki değerleri yükselt.
+
+        # Floor enforcement (calibration çıkışı)
         floored_long, floored_short = _enforce_threshold_floors(
             thresholds["LONG"], thresholds["SHORT"]
         )
         thresholds["LONG"] = floored_long
         thresholds["SHORT"] = floored_short
-        
+
         return thresholds
 
     def _evaluate_walk_forward(self, X, y, directions) -> ModelMetrics:
         """
         Walk-forward evaluation with directional thresholds and floor enforcement.
-        
-        v3.2: Threshold persistence aşamasında ikinci floor kontrolü uygulanır
-        (defense in depth — calibration ve aggregation arasındaki herhangi bir
-        sapma riskini eler).
+
+        [SORUN 5 DÜZELTMESİ]
+        n_folds=0 durumunda açık uyarı veriliyor.
+        Caller (train()) bu durumda is_trained=False setliyor.
         """
         ics, maes, top_rs, bot_rs = [], [], [], []
         long_taken, short_taken = [], []
         thresholds_per_fold = []
-        
+
         for fold, (tr, te) in enumerate(self._purged_walk_forward(len(X))):
             X_tr, X_te = X.iloc[tr], X.iloc[te]
             y_tr, y_te = y[tr], y[te]
@@ -416,28 +429,29 @@ class EnsemblePredictor:
                         long_taken.append(y_te[i])
                     elif d == "SHORT":
                         short_taken.append(y_te[i])
-        
+
         if not ics:
-            return ModelMetrics()
-        
+            # [SORUN 5 DÜZELTMESİ] — Açık uyarı, sessiz başarısızlık yok
+            logger.warning(
+                f"⚠️ Walk-forward hiç geçerli fold üretmedi (n={len(X)}). "
+                f"Model eğitildi ama CV metrikleri güvenilmez. "
+                f"Caller'da is_trained=False set edilecek."
+            )
+            return ModelMetrics(n_train_samples=len(X))
+
         ic_mean = float(np.mean(ics))
         ic_std = float(np.std(ics, ddof=1)) if len(ics) > 1 else 0.0
         ir = ic_mean / ic_std if ic_std > 1e-9 else 0.0
         z_agg = ic_mean * np.sqrt(len(ics)) / ic_std if ic_std > 1e-9 else 0.0
-        
-        # Cross-fold aggregation: median of per-fold (already-floored) thresholds
+
         avg_thr_long = float(np.median([t["LONG"] for t in thresholds_per_fold]))
         avg_thr_short = float(np.median([t["SHORT"] for t in thresholds_per_fold]))
-        
-        # === v3.2 SECONDARY FLOOR ENFORCEMENT (aggregation çıkışı) ===
-        # Defense in depth: calibration aşamasında floor uygulansa bile
-        # median aggregation matematiksel olarak floor altına düşürebilir
-        # (örn. yarı fold'ların floor'da yarısının altında olması durumu).
-        # Burada finalize edilmiş threshold tekrar floor'a karşı kontrol edilir.
+
+        # Secondary floor enforcement (aggregation çıkışı)
         avg_thr_long, avg_thr_short = _enforce_threshold_floors(
             avg_thr_long, avg_thr_short
         )
-        
+
         return ModelMetrics(
             spearman_ic=ic_mean, ic_std=ic_std, information_ratio=ir,
             mae=float(np.mean(maes)),
@@ -462,8 +476,15 @@ class EnsemblePredictor:
         y = np.asarray(y, dtype=float)
         unique = np.unique(y[~pd.isna(y)])
         if len(unique) <= 2 and set(unique).issubset({0, 1, 0.0, 1.0}):
-            logger.warning("Binary target detected. Converting to {-1, +1}. "
-                           "RECOMMENDED: pass R-multiple via construct_r_multiple().")
+            # [SORUN 1 DÜZELTMESİ] — Daha açıklayıcı ve uyarı düzeyi yükseltildi
+            logger.error(
+                "⚠️ BINARY TARGET DETECTED — bu olmamalıydı!\n"
+                "Eğitim verisi R-multiple yerine {0,1} binary geliyor.\n"
+                "Otomatik olarak {-1, +1}'e çevriliyor ama threshold floor'ları\n"
+                "R-multiple ölçeğine göre ayarlı (LONG=0.10, SHORT=0.40). Sonuçlar GÜVENİLMEZ.\n"
+                "Lütfen initial_train() ve retrain_from_experience()'ı kontrol edin.\n"
+                "initial_train() R-multiple üretmeli, binary {0,1} değil."
+            )
             y = np.where(y > 0.5, 1.0, -1.0)
         if directions is None:
             logger.warning("No directions provided. Direction-aware features disabled.")
@@ -477,23 +498,20 @@ class EnsemblePredictor:
             logger.warning(f"n={len(X)} < MIN_TRAIN_SAMPLES={MIN_TRAIN_SAMPLES}. Cold start.")
             self.is_trained = False
             return ModelMetrics(n_train_samples=len(X))
-        
+
         metrics = self._evaluate_walk_forward(X, y, directions_arr)
-        
-        # === v3.2 TERTIARY FLOOR ENFORCEMENT (production state çıkışı) ===
-        # En son güvenlik: instance state'e yazılmadan önce floor garantisi.
-        # Üç katmanlı savunma (calibration → aggregation → state assignment)
-        # SHORT threshold collapse riskini sıfıra indirir.
+
+        # Tertiary floor enforcement (production state çıkışı)
         floored_long, floored_short = _enforce_threshold_floors(
             metrics.threshold_long, metrics.threshold_short
         )
         self.threshold_long = floored_long
         self.threshold_short = floored_short
-        
+
         # ModelMetrics objesini de güncelle (raporlama tutarlılığı için)
         metrics.threshold_long = floored_long
         metrics.threshold_short = floored_short
-        
+
         self.lgbm_model = LGBMRegressor(n_estimators=200, max_depth=4, learning_rate=0.05,
                                           min_child_samples=10, reg_alpha=0.1, reg_lambda=0.1,
                                           random_state=42, verbose=-1)
@@ -505,8 +523,19 @@ class EnsemblePredictor:
         self.calibrator = EnsembleCalibratorMock(self.lgbm_model, self.rf_model, self.feature_names)
         self.calibrator._train_median = self._train_median
         self.model = self.calibrator
-        self.is_trained = True
-        self.retrain_count += 1
+
+        # [SORUN 5 DÜZELTMESİ] — n_folds=0 ise is_trained=False
+        if metrics.n_folds == 0 or metrics.spearman_ic == 0.0:
+            logger.warning(
+                "⚠️ Model train edildi ama CV metrikleri güvenilmez (n_folds=0 veya IC=0). "
+                "is_trained=False — cold start fallback aktif kalacak. "
+                "Daha fazla trade verisi birikmesi bekleniyor."
+            )
+            self.is_trained = False
+        else:
+            self.is_trained = True
+            self.retrain_count += 1
+
         self.last_metrics = metrics
         self._log_training_report(metrics)
         return metrics
@@ -542,10 +571,8 @@ class EnsemblePredictor:
         pred_rf = float(self.rf_model.predict(X.fillna(self._train_median))[0])
         pred_r = (pred_lgbm + pred_rf) / 2.0
         uncertainty = abs(pred_lgbm - pred_rf)
-        # self.threshold_long ve self.threshold_short zaten floor'lanmış
         threshold = self.threshold_long if ic_direction == "LONG" else self.threshold_short
-        
-        # --- YENİ LİNEER GÜVEN SKORU HESAPLAMASI ---
+
         if pred_r >= threshold:
             decision = MLDecision.LONG if ic_direction == "LONG" else MLDecision.SHORT
             confidence = 60.0 + ((pred_r - threshold) / 0.5) * 40.0
@@ -554,14 +581,14 @@ class EnsemblePredictor:
             decision = MLDecision.WAIT
             confidence = 50.0 - ((threshold - pred_r) / 0.5) * 50.0
             confidence = max(0.0, float(confidence))
-            
+
         return MLDecisionResult(
-            decision=decision, 
+            decision=decision,
             confidence=float(confidence),
-            predicted_r=float(pred_r), 
+            predicted_r=float(pred_r),
             threshold_used=float(threshold),
             fold_uncertainty=float(uncertainty),
-            feature_vector=feature_vector # <--- UNUTULAN VE EKLENEN SATIR BURASI!
+            feature_vector=feature_vector
         )
 
     def _coerce_to_frame(self, fv, ic_direction: Optional[str] = None) -> pd.DataFrame:

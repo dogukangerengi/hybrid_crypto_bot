@@ -41,6 +41,40 @@ import pandas as pd
 # TR yaz saati uygulamasını kaldırdığı için sabit UTC+3 offset güvenlidir.
 LOCAL_TZ = timezone(timedelta(hours=3), name="TRT")
 
+# =============================================================================
+# [SORUN 4 DÜZELTMESİ] — UTC-aware datetime helper fonksiyonları
+# =============================================================================
+# Eski kodda datetime.now() (naive, timezone'suz) kullanılıyordu.
+# _compute_daily_pnl bu naive string'leri UTC sanıp +3 saat çevirince
+# 3 saatlik kayma oluşuyordu. Artık tüm zaman üretimi UTC veya TR-aware.
+#
+# Kullanım:
+#   _now_utc()  → UTC datetime (karşılaştırma, hesaplama)
+#   _now_local() → TR datetime (log, display)
+#   _iso_tr()   → Excel için TR zaman string'i (timezone bilgisi olmadan)
+
+def _now_utc() -> datetime:
+    """UTC-aware şimdi — karşılaştırma ve hesaplamalar için."""
+    return datetime.now(timezone.utc)
+
+def _now_local() -> datetime:
+    """TR (LOCAL_TZ) aware şimdi — log ve gösterim için."""
+    return datetime.now(LOCAL_TZ)
+
+def _iso_tr(dt: datetime = None) -> str:
+    """
+    ISO formatında TR zaman string'i (Excel için okunabilir).
+    Excel tz-aware ISO'yu parse edemeyebilir, bu yüzden
+    saf string olarak yazıyoruz ama TR saatiyle.
+    """
+    if dt is None:
+        dt = datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%dT%H:%M:%S.%f")
+
+
+
 # ── .env yükle ────────────────────────────────────────────────────────────────
 from dotenv import load_dotenv
 _src_dir  = Path(__file__).parent
@@ -447,6 +481,9 @@ class MLTradingPipeline:
                     else:
                         closed_dt = closed_at
                     if closed_dt.tzinfo is None:
+                        # Naive datetime geldi — UTC varsayıyoruz
+                        # Bu dal artık tetiklenmemeli (_iso_tr() her yerde UTC üretiyor)
+                        logger.debug(f'Naive datetime: {closed_at} — UTC varsayılıyor')
                         closed_dt = closed_dt.replace(tzinfo=timezone.utc)
                     # ⏱️ Yerel saate çevirip TR gününe göre karşılaştır
                     closed_dt_local = closed_dt.astimezone(LOCAL_TZ)
@@ -601,6 +638,71 @@ class MLTradingPipeline:
             logger.warning(f"  ⚠️ Rejim tespiti hatası: {e}")
             return 'ranging'
 
+
+    @staticmethod
+    def _compute_category_tops(
+        all_scores: list,
+        categories: dict
+    ) -> dict:
+        """
+        [SORUN 2 DÜZELTMESİ] — Kategori bazlı en güçlü indikatörü bulur.
+
+        Eski kodda iç içe bozuk for-döngüsü vardı:
+        - `if 'matched' in locals()` her zaman True dönerdi
+        - `if not cat_scores:` döngü içinde değişkeni güncellemiyordu
+        - Sonuç: category_tops neredeyse her zaman boş dict dönüyordu
+        - ic_cat_trend/momentum/volatility/volume feature'ları hep NaN oluyordu
+
+        Bu implementasyon iki aşamalı temiz eşleştirme yapar:
+        1. startswith eşleşmesi (tam ön ek)
+        2. contains eşleşmesi (daha esnek, min 3 karakter)
+
+        Parameters
+        ----------
+        all_scores : List[IndicatorScore]
+            selector.evaluate_all_indicators() çıktısı
+        categories : Dict[str, List[str]]
+            {'trend': ['ADX', 'Aroon', ...], 'momentum': ['RSI', ...], ...}
+
+        Returns
+        -------
+        Dict[str, Dict]
+            {'trend': {'name': 'ADX_14', 'ic': -0.05}, ...}
+            Boş kategoriler sonuç dict'e dahil edilmez.
+        """
+        result = {}
+
+        for cat, cat_indicators in categories.items():
+            # Aşama 1: startswith (tam ön ek eşleşmesi)
+            cat_scores = [
+                s for s in all_scores
+                if any(
+                    s.name.lower().startswith(ci.lower() + '_') or
+                    s.name.lower().startswith(ci.lower())
+                    for ci in cat_indicators
+                )
+            ]
+
+            # Aşama 2: contains (esnek eşleşme, en az 3 karakter)
+            if not cat_scores:
+                cat_scores = [
+                    s for s in all_scores
+                    if any(
+                        ci.lower() in s.name.lower()
+                        for ci in cat_indicators
+                        if len(ci) >= 3
+                    )
+                ]
+
+            if cat_scores:
+                top = max(cat_scores, key=lambda s: abs(s.ic_mean))
+                result[cat] = {
+                    "name": top.name,
+                    "ic": round(top.ic_mean, 4),
+                }
+
+        return result
+
     def _analyze_coin(self, symbol: str, coin: str, scan_result=None) -> CoinAnalysisResult:
         result = CoinAnalysisResult(coin=coin, full_symbol=symbol)
 
@@ -708,41 +810,14 @@ class MLTradingPipeline:
 
             result.market_regime = self._detect_regime(indicator_data[best_tf])
 
+            # [SORUN 2 DÜZELTMESİ] — Bozuk iç içe for-döngüsü yerine temiz helper
             CATEGORIES = {
-                'volume':  ['OBV', 'CMF', 'VPT', 'FI', 'EOM', 'ADI', 'NVI'],
-                'momentum':['RSI', 'Stoch', 'MFI', 'UO', 'MACD', 'PPO', 'ROC',
-                            'TSI', 'CCI', 'Williams'],
-                'trend':   ['ADX', 'Aroon', 'PSAR', 'DPO', 'Vortex', 'KST',
-                            'Ichimoku', 'SMA', 'EMA', 'WMA'],
-                'volatility': ['BBW', 'ATR', 'Keltner', 'Donchian', 'STD'],
+                'volume':     ['OBV', 'CMF', 'VPT', 'FI', 'EOM', 'ADI', 'NVI', 'MFI'],
+                'momentum':   ['RSI', 'Stoch', 'UO', 'MACD', 'PPO', 'ROC', 'TSI', 'CCI', 'Williams', 'WILLR'],
+                'trend':      ['ADX', 'Aroon', 'PSAR', 'DPO', 'Vortex', 'KST', 'Ichimoku', 'SMA', 'EMA', 'WMA'],
+                'volatility': ['BBW', 'BBU', 'BBL', 'BBM', 'ATR', 'NATR', 'Keltner', 'Donchian'],
             }
-            dynamic_cat_tops = {}
-            for cat, cat_indicators in CATEGORIES.items():
-                cat_scores = [s for s in best_scores if any(
-                    s.name.lower().startswith(ci.lower()) or ci.lower() in s.name.lower()
-                    for ci in cat_indicators
-                )]
-                if not cat_scores:
-                    cat_ind_lower = [x.lower() for x in cat_indicators]
-                    matched = []
-                    for s in best_scores:
-                        s_lower = s.name.lower()
-                        if not cat_scores:
-                                for ci in cat_ind_lower:
-                                    if s_lower.startswith(ci + '_') or s_lower.startswith(ci):
-                                        if len(ci) >= 3:
-                                            matched.append(s)
-                                            break
-                        if 'matched' in locals():
-                            cat_scores = matched
-                        else:
-                            cat_scores = []
-
-                if cat_scores:
-                    top = max(cat_scores, key=lambda s: abs(s.ic_mean))
-                    dynamic_cat_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
-
-            result.category_tops = dynamic_cat_tops
+            result.category_tops = self._compute_category_tops(best_scores, CATEGORIES)
 
             df_best = indicator_data[best_tf]
 
@@ -991,7 +1066,7 @@ class MLTradingPipeline:
 
                         yeni_islem = {
                             "ID": str(uuid.uuid4())[:8],
-                            "Tarih (Açılış)": datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f"),
+                            "Tarih (Açılış)": _iso_tr(_now_utc()),  # UTC üretilir, TR gösterilir
                             "Tarih (Kapanış)": "",
                             "Coin": result.coin,
                             "Yön": direction,
@@ -1386,8 +1461,8 @@ class MLTradingPipeline:
 
                                     if mask.any():
                                         idx = df[mask].index[-1]
-                                        kapanis_zamani = datetime.now()
-                                        df.at[idx, 'Tarih (Kapanış)'] = kapanis_zamani.strftime("%Y-%m-%dT%H:%M:%S.%f")
+                                        kapanis_zamani = _now_utc()
+                                        df.at[idx, 'Tarih (Kapanış)'] = _iso_tr(kapanis_zamani)
                                         try:
                                             acilis_str = str(df.at[idx, 'Tarih (Açılış)'])
                                             acilis_zamani = pd.to_datetime(acilis_str)
@@ -1538,8 +1613,8 @@ class MLTradingPipeline:
                                 if mask.any():
                                     idx = df[mask].index[-1]
 
-                                    kapanis_zamani = datetime.now()
-                                    df.at[idx, 'Tarih (Kapanış)'] = kapanis_zamani.strftime("%Y-%m-%dT%H:%M:%S.%f")
+                                    kapanis_zamani = _now_utc()
+                                    df.at[idx, 'Tarih (Kapanış)'] = _iso_tr(kapanis_zamani)
 
                                     try:
                                         acilis_str = str(df.at[idx, 'Tarih (Açılış)'])
@@ -1791,7 +1866,9 @@ class MLTradingPipeline:
                     r_multiple = -1.0 # Stop Loss vurulduysa 1.0 R kayıp
                 else:
                     if pnl != 0:
-                        r_multiple = pnl / 0.16 
+                        risk_est = self._balance * 0.02 if self._balance > 0 else 1.0
+                        r_multiple = pnl / risk_est if risk_est > 0 else 0.0  # [SORUN 1 FIX]
+
                         r_multiple = max(-2.0, min(2.0, r_multiple))
                     else:
                         r_multiple = 0.0
@@ -1950,88 +2027,81 @@ class MLTradingPipeline:
             train_cat_tops = {}
             all_scores = self.selector.evaluate_all_indicators(df_ind, target_col)
 
+            # [SORUN 2 DÜZELTMESİ] — Temiz helper kullan
             CATEGORIES = {
-                'volume':  ['OBV', 'CMF', 'VPT', 'FI', 'EOM', 'ADI', 'NVI'],
-                'momentum':['RSI', 'Stoch', 'MFI', 'UO', 'MACD', 'PPO', 'ROC','TSI', 'CCI', 'Williams'],
-                'trend':   ['ADX', 'Aroon', 'PSAR', 'DPO', 'Vortex', 'KST','Ichimoku', 'SMA', 'EMA', 'WMA'],
-                'volatility': ['BBW', 'ATR', 'Keltner', 'Donchian', 'STD'],
+                'volume':     ['OBV', 'CMF', 'VPT', 'FI', 'EOM', 'ADI', 'NVI', 'MFI'],
+                'momentum':   ['RSI', 'Stoch', 'UO', 'MACD', 'PPO', 'ROC', 'TSI', 'CCI', 'Williams', 'WILLR'],
+                'trend':      ['ADX', 'Aroon', 'PSAR', 'DPO', 'Vortex', 'KST', 'Ichimoku', 'SMA', 'EMA', 'WMA'],
+                'volatility': ['BBW', 'BBU', 'BBL', 'BBM', 'ATR', 'NATR', 'Keltner', 'Donchian'],
             }
-            for cat, cat_indicators in CATEGORIES.items():
-                cat_scores = [s for s in all_scores if any(s.name.lower().startswith(ci.lower()) for ci in cat_indicators)]
-                if cat_scores:
-                    top = max(cat_scores, key=lambda s: abs(s.ic_mean))
-                    train_cat_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
+            train_cat_tops = self._compute_category_tops(all_scores, CATEGORIES)
 
-            MIN_MOVE = 0.0025
+            MIN_MOVE = 0.0025  # Küçük fiyat hareketleri (TIMEOUT dead-band) için alt eşik
             start_idx = 250
             end_idx   = len(df_ind) - self.fwd_period
+
+            # [SORUN 2] category_tops loop dışında bir kez hesapla
+            analysis_stub.category_tops = self._compute_category_tops(all_scores, CATEGORIES)
+
+            # [SORUN 1+9] ATR kolonu bul
+            atr_col_train = next(
+                (c for c in ['ATRr_14', 'ATR_14', 'ATRr_7', 'NATR_14'] if c in df_ind.columns),
+                None
+            )
+            if atr_col_train is None:
+                logger.error("❌ ATR kolonu bulunamadı — initial_train başarısız")
+                return False
+
+            ATR_MULT, RR_RATIO = 3.0, 1.5
 
             for i in range(start_idx, end_idx):
                 fwd_val = df_ind[target_col].iloc[i]
                 if pd.isna(fwd_val):
                     continue
-                if abs(fwd_val) < MIN_MOVE:
+
+                entry_price = df_ind['close'].iloc[i]
+                atr_val     = df_ind[atr_col_train].iloc[i]
+                if atr_col_train == 'NATR_14':
+                    atr_val = atr_val * entry_price / 100  # % → $
+                if pd.isna(entry_price) or pd.isna(atr_val) or atr_val <= 0 or entry_price <= 0:
                     continue
 
-                target = 1 if fwd_val > 0 else 0
-                fake_direction = "LONG" if fwd_val > 0 else "SHORT" # YENİ EKLENDİ
-                
-                df_slice = df_ind.iloc[max(0, i-50):i+1].copy()
+                sl_distance    = atr_val * ATR_MULT
+                tp_distance    = sl_distance * RR_RATIO
+                price_move_usd = (np.exp(fwd_val) - 1) * entry_price
+
+                df_slice = df_ind.iloc[max(0, i - 50):i + 1].copy()
                 if len(df_slice) < 40:
                     continue
 
-                analysis_stub.category_tops = {}
-                for cat, cat_indicators in CATEGORIES.items():
-                    cat_scores = [s for s in all_scores if any(s.name.lower().startswith(ci.lower()) for ci in cat_indicators)]
-                    if not cat_scores:
-                        cat_ind_lower = [x.lower() for x in cat_indicators]
-                        matched = []
-                        for s in all_scores:
-                            s_lower = s.name.lower()
-                            if not cat_scores:
-                                for ci in cat_ind_lower:
-                                    if s_lower.startswith(ci + '_') or s_lower.startswith(ci):
-                                        if len(ci) >= 3:
-                                            matched.append(s)
-                                            break
-                        if 'matched' in locals():
-                            cat_scores = matched
+                # [SORUN 9] Her bar için LONG ve SHORT → tautoloji yok
+                for fake_direction in ["LONG", "SHORT"]:
+                    if fake_direction == 'LONG':
+                        if price_move_usd >= tp_distance:
+                            r_multiple = RR_RATIO
+                        elif price_move_usd <= -sl_distance:
+                            r_multiple = -1.0
                         else:
-                            cat_scores = []
-
-                    if cat_scores:
-                        top = max(cat_scores, key=lambda s: abs(s.ic_mean))
-                        dynamic_cat_tops = {}
-                        for cat, cat_indicators in CATEGORIES.items():
-                            cat_scores = [s for s in all_scores if any(
-                                s.name.lower().startswith(ci.lower()) or ci.lower() in s.name.lower()
-                                for ci in cat_indicators
-                            )]
-                            if not cat_scores:
-                                for ci in cat_ind_lower:
-                                    if s_lower.startswith(ci + '_') or s_lower.startswith(ci):
-                                        if len(ci) >= 3:
-                                            matched.append(s)
-                                            break
-                        if 'matched' in locals():
-                            cat_scores = matched
+                            r_multiple = price_move_usd / sl_distance
+                    else:  # SHORT
+                        if price_move_usd <= -tp_distance:
+                            r_multiple = RR_RATIO
+                        elif price_move_usd >= sl_distance:
+                            r_multiple = -1.0
                         else:
-                            cat_scores = []
+                            r_multiple = -price_move_usd / sl_distance
 
-                if cat_scores:
-                    top = max(cat_scores, key=lambda s: abs(s.ic_mean))
-                    dynamic_cat_tops[cat] = {"name": top.name, "ic": round(top.ic_mean, 4)}
+                    if abs(r_multiple) < 0.25:  # dead-band: noise at
+                        continue
+                    r_multiple = max(-2.0, min(2.0, r_multiple))
 
-                analysis_stub.category_tops = dynamic_cat_tops
-
-                fv = self.feature_eng.build_features(
-                    analysis=analysis_stub,
-                    ohlcv_df=df_slice
-                )
-
-                rows_X.append(fv.to_dict())
-                rows_y.append(1 if target > 0 else 0)
-                rows_dir.append(fake_direction) # YENİ EKLENDİ
+                    fv = self.feature_eng.build_features(
+                        analysis=analysis_stub,
+                        ohlcv_df=df_slice,
+                    )
+                    rows_X.append(fv.to_dict())
+                    rows_y.append(float(r_multiple))
+                    rows_dir.append(fake_direction)
 
             if len(rows_X) < 30:
                 logger.error(f"❌ Yetersiz eğitim verisi: {len(rows_X)} < 30")

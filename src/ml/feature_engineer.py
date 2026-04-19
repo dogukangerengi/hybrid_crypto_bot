@@ -527,15 +527,15 @@ class FeatureEngineer:
             scores = [r.get('score', 0) for r in tf_rankings]   # Her TF'nin skoru
 
             # En iyi TF skoru (pipeline'ın seçtiği timeframe)
-            features['ctf_best_score'] = float(max(scores))     # En yüksek TF composite skoru
+            features['ctf_best_score'] = float(max(scores))     # En iyi TF'nin IC×100 skoru (tipik 5-20, yüzde DEĞİL)
 
             # TF skorları ortalaması (genel sinyal kalitesi)
-            features['ctf_avg_score'] = float(np.mean(scores))  # Ortalama TF skoru
+            features['ctf_avg_score'] = float(np.mean(scores))  # Ortalama TF IC×100 skoru
 
             # TF skorları standart sapması (TF'ler arası tutarlılık)
             # Düşük std = tüm TF'ler benzer sinyal → güvenilir
             # Yüksek std = TF'ler çelişiyor → riskli
-            features['ctf_score_std'] = float(                  # TF skorları standart sapması
+            features['ctf_score_std'] = float(                  # TF IC×100 skorları std (düşük=tutarlı)
                 np.std(scores) if len(scores) > 1 else 0.0
             )
 
@@ -957,9 +957,9 @@ class FeatureEngineer:
             'mkt_regime_ranging':     '1=yatay piyasa',
             'mkt_regime_volatile':    '1=volatil piyasa',
             # Cross-TF Features
-            'ctf_best_score':         'En iyi TF composite skoru',
-            'ctf_avg_score':          'Ortalama TF skoru',
-            'ctf_score_std':          'TF skorları std (düşük=tutarlı)',
+            'ctf_best_score':         'En iyi TF IC×100 skoru (0-40 tipik, yüzde değil)',
+            'ctf_avg_score':          'Ortalama TF IC×100 skoru (0-40 tipik)',
+            'ctf_score_std':          'TF IC×100 skorları std (düşük=tutarlı TF)  ',
             'ctf_score_spread':       'En iyi vs en kötü TF farkı',
             'ctf_direction_agreement':'TF yön uyumu oranı (0-1)',
             'ctf_n_timeframes':       'Analiz edilen TF sayısı',
