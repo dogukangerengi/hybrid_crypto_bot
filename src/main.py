@@ -1776,7 +1776,8 @@ class MLTradingPipeline:
 
             for t in closed_trades:
                 fv = t.get('feature_snapshot', {})
-                if not fv:
+                # Eğer fv boşsa veya amnezi (eksik kolon) sorunu yaşanmışsa o işlemi yoksay!
+                if not fv or 'ic_confidence' not in fv:
                     continue
 
                 direction = t.get('direction', '')
@@ -1794,12 +1795,18 @@ class MLTradingPipeline:
                         r_multiple = max(-2.0, min(2.0, r_multiple))
                     else:
                         r_multiple = 0.0
+                        
+                # --- YENİ EKLENEN DEAD-BAND (ÖLÜ BÖLGE) FİLTRESİ ---
+                # TIMEOUT olan ve çok küçük kâr/zarar (-0.25R ile +0.25R arası) eden işlemleri
+                # gürültü (noise) olmaması için eğitimden dışlıyoruz.
+                if exit_reason == "TIMEOUT" and abs(r_multiple) < 0.25:
+                    continue
                 
                 target = float(r_multiple)
 
                 rows_X.append(fv)
                 rows_y.append(target)
-                rows_dir.append(direction) # YENİ EKLENDİ
+                rows_dir.append(direction)
 
             if len(rows_X) == 0:
                 return False

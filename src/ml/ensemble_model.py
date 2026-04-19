@@ -544,15 +544,24 @@ class EnsemblePredictor:
         uncertainty = abs(pred_lgbm - pred_rf)
         # self.threshold_long ve self.threshold_short zaten floor'lanmış
         threshold = self.threshold_long if ic_direction == "LONG" else self.threshold_short
-        confidence = 100.0 / (1.0 + np.exp(-2.0 * (pred_r - threshold)))
+        
+        # --- YENİ LİNEER GÜVEN SKORU HESAPLAMASI ---
         if pred_r >= threshold:
             decision = MLDecision.LONG if ic_direction == "LONG" else MLDecision.SHORT
+            confidence = 60.0 + ((pred_r - threshold) / 0.5) * 40.0
+            confidence = min(100.0, float(confidence))
         else:
             decision = MLDecision.WAIT
+            confidence = 50.0 - ((threshold - pred_r) / 0.5) * 50.0
+            confidence = max(0.0, float(confidence))
+            
         return MLDecisionResult(
-            decision=decision, confidence=float(confidence),
-            predicted_r=float(pred_r), threshold_used=float(threshold),
+            decision=decision, 
+            confidence=float(confidence),
+            predicted_r=float(pred_r), 
+            threshold_used=float(threshold),
             fold_uncertainty=float(uncertainty),
+            feature_vector=feature_vector # <--- UNUTULAN VE EKLENEN SATIR BURASI!
         )
 
     def _coerce_to_frame(self, fv, ic_direction: Optional[str] = None) -> pd.DataFrame:
