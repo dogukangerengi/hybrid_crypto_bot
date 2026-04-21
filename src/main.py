@@ -328,8 +328,11 @@ class MLTradingPipeline:
     def _init_balance(self) -> bool:
         try:
             if self.dry_run:
-                self._balance = self._initial_balance = 1000.0
-                logger.info(f"💰 Paper bakiye: ${self._balance:.2f}")
+                # Paper trader'ın mevcut bakiyesini kullan (1000.0 değil)
+                # Böylece initial_balance gerçek başlangıç noktasını yansıtır
+                # ve kill switch yanlış tetiklenmez.
+                self._balance = self._initial_balance = self.paper_trader.balance
+                logger.info(f"💰 Paper bakiye: ${self._balance:.2f} (paper_trader'dan)")
             else:
                 b = self.executor.fetch_balance()
                 if isinstance(b, dict):
@@ -388,8 +391,13 @@ class MLTradingPipeline:
             if self.notifier.is_configured():
                 self.notifier.send_risk_alert_sync(
                     alert_type="KILL_SWITCH",
-                    message=f"⛔ Kill switch! DD={dd:.1f}%",
-                    balance=self._balance, drawdown=dd,
+                    details=(
+                        f"⛔ Kill switch tetiklendi!\n"
+                        f"📉 Drawdown: %{dd:.1f}\n"
+                        f"💰 Başlangıç: ${self._initial_balance:.2f}\n"
+                        f"💰 Güncel: ${self._balance:.2f}"
+                    ),
+                    severity="critical",
                 )
             return True
         return False
@@ -1466,6 +1474,9 @@ class MLTradingPipeline:
                                         try:
                                             acilis_str = str(df.at[idx, 'Tarih (Açılış)'])
                                             acilis_zamani = pd.to_datetime(acilis_str)
+                                            # UTC-aware yap (aware - naive → TypeError önle)
+                                            if acilis_zamani.tzinfo is None:
+                                                acilis_zamani = acilis_zamani.tz_localize('UTC')
                                             df.at[idx, 'Süre (dk)'] = int((kapanis_zamani - acilis_zamani).total_seconds() / 60)
                                         except Exception:
                                             df.at[idx, 'Süre (dk)'] = 0
@@ -1619,6 +1630,8 @@ class MLTradingPipeline:
                                     try:
                                         acilis_str = str(df.at[idx, 'Tarih (Açılış)'])
                                         acilis_zamani = pd.to_datetime(acilis_str)
+                                        if acilis_zamani.tzinfo is None:
+                                            acilis_zamani = acilis_zamani.tz_localize('UTC')
                                         df.at[idx, 'Süre (dk)'] = int((kapanis_zamani - acilis_zamani).total_seconds() / 60)
                                     except Exception:
                                         df.at[idx, 'Süre (dk)'] = 0
@@ -1694,7 +1707,7 @@ class MLTradingPipeline:
         report = CycleReport(timestamp=datetime.now(timezone.utc).isoformat())
 
         logger.info(f"\n{'═'*60}")
-        logger.info(f"🔄 YENİ DÖNGÜ — {datetime.now().strftime('%H:%M:%S')} "
+        logger.info(f"🔄 YENİ DÖNGÜ — {_now_local().strftime('%H:%M:%S')} "
                     f"| v{VERSION} | {'PAPER' if self.dry_run else 'CANLI'}")
         logger.info(f"{'═'*60}")
 
@@ -1910,7 +1923,7 @@ class MLTradingPipeline:
                     z_score = (metrics.spearman_ic * np.sqrt(metrics.n_train_samples - 3)) if metrics.n_train_samples > 3 else 0.0
                     
                     df_metrics = pd.DataFrame([{
-                        "Tarih": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Tarih": _now_local().strftime("%Y-%m-%d %H:%M:%S"),  # TR saati
                         "Kaynak": "retrain_from_experience",
                         "Eğitim Satır Sayısı": len(X_experience),
                         "Kazanma Oranı (Win Rate)": f"{sum(1 for val in y_experience if float(val) > 0) / max(1, len(y_experience)) * 100:.1f}%",
@@ -2137,7 +2150,7 @@ class MLTradingPipeline:
                     z_score = (metrics.spearman_ic * np.sqrt(metrics.n_train_samples - 3)) if metrics.n_train_samples > 3 else 0.0
                     
                     df_metrics = pd.DataFrame([{
-                        "Tarih": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "Tarih": _now_local().strftime("%Y-%m-%d %H:%M:%S"),  # TR saati
                         "Kaynak": "initial_train",
                         "Eğitim Satır Sayısı": len(X),
                         "Kazanma Oranı (Win Rate)": f"{sum(1 for val in y if float(val) > 0) / max(1, len(y)) * 100:.1f}%",
@@ -2385,7 +2398,7 @@ class MLTradingPipeline:
             ws_summary['A1'] = '📊 CANLI İŞLEM PERFORMANS RAPORU'
             ws_summary['A1'].font = title_font
             ws_summary.merge_cells('A1:D1')
-            ws_summary['A2'] = f'Oluşturulma: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+            ws_summary['A2'] = f'Oluşturulma: {_now_local().strftime("%Y-%m-%d %H:%M:%S")} (TR)'
             ws_summary['A2'].font = Font(name='Arial', size=9, italic=True, color='808080')
 
             ws_summary.column_dimensions['A'].width = 22
@@ -2469,7 +2482,7 @@ class MLTradingPipeline:
             try:
                 wb.save(str(filepath))
             except PermissionError:
-                alt_path = filepath.with_stem(filepath.stem + f"_{datetime.now().strftime('%H%M%S')}")
+                alt_path = filepath.with_stem(filepath.stem + f"_{_now_local().strftime('%H%M%S')}")
                 wb.save(str(alt_path))
                 logger.warning(f"⚠️ Dosya kilitli, alternatif kaydedildi: {alt_path}")
         except Exception as e:
@@ -2580,7 +2593,7 @@ class MLTradingPipeline:
                     if col in df.columns:
                         df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
 
-                now_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S.%f")
+                now_str = _iso_tr(_now_utc())  # UTC üret, TR göster
                 df.at[idx, 'Tarih (Kapanış)'] = now_str
                 df.at[idx, 'Çıkış ($)']       = round(exit_price, 6)
                 df.at[idx, 'PnL ($)']         = round(pnl_val, 4)
@@ -2592,7 +2605,10 @@ class MLTradingPipeline:
 
                 try:
                     acilis = pd.to_datetime(str(row.get('Tarih (Açılış)', '')))
-                    df.at[idx, 'Süre (dk)'] = int((datetime.now() - acilis.to_pydatetime()).total_seconds() / 60)
+                    _acilis_aware = acilis.to_pydatetime()
+                    if _acilis_aware.tzinfo is None:
+                        _acilis_aware = _acilis_aware.replace(tzinfo=timezone.utc)
+                    df.at[idx, 'Süre (dk)'] = int((_now_utc() - _acilis_aware).total_seconds() / 60)
                 except Exception:
                     pass
 
@@ -2659,7 +2675,7 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 10) -> No
         if report.status == CycleStatus.KILLED:
             break
 
-        logger.info(f"⏰ Sonraki Tarama: {(datetime.now()+timedelta(minutes=interval_minutes)).strftime('%H:%M:%S')}")
+        logger.info(f"⏰ Sonraki Tarama: {(_now_local()+timedelta(minutes=interval_minutes)).strftime('%H:%M:%S')}")
 
         for i in range(interval_minutes * 60):
             if not pipeline._is_running:
