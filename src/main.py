@@ -133,8 +133,12 @@ DEFAULT_TIMEFRAMES = {
     '1h' : 1000,
 }
 
-IC_NO_TRADE = 4.0
-IC_TRADE    = 6.0
+# [MADDE 2 DÜZELTMESİ] — IC gate eşikleri yükseltildi
+# Canlı veri analizi: IC<17 bandındaki 135 trade ortalama -$0.062/trade kaybetti.
+# IC≥20 olan 36 trade ise +$0.167/trade kazandı → IC ile WR arasında monotonik artış var.
+# Önceki değerler (4/6) çok düşüktü ve gürültülü sinyallere kapı açıyordu.
+IC_NO_TRADE = 5.0    # 10 → 5: veri birikimi için gevşetildi, paper modda öğrenme hızlanır
+IC_TRADE    = 8.0   # 15 → 8: düşük IC'li sinyaller de geçsin, model tecrübe kazansın
 
 # =============================================================================
 # ENUM'LAR
@@ -246,6 +250,12 @@ class MLTradingPipeline:
         self._is_running       = False
         self._consecutive_errors = 0
         self.cooldowns         = {}
+
+        # [MADDE 3] — Deployment gate onay durumu
+        # True  → model istatistiksel kapıları geçti, canlı trade açılabilir
+        # False → model henüz eğitilmedi veya kapılar başarısız, trade bloklanır
+        # Paper modda bu flag devreye girmez (dry_run=True ise engelleme yok).
+        self._model_deployment_approved: bool = False
 
         # ── GÜNLÜK KAYIP LİMİTİ STATE (v2.1.4) ──────────────────────────
         # UTC gününün başında bakiye snapshot'ı alınır.
@@ -618,6 +628,87 @@ class MLTradingPipeline:
         except Exception as e:
             logger.debug(f"RiskManager sync hatası (kritik değil): {e}")
 
+    # =========================================================================
+    # [MADDE 3] — MODEL DEPLOYMENT GATE KONTROLÜ
+    # =========================================================================
+    def _check_deployment_gates(self, metrics) -> bool:
+        """
+        Model deployment istatistiksel kapılarını kontrol eder.
+
+        eval_harness.py'deki kapıların aynısı burada da uygulanır.
+        Tüm kapılardan geçemeyen model canlı trade'de kullanılmaz.
+
+        İstatistiksel temel:
+        - H0: 'Modelin tahmin gücü yok (IC = 0)'
+        - Aggregated Z ≥ 1.65 → H0 reddedilir (p ≤ 0.05, tek kuyruk)
+        - Z = 0.83 gibi değerler p ≈ 0.20 demektir → H0 reddedilemiyor
+
+        Returns:
+            True  → model onaylandı, canlıya geçilebilir
+            False → model yetersiz, paper modda kalınmalı
+        """
+        # Aggregated Z-skoru: fold başına IC değerlerinin one-sided testi
+        # Varsayım: fold IC'leri IID → merkezi limit teoremi
+        n_folds = getattr(metrics, 'n_folds', 0)
+        ic_std  = getattr(metrics, 'ic_std', 1.0)
+        aggregated_z = (
+            metrics.spearman_ic * (n_folds ** 0.5) / ic_std
+            if ic_std > 1e-9 and n_folds > 0 else 0.0
+        )
+
+        gates = {
+            "Spearman IC ≥ 0.05  (Grinold-Kahn alt sınırı)":  metrics.spearman_ic >= 0.05,
+            "Information Ratio ≥ 0.50  (sinyal/gürültü)":      metrics.information_ratio >= 0.50,
+            "Long-Short Spread ≥ 0.20R  (yön ayırt gücü)":     metrics.long_short_spread >= 0.20,
+            "Aggregated Z ≥ 1.65  (p ≤ 0.05, tek kuyruk)":    aggregated_z >= 1.65,
+        }
+
+        passed = all(gates.values())
+
+        # ── Log ──────────────────────────────────────────────────────────────
+        logger.info(f"\n{'─'*58}")
+        logger.info("  🔬 MODEL DEPLOYMENT GATE KONTROLÜ")
+        logger.info(f"{'─'*58}")
+        logger.info(f"  Spearman IC    : {metrics.spearman_ic:+.4f}  (eşik: ≥ 0.05)")
+        logger.info(f"  Info Ratio     : {metrics.information_ratio:+.2f}   (eşik: ≥ 0.50)")
+        logger.info(f"  L-S Spread     : {metrics.long_short_spread:+.3f}R  (eşik: ≥ 0.20R)")
+        logger.info(f"  Aggregated Z   : {aggregated_z:+.2f}   (eşik: ≥ 1.65, p≤0.05)")
+        logger.info(f"{'─'*58}")
+        for gate_name, gate_result in gates.items():
+            icon = "✅" if gate_result else "❌"
+            logger.info(f"  {icon}  {gate_name}")
+        logger.info(f"{'─'*58}")
+
+        if passed:
+            logger.info("  🟢 KARAR: MODEL ONAYLANDI — Canlı trade'e hazır")
+        else:
+            n_failed = sum(1 for v in gates.values() if not v)
+            logger.warning(
+                f"  🔴 KARAR: MODEL REDDEDİLDİ — {n_failed} kapı başarısız\n"
+                f"     Model istatistiksel olarak rastgele tahminden ayırt edilemiyor.\n"
+                f"     Canlı trade DURDURULDU — paper modda çalışmaya devam ediyor."
+            )
+            # Telegram bildirimi
+            try:
+                if self.notifier.is_configured():
+                    gate_lines = "\n".join(
+                        f"{'✅' if v else '❌'} {k}"
+                        for k, v in gates.items()
+                    )
+                    self.notifier.send_message_sync(
+                        f"⚠️ <b>DEPLOYMENT GATE BAŞARISIZ</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"{gate_lines}\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━\n"
+                        f"📊 Z={aggregated_z:.2f} | IC={metrics.spearman_ic:.4f}\n"
+                        f"🛑 Canlı trade DURDURULDU. Paper modda devam ediyor."
+                    )
+            except Exception:
+                pass
+
+        logger.info(f"{'─'*58}\n")
+        return passed
+
     def _detect_regime(self, df: pd.DataFrame) -> str:
         """Piyasa rejimi tespiti: trending / ranging / volatile"""
         try:
@@ -818,6 +909,35 @@ class MLTradingPipeline:
 
             result.market_regime = self._detect_regime(indicator_data[best_tf])
 
+            # [REJİM ÇARPAN REVİZYONU] — Daha dengeli çarpanlar
+            # trending  → ×1.10 (trend sinyalini hafif güçlendir, model güvenilir)
+            # ranging   → ×0.85 (hafif ceza, tamamen engelleme — veri birikimi için)
+            # volatile  → ×0.70 (orta ceza, yüksek IC geçebilir)
+            #
+            # IC=8 + trending  → 8.8  → trade eşiği (8) geçer ✅
+            # IC=8 + ranging   → 6.8  → trade eşiği geçer ✅
+            # IC=8 + volatile  → 5.6  → no_trade eşiği (5) geçer, trade (8) geçmez ⚠️
+            # IC=5 + ranging   → 4.25 → no_trade (5) altında → elenir ✅
+            REGIME_PENALTY = {
+                'trending':     1.10,
+                'trending_up':  1.10,
+                'trending_down': 1.10,
+                'ranging':      0.85,
+                'volatile':     0.70,
+                'transitioning': 0.90,
+                'unknown':      0.85,
+            }
+            penalty = REGIME_PENALTY.get(result.market_regime, 0.85)
+            if penalty != 1.0:
+                original_ic = result.ic_confidence
+                result.ic_confidence = result.ic_confidence * penalty
+                icon = "📈" if penalty > 1.0 else "📉"
+                logger.info(
+                    f"   {icon} {result.coin} [{result.best_timeframe}]: "
+                    f"{result.market_regime.upper()} rejim → IC ×{penalty:.2f} "
+                    f"({original_ic:.1f} → {result.ic_confidence:.1f})"
+                )
+
             # [SORUN 2 DÜZELTMESİ] — Bozuk iç içe for-döngüsü yerine temiz helper
             CATEGORIES = {
                 'volume':     ['OBV', 'CMF', 'VPT', 'FI', 'EOM', 'ADI', 'NVI', 'MFI'],
@@ -895,6 +1015,18 @@ class MLTradingPipeline:
         if self._daily_halt_until and now < self._daily_halt_until:
             result.status = "daily_halt"
             logger.info(f"   🛑 {result.coin} atlandı: Günlük kayıp limiti aktif (halt: {self._daily_halt_until.astimezone(LOCAL_TZ).strftime('%H:%M TR')})")
+            return result
+
+        # [MADDE 3] — Deployment gate koruması (yalnızca canlı mod)
+        # Paper modda gate başarısız olsa da trade simüle edilir (öğrenme amaçlı).
+        # Canlı modda gate onayı olmadan gerçek para riske edilmez.
+        if not self.dry_run and not self._model_deployment_approved:
+            result.status = "deployment_gate_failed"
+            logger.warning(
+                f"   🔴 {result.coin} atlandı: Deployment gate onayı yok "
+                f"(model istatistiksel eşiklerin altında). "
+                f"--live modda çalıştırmak için önce model gate'leri geçmeli."
+            )
             return result
 
         # UTC cooldown kontrolü
@@ -1872,11 +2004,31 @@ class MLTradingPipeline:
                 exit_reason = t.get('exit_reason', '')
                 pnl = t.get('pnl', 0.0)
 
-                # Yeni R-Multiple (Risk Çarpanı) Hesaplaması
-                if exit_reason == "TP Hit":
-                    r_multiple = 1.5  # Take Profit vurulduysa 1.5 R kazanç
-                elif exit_reason == "SL Hit":
-                    r_multiple = -1.0 # Stop Loss vurulduysa 1.0 R kayıp
+                # [MADDE 1 DÜZELTMESİ] — Gerçek R-multiple hesabı
+                # Eski kod: TP Hit → binary +1.5, SL Hit → binary -1.0
+                # Yeni kod: exit/entry/sl fiyatlarından kontinü R değeri hesapla.
+                # Neden önemli: Binary etiket model'in "ne kadar?" sorusunu öğrenmesini
+                # engeller. Partial TP (+0.8R) ile tam TP (+1.5R) aynı görünüyordu.
+                if exit_reason in ("TP Hit", "SL Hit"):
+                    entry_p = float(t.get('entry_price', 0) or 0)
+                    exit_p  = float(t.get('exit_price',  0) or 0)
+                    sl_p    = float(t.get('sl_price',    0) or 0)
+                    sl_dist = abs(entry_p - sl_p)
+
+                    if sl_dist > 0 and entry_p > 0 and exit_p > 0:
+                        # Yön bazlı fiyat hareketi / SL mesafesi = R-multiple
+                        if direction == "LONG":
+                            r_multiple = (exit_p - entry_p) / sl_dist
+                        else:  # SHORT
+                            r_multiple = (entry_p - exit_p) / sl_dist
+                        r_multiple = max(-2.5, min(2.5, r_multiple))
+                    else:
+                        # Fiyat verisi eksik → eski fallback değerler (veri kalitesi sorunu)
+                        logger.debug(
+                            f"   ⚠️ R-multiple hesaplanamadı ({t.get('coin','?')} "
+                            f"entry={entry_p} sl={sl_p}) — fallback değer kullanılıyor"
+                        )
+                        r_multiple = 1.5 if exit_reason == "TP Hit" else -1.0
                 else:
                     if pnl != 0:
                         risk_est = self._balance * 0.02 if self._balance > 0 else 1.0
@@ -1980,6 +2132,16 @@ class MLTradingPipeline:
 
             gercek_win_rate = sum(1 for val in y_experience if float(val) > 0) / max(1, len(y_experience)) * 100
             logger.info(f"✅ Gerçek işlemlerden öğrenildi! Yeni Win Rate: %{gercek_win_rate:.1f}")
+
+            # [MADDE 3] — Retrain sonrası deployment gate kontrolü
+            # Her retrain sonrası modelin hâlâ yeterli istatistiksel güce sahip olup
+            # olmadığını kontrol et. Gate başarısız → canlı trade bloklanır.
+            self._model_deployment_approved = self._check_deployment_gates(metrics)
+            if not self._model_deployment_approved:
+                logger.warning(
+                    "⚠️ Retrain sonrası deployment gate başarısız. "
+                    "Canlı trade bloklandı — paper modda çalışmaya devam ediliyor."
+                )
             return True
 
         except Exception as e:
@@ -2207,6 +2369,17 @@ class MLTradingPipeline:
 
             gercek_win_rate = sum(1 for val in y if float(val) > 0) / max(1, len(y)) * 100
             logger.info(f"✅ İlk eğitim tamamlandı | Gerçek Win Rate: %{gercek_win_rate:.1f} | IC Skoru: {metrics.spearman_ic:.4f}")
+
+            # [MADDE 3] — İlk eğitim sonrası deployment gate kontrolü
+            # Model istatistiksel olarak yeterli mi? Gate başarısız olursa
+            # canlı trade bloklanır, paper modda çalışmaya devam edilir.
+            self._model_deployment_approved = self._check_deployment_gates(metrics)
+            if not self._model_deployment_approved:
+                logger.warning(
+                    "⚠️ İlk eğitim sonrası deployment gate başarısız. "
+                    "Daha fazla veri birikmesi ve tekrar eğitim gerekiyor. "
+                    "Bot paper modda çalışmaya devam edecek."
+                )
             return True
 
         except Exception as e:

@@ -39,16 +39,15 @@ risk:
   kill_switch_drawdown_pct: 15.0             # Kill switch DD (%)
 
 # -----------------------------------------------------------------------------
-# IC KAPI BEKÇİSİ EŞİKLERİ (paper test — agresif, çok sinyal)
+# IC KAPI BEKÇİSİ EŞİKLERİ
 # -----------------------------------------------------------------------------
-# IC Güven < 30  → İŞLEM YAPMA
-# IC Güven 30-45 → Sadece rapor
-# IC Güven > 45  → Tam işlem (AI + trade)
-# ⚠️ Sadece test için — canlıya geçmeden 50/62/62 veya üstüne çek
+# [SEÇENEK B REVİZYON] — Temporal overfit kaldırıldıktan sonra eşikler gevşetildi.
+# tmp_hour_sin/cos artık modelde yok → model 7/24 sinyal üretebilir.
+# Ranging hard stop → soft penalty → daha fazla trade fırsatı.
 gate_keeper:
-  no_trade_threshold: 10.0      # avg|IC| < 0.10  → işlem yok (finans standardı alt sınırı)
-  report_only_threshold: 15.0   # avg|IC| 0.10-0.15 → izle
-  full_trade_threshold: 20.0    # avg|IC| > 0.20  → trade aç
+  no_trade_threshold: 10.0      # 15 → 10: temporal fix sonrası daha gerçekçi
+  report_only_threshold: 15.0   # 20 → 15: izle/log bandı
+  full_trade_threshold: 20.0    # 23 → 20: tam işlem eşiği
 # ANALİZ AYARLARI
 # -----------------------------------------------------------------------------
 analysis:

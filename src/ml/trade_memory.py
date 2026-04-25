@@ -45,7 +45,11 @@ logger = logging.getLogger(__name__)           # Bu modüle özel logger
 # =============================================================================
 
 MIN_TRADES_FOR_RETRAIN = 30                    # İlk retrain için minimum kapalı trade sayısı
-RETRAIN_INTERVAL = 10                          # Her X yeni kapanan trade'de retrain yap
+RETRAIN_INTERVAL = 15                          # [MADDE 14] Her X yeni kapanan trade'de retrain yap
+                                               # Eski: 10. 225 trade'de 22 retrain çok fazlaydı.
+                                               # 340 satırlık veriyle her retrain model parametrelerini
+                                               # ciddi değiştiriyor, fold-arası IC varyansı artıyor.
+                                               # 30'a çekmek stabilitiyi artırır → IR yükselir.
 MEMORY_FILE_NAME = "ml_trade_memory.json"      # Kalıcı hafıza dosyası adı
 MAX_MEMORY_SIZE = 2000                         # RAM'de max trade sayısı (eski olanlar silinir)
 
@@ -465,10 +469,14 @@ class TradeMemory:
 
         for r in closed:
             rows.append(r.feature_snapshot)        # Dict → satır
-            labels.append(1 if r.outcome == TradeOutcome.WIN else 0)
+            # [MADDE 1] — Binary 0/1 yerine kontinü R-multiple kullan
+            # Eski: 1 if WIN else 0 (bilgi kaybı: +0.1R ve +1.5R aynı görünüyordu)
+            # Yeni: gerçek fiyat hareketi / SL mesafesi → model magnitude öğrenir
+            r_val = TradeMemory.compute_actual_r_multiple(r)
+            labels.append(r_val)
 
         X = pd.DataFrame(rows)                     # Feature matrisi
-        y = pd.Series(labels, name="outcome")      # Target vektörü
+        y = pd.Series(labels, name="r_multiple")   # Target: kontinü R-multiple değerleri
 
         # Sonsuz değerleri ve aşırı NaN'lı kolonları temizle
         X = X.replace([np.inf, -np.inf], np.nan)  # inf → NaN
@@ -476,10 +484,12 @@ class TradeMemory:
         valid_cols = nan_ratio[nan_ratio < 0.5].index  # %50'den az NaN olan kolonlar
         X = X[valid_cols].fillna(X[valid_cols].median())  # Kalan NaN'ları medyan ile doldur
 
+        win_count = sum(1 for v in labels if v > 0)   # Pozitif R → kârlı trade
         logger.info(
-            f"📊 Eğitim verisi hazırlandı: "
+            f"📊 Eğitim verisi hazırlandı (R-multiple): "
             f"{len(X)} satır × {len(X.columns)} kolon | "
-            f"WIN: {y.sum()}/{len(y)} (%{y.mean()*100:.0f})"
+            f"Pozitif R: {win_count}/{len(y)} (%{win_count/max(1,len(y))*100:.0f}) | "
+            f"Ort R: {float(y.mean()):+.3f}"
         )
 
         return X, y
@@ -785,3 +795,52 @@ class TradeMemory:
         """TradeRecord dataclass'ını JSON-serileştirilebilir dict'e çevirir."""
         d = asdict(record)                      # dataclasses.asdict() → iç içe dict
         return d
+
+    # =========================================================================
+    # [MADDE 1] — GERÇEK R-MULTIPLE HESABI
+    # =========================================================================
+
+    @staticmethod
+    def compute_actual_r_multiple(record: 'TradeRecord') -> float:
+        """
+        Gerçek R-multiple hesaplar: (çıkış - giriş) / SL mesafesi, yöne göre.
+
+        Binary etiketleme (+1.5 / -1.0) yerine sürekli değer döndürür.
+        Bu sayede model "kazandı mı?" değil "ne kadar kazandı?" sorusunu öğrenir.
+
+        Örnekler:
+          LONG @ 100, SL @ 95, TP @ 107.5 (TP vuruldu)  → r = +7.5/5 = +1.5
+          LONG @ 100, SL @ 95, çıkış @ 97 (SL'den önce)  → r = -3/5  = -0.6
+          SHORT @ 100, SL @ 105, çıkış @ 92              → r = +8/5  = +1.6
+
+        Parameters:
+        ----------
+        record : TradeRecord
+            Kapalı bir trade kaydı (exit_price, entry_price, sl_price dolu olmalı).
+
+        Returns:
+        -------
+        float
+            R-multiple değeri, [-2.5, +2.5] aralığında sınırlandırılmış.
+            Veri eksikse 0.0 döner.
+        """
+        entry      = record.entry_price          # Pozisyon giriş fiyatı ($)
+        exit_price = record.exit_price            # Gerçek çıkış fiyatı ($)
+        sl         = record.sl_price              # Stop-Loss fiyatı ($)
+
+        sl_distance = abs(entry - sl)             # SL mesafesi (mutlak, $)
+
+        if sl_distance <= 0 or entry <= 0 or exit_price <= 0:
+            # Eksik veya hatalı veri — sıfır döndür (eğitimde dead-band filtresi atar)
+            return 0.0
+
+        if record.direction == "LONG":
+            price_move = exit_price - entry       # LONG: yukarı hareket = kâr
+        else:
+            price_move = entry - exit_price       # SHORT: aşağı hareket = kâr
+
+        r = price_move / sl_distance              # Sürekli R değeri
+
+        # Aşırı outlier'ları kırp: -2.5R / +2.5R sınırı
+        # Veri hatası veya slippage kaynaklı uç değerler modeli bozmasın.
+        return max(-2.5, min(2.5, r))

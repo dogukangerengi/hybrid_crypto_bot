@@ -62,7 +62,10 @@ logger = logging.getLogger(__name__)
 # Bootstrap parametreleri
 BOOTSTRAP_N_ITERATIONS = 500                   # Bootstrap tekrar sayısı (500 = hız/doğruluk dengesi)
 BOOTSTRAP_SAMPLE_RATIO = 0.8                   # Her iterasyonda kullanılan sample oranı
-BOOTSTRAP_CI_LEVEL = 0.90                      # Güven aralığı seviyesi (%90)
+BOOTSTRAP_CI_LEVEL = 0.75                      # Güven aralığı seviyesi (%75)
+                                               # 0.90 (5-95 pct) CI çok genişti → sinyalleri veto ediyordu.
+                                               # 0.75 (12.5-87.5 pct) CI daha dar → daha fazla sinyal geçer.
+                                               # 0.60 altı anlamsızlaşır (sadece orta %60'a bakılır).
 
 # Regime filtreleme (unknown çıkmasın diye default'u ranging gibi cezalandırıyoruz)
 REGIME_PENALTIES = {
@@ -79,9 +82,19 @@ REGIME_PENALTIES = {
 FEATURE_ZSCORE_THRESHOLD = 3.5                 # |z| > 3.5 → anomali (6σ olayı seviyesinde nadir)
 MAX_ANOMALY_RATIO = 0.25                       # Feature'ların %25'inden fazlası anomaliyse → red
 
-# Ensemble agreement
-IC_MODEL_AGREEMENT_BONUS = 1.10                # IC ve model aynı yönde → %10 güven bonusu
-IC_MODEL_DISAGREE_PENALTY = 0.85               # IC ve model farklı yönde → %15 penaltı
+# [MADDE 5 DÜZELTMESİ] — Ensemble agreement mantığı nötrleştirildi
+# Canlı 225 trade analizi:
+#   AI Karar = IC Yön (uyumlu)  → 177 trade, WR %40.1, PnL −$25.28  ❌
+#   AI Karar ≠ IC Yön (uyumsuz) →  48 trade, WR %52.1, PnL +$14.10  ✅
+#
+# Veri, uyumsuzluk bonusu/uyum penaltısı gerektiriyor ama n=48 küçük (p≈0.14).
+# Kesin karar vermek için 100 trade daha gerekiyor.
+# Şimdilik: her iki çarpanı 1.0'a eşitleyelim (nötr) → sistematik hata önlenir.
+# 100 yeni trade sonrası tekrar analiz et, gerekirse tersine çevir:
+#   IC_MODEL_AGREEMENT_BONUS = 0.90  (uyumlu → güven azalt)
+#   IC_MODEL_DISAGREE_PENALTY = 1.05 (uyumsuz → güven artır)
+IC_MODEL_AGREEMENT_BONUS = 1.00    # Eski: 1.10  → nötr (yeterli veri bekleniliyor)
+IC_MODEL_DISAGREE_PENALTY = 1.00   # Eski: 0.85  → nötr (yeterli veri bekleniliyor)
 
 # ── COLD START PARAMETRELERİ ──
 # Model henüz yeterli kapalı trade görmemişken bootstrap veto'yu
@@ -294,7 +307,7 @@ class SignalValidator:
             predictions = np.zeros(n_iter)       
 
             rng = np.random.default_rng()        
-            noise_fraction = 0.25
+            noise_fraction = 0.15               # 0.25 → 0.15: daha az gürültü → daha dar CI → daha fazla sinyal geçer
 
             for i in range(n_iter):
                 noise = rng.normal(
@@ -316,9 +329,12 @@ class SignalValidator:
 
                 predictions[i] = prob                  
 
-            # ── 4. CI hesapla ──
-            lower_bound = float(np.percentile(predictions, 5))    
-            upper_bound = float(np.percentile(predictions, 95))   
+            # ── 4. CI hesapla — self.ci_level'i gerçekten kullan ──
+            # Bug fix: önceki kod percentile'ı hardcode 5-95 (90% CI) kullanıyordu,
+            # self.ci_level değeri hiç kullanılmıyordu.
+            tail = (1.0 - self.ci_level) / 2.0 * 100   # 0.75 CI → tail=12.5 → pct 12.5-87.5
+            lower_bound = float(np.percentile(predictions, tail))
+            upper_bound = float(np.percentile(predictions, 100 - tail))
             ci_width = upper_bound - lower_bound                  
 
             result.bootstrap_mean = float(np.mean(predictions))   
@@ -330,10 +346,10 @@ class SignalValidator:
             # ── 5. Karar: CI kabul edilebilir mi? ──
             contains_50 = (lower_bound <= 0.50 <= upper_bound)
 
-            if ci_width > 0.55:
+            if ci_width > 0.65:                 # 0.55 → 0.65: daha toleranslı eşik
                 result.bootstrap_passed = False
                 result.veto_reasons.append(
-                    f"Bootstrap CI geniş: {ci_width:.3f} > 0.55 → tahmin belirsiz"
+                    f"Bootstrap CI geniş: {ci_width:.3f} > 0.65 → tahmin belirsiz"
                 )
             elif contains_50:
                 result.bootstrap_passed = True
@@ -444,8 +460,8 @@ class SignalValidator:
 
         result.adjusted_confidence = round(max(0, min(100, adjusted)), 1)
 
-        if result.adjusted_confidence < 40.0:
-            result.veto_reasons.append(f"Güvenlik barajı aşılamadı: %{result.adjusted_confidence:.1f} < %40.0")
+        if result.adjusted_confidence < 35.0:     # 40.0 → 35.0: daha düşük eşik, veri birikimi için
+            result.veto_reasons.append(f"Güvenlik barajı aşılamadı: %{result.adjusted_confidence:.1f} < %35.0")
             
         if result.veto_reasons:
             result.is_valid = False

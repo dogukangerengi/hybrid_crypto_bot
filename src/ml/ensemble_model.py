@@ -45,6 +45,15 @@ logger = logging.getLogger(__name__)
 
 MIN_TRAIN_SAMPLES = 120
 CV_N_SPLITS = 5
+# [MADDE 13 DÜZELTMESİ] — Purged embargo gap 5 → 8
+# Lopez de Prado önerisi: embargo = TP/SL horizonu.
+# forward_period = 6 bar × 1.3 güvenlik marjı ≈ 8 bar.
+# Eski değer (5) temporal leakage'ı tam temizlemiyordu.
+# 15m TF'de 8 bar = 2 saat → yeterli korelasyon koruması.
+# [GEÇİCİ] CV embargo gap 8 → 5
+# Sebep: 351 sample + 5 fold + embargo=8 → fold başına ~34 etkili sample → IC std çok yüksek.
+# 450+ sample birikince embargo=8'e geri alınacak.
+# Lopez de Prado tavsiyesi: embargo = forward_period. forward_period=6 → ideal=6, şimdi 5 kullanıyoruz.
 CV_EMBARGO_GAP = 5
 CV_MIN_TRAIN = 100
 NESTED_CV_HOLDOUT = 0.20
@@ -79,14 +88,27 @@ DEFAULT_THRESHOLD_SHORT = 0.40
 #   - SHORT sample >100 ve mean_R > 0 (p<0.05): FLOOR_SHORT → 0.30'a düşür
 #   - LONG sample >200 ve SE < 0.1: FLOOR_LONG → 0.05'e düşür
 # Aksi halde mevcut değerleri koru.
-HARD_THRESHOLD_FLOOR_LONG = 0.10
-HARD_THRESHOLD_FLOOR_SHORT = 0.40
+HARD_THRESHOLD_FLOOR_LONG  = 0.08   # 0.10 → 0.08: LONG edge zayıf, biraz gevşetildi
+HARD_THRESHOLD_FLOOR_SHORT = 0.25   # 0.40 → 0.25: Model 0.28-0.37 tahmin ediyor, 0.40 floor
+                                    # tüm SHORT sinyallerini WAIT'e düşürüyordu.
+                                    # OOS SHORT R=+0.3947 güçlü edge var → 0.25 ile geçiyor.
 
 THRESHOLD_GRID_PERCENTILES = [50, 60, 70, 80, 90]
 
 DROPPED_FEATURES_HARD = {
     "risk_sl_distance_pct", "risk_rr_ratio", "ic_direction_code",
     "tmp_dow_sin", "tmp_dow_cos", "tmp_is_weekend",
+    # [SEÇENEK B DÜZELTMESİ] — Temporal (saat) feature'ları kaldırıldı
+    # Sorun: Feature importance analizinde tmp_hour_sin ve tmp_hour_cos
+    # sırasıyla #1 ve #3 en önemli feature çıktı (toplam ağırlık ~%13).
+    # Model "hangi saatte trade açılmalı?" sorusunu öğreniyor,
+    # "bu sinyal kârlı mı?" değil. Bu temporal overfit demek:
+    # kripto 7/24 açık, belirli saat avantajı yoktur — 343 trade'deki
+    # kârlı saatler rastlantısal korelasyon.
+    # Sonuç: Model belirli saatler dışında sinyal üretmiyor → 18 saat boşta.
+    # Çözüm: Bu feature'ları eğitimden tamamen çıkar, model gerçek
+    # teknik sinyallere (RSI, momentum, IC) odaklanmak zorunda kalır.
+    "tmp_hour_sin", "tmp_hour_cos",
     "ctf_n_timeframes", "mkt_regime_volatile", "mkt_regime_trending",
 }
 
