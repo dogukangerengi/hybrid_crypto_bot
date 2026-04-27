@@ -332,7 +332,9 @@ class FeatureEngineer:
         )
         vec.price_features = self._build_price_features(ohlcv_df)     # Price action
         vec.risk_features = self._build_risk_features(analysis)       # Risk metrikleri
-        vec.temporal_features = self._build_temporal_features()       # Temporal
+        vec.temporal_features = self._build_temporal_features(         # Temporal
+            bar_dt=getattr(analysis, 'bar_dt', None)  # [EĞİTİM FIX] bar timestamp varsa kullan
+        )
 
         if self.verbose:
             n_features = vec.feature_count()   # Toplam feature sayısı
@@ -782,7 +784,7 @@ class FeatureEngineer:
     # 6. TEMPORAL FEATURES (~5 feature)
     # =========================================================================
 
-    def _build_temporal_features(self) -> Dict[str, float]:
+    def _build_temporal_features(self, bar_dt=None) -> Dict[str, float]:
         """
         Zaman bazlı feature'lar.
         
@@ -794,13 +796,23 @@ class FeatureEngineer:
         - Saat 23 ve saat 0 aslında yakın ama numerik olarak uzak (23 vs 0)
         - sin/cos dönüşümü ile: 23:00 ve 01:00 yakın değerler alır
         - LightGBM böylece "gece yarısı civarı" pattern'ini öğrenebilir
-        
+
+        Parameters:
+        ----------
+        bar_dt : datetime, optional
+            [EĞİTİM FIX] Eğitim sırasında bar'ın gerçek timestamp'i.
+            None ise canlı trading zamanı (datetime.now) kullanılır.
+            Neden gerekli: initial_train'de tüm barlar aynı anda üretilir,
+            datetime.now() her bar için aynı değeri döndürür — tüm eğitim
+            verisi tek bir saat/gün değeri alır, model temporal pattern öğrenemez.
+
         Returns:
         -------
         Dict[str, float]
             Temporal feature'lar
         """
-        now = datetime.now(timezone.utc)       # UTC zaman (borsa zamanı)
+        # [EĞİTİM FIX] bar_dt verilmişse onu kullan, yoksa anlık zamanı al
+        now = bar_dt if bar_dt is not None else datetime.now(timezone.utc)
         features = {}
 
         # Saat — sin/cos cyclical encoding

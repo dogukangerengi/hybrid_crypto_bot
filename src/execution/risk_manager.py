@@ -136,6 +136,12 @@ class RiskManager:
     MIN_ATR_MULTIPLIER = 2.0
     MAX_ATR_MULTIPLIER = 5.0
 
+    # [RR HARD FLOOR] Risk/Reward oranı hiçbir koşulda bu değerin altına inemez.
+    # Config'den daha düşük bir değer gelse bile bu floor korunur.
+    # Neden 1.5: Fee + slippage sonrası gerçek edge için minimum eşik.
+    # 1:1 RR → komisyon sonrası beklenen değer negatif olur.
+    MIN_RISK_REWARD_HARD_FLOOR = 1.5
+
     def __init__(
         self,
         balance: float = 0.0,
@@ -223,8 +229,9 @@ class RiskManager:
         # settings.yaml'da risk.min_risk_reward_ratio değerini değiştirmek yeterli.
         config_rr = getattr(self.risk_cfg, 'min_risk_reward_ratio', 1.5)
         rr = risk_reward or config_rr
-        # Floor: config değerinin altına inmesini engelle
-        rr = max(rr, config_rr)
+        # [RR HARD FLOOR] Config veya parametre ne olursa olsun minimum 1.5 garanti
+        # Fee + slippage sonrası 1.0 RR → beklenen değer negatif olur
+        rr = max(rr, config_rr, self.MIN_RISK_REWARD_HARD_FLOOR)
 
         tp_distance = sl_distance * rr
 
@@ -355,7 +362,11 @@ class RiskManager:
         # [SORUN 7 DÜZELTMESİ]
         # Eskiden hard-code 1.5 kullanılıyordu.
         # Artık config'den min_risk_reward_ratio okunuyor.
-        min_allowed_rr = getattr(self.risk_cfg, 'min_risk_reward_ratio', 1.5)
+        # [RR HARD FLOOR] Config değerinden bağımsız olarak 1.5 minimum garanti
+        min_allowed_rr = max(
+            getattr(self.risk_cfg, 'min_risk_reward_ratio', 1.5),
+            self.MIN_RISK_REWARD_HARD_FLOOR  # Her zaman ≥ 1.5
+        )
 
         if rr < min_allowed_rr - 0.001:
             return False, f"RR ({rr:.2f}) < min ({min_allowed_rr})"

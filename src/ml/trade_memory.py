@@ -53,6 +53,12 @@ RETRAIN_INTERVAL = 15                          # [MADDE 14] Her X yeni kapanan t
 MEMORY_FILE_NAME = "ml_trade_memory.json"      # Kalıcı hafıza dosyası adı
 MAX_MEMORY_SIZE = 2000                         # RAM'de max trade sayısı (eski olanlar silinir)
 
+# [LABEL NOISE FİLTRESİ]
+# Çok küçük |R| değerleri (gürültü bölgesi) eğitim kalitesini düşürür.
+# Model "ne kadar kazandı?" sorusunu öğrenemez çünkü target sıfıra yakın.
+# Bu eşiğin altındaki trade'ler get_training_data()'dan çıkarılır.
+MIN_ABS_R_FOR_TRAINING = 0.12  # |R| < 0.12 → eğitimden çıkar (gürültü)
+
 
 # =============================================================================
 # ENUM: TRADE DURUMU
@@ -468,11 +474,18 @@ class TradeMemory:
         labels = []
 
         for r in closed:
-            rows.append(r.feature_snapshot)        # Dict → satır
             # [MADDE 1] — Binary 0/1 yerine kontinü R-multiple kullan
             # Eski: 1 if WIN else 0 (bilgi kaybı: +0.1R ve +1.5R aynı görünüyordu)
             # Yeni: gerçek fiyat hareketi / SL mesafesi → model magnitude öğrenir
             r_val = TradeMemory.compute_actual_r_multiple(r)
+
+            # [LABEL NOISE FİLTRESİ] |R| < 0.12 → gürültü bölgesi, eğitimden çıkar
+            # Model "ne kadar kazandı?" sorusunu öğrenemez, sadece noise öğrenir
+            # Bu filtre retrain kalitesini artırır ve IC'yi stabilize eder
+            if abs(r_val) < MIN_ABS_R_FOR_TRAINING:
+                continue
+
+            rows.append(r.feature_snapshot)        # Dict → satır (sadece geçerlileri ekle)
             labels.append(r_val)
 
         X = pd.DataFrame(rows)                     # Feature matrisi
@@ -485,11 +498,13 @@ class TradeMemory:
         X = X[valid_cols].fillna(X[valid_cols].median())  # Kalan NaN'ları medyan ile doldur
 
         win_count = sum(1 for v in labels if v > 0)   # Pozitif R → kârlı trade
+        noise_filtered = len(closed) - len(rows)       # Noise filtresi ile çıkarılan
         logger.info(
             f"📊 Eğitim verisi hazırlandı (R-multiple): "
             f"{len(X)} satır × {len(X.columns)} kolon | "
             f"Pozitif R: {win_count}/{len(y)} (%{win_count/max(1,len(y))*100:.0f}) | "
-            f"Ort R: {float(y.mean()):+.3f}"
+            f"Ort R: {float(y.mean()):+.3f} | "
+            f"Noise filtresi: {noise_filtered} trade çıkarıldı (|R|<{MIN_ABS_R_FOR_TRAINING})"
         )
 
         return X, y

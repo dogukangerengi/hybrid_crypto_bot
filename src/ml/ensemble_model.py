@@ -45,15 +45,12 @@ logger = logging.getLogger(__name__)
 
 MIN_TRAIN_SAMPLES = 120
 CV_N_SPLITS = 5
-# [MADDE 13 DÜZELTMESİ] — Purged embargo gap 5 → 8
+# [MADDE 13 DÜZELTMESİ] — Purged embargo gap
 # Lopez de Prado önerisi: embargo = TP/SL horizonu.
-# forward_period = 6 bar × 1.3 güvenlik marjı ≈ 8 bar.
+# forward_period = 12 bar × 1.3 güvenlik marjı ≈ 16 bar (ideal).
 # Eski değer (5) temporal leakage'ı tam temizlemiyordu.
-# 15m TF'de 8 bar = 2 saat → yeterli korelasyon koruması.
-# [GEÇİCİ] CV embargo gap 8 → 5
-# Sebep: 351 sample + 5 fold + embargo=8 → fold başına ~34 etkili sample → IC std çok yüksek.
-# 450+ sample birikince embargo=8'e geri alınacak.
-# Lopez de Prado tavsiyesi: embargo = forward_period. forward_period=6 → ideal=6, şimdi 5 kullanıyoruz.
+# [GEÇİCİ] CV embargo gap = 5
+# Sebep: Mevcut sample sayısı az. 450+ sample birikince embargo=12'ye alınacak.
 CV_EMBARGO_GAP = 5
 CV_MIN_TRAIN = 100
 NESTED_CV_HOLDOUT = 0.20
