@@ -668,7 +668,26 @@ class MLTradingPipeline:
         }
 
         _ = all(gates.values())  # loglama için
-        passed = True  # [GATE BYPASS] Devre dışı — tüm modeller onaylanır
+
+        # [GATE BYPASS REVİZYONU] Tam bypass yerine akıllı bypass:
+        # - IC < 0 (negatif): ASLA onaylama — negatif IC rastgeleden kötü tahmin yapar
+        # - IC >= 0 ama gate'ler tam geçmiyorsa: Yine de onayla (veri az, eşikler sert)
+        # Önceki: passed = True (her zaman)
+        # Yeni: IC negatifse geçme, pozitifse onayla
+        if metrics.spearman_ic <= 0:
+            passed = False  # NEGATİF veya SIFIR IC — model yararsız/zararlı, trade yapma
+            if metrics.spearman_ic < 0:
+                logger.warning(
+                    f"  ⛔ GATE HARD-BLOCK: IC={metrics.spearman_ic:+.4f} NEGATİF — "
+                    f"model rastgeleden KÖTÜ tahmin yapıyor. Canlı trade engellendi."
+                )
+            else:
+                logger.warning(
+                    f"  ⛔ GATE HARD-BLOCK: IC=0.0 — model eğitilemedi (cold start). "
+                    f"Canlı trade engellendi."
+                )
+        else:
+            passed = True  # Pozitif IC var, gate'ler tam geçmese de devam et
 
         # ── Log ──────────────────────────────────────────────────────────────
         logger.info(f"\n{'─'*58}")
@@ -917,18 +936,21 @@ class MLTradingPipeline:
             # [REJİM ÇARPAN REVİZYONU] — Daha dengeli çarpanlar
             # trending  → ×1.10 (trend sinyalini hafif güçlendir, model güvenilir)
             # ranging   → ×0.85 (hafif ceza, tamamen engelleme — veri birikimi için)
-            # volatile  → ×0.70 (orta ceza, yüksek IC geçebilir)
+            # volatile  → ×0.50 (güçlü ceza — geçmiş 0/4 WIN, -$10.53 kayıp)
+            #             IC=8  + volatile → 4.0 → no_trade (5) altında → elenir ✅
+            #             IC=12 + volatile → 6.0 → trade (8) altında → elenir ✅
+            #             IC=16 + volatile → 8.0 → ancak eşiği geçer (çok güçlü sinyal)
             #
             # IC=8 + trending  → 8.8  → trade eşiği (8) geçer ✅
             # IC=8 + ranging   → 6.8  → trade eşiği geçer ✅
-            # IC=8 + volatile  → 5.6  → no_trade eşiği (5) geçer, trade (8) geçmez ⚠️
+            # IC=8 + volatile  → 4.0  → no_trade (5) altında → elenir ✅
             # IC=5 + ranging   → 4.25 → no_trade (5) altında → elenir ✅
             REGIME_PENALTY = {
                 'trending':     1.10,
                 'trending_up':  1.10,
                 'trending_down': 1.10,
                 'ranging':      0.85,
-                'volatile':     0.70,
+                'volatile':     0.50,  # [GÜNCELLENDİ] 0.70 → 0.50
                 'transitioning': 0.90,
                 'unknown':      0.85,
             }
@@ -1955,12 +1977,15 @@ class MLTradingPipeline:
             real_win_rate = pt_stats.get("win_rate_pct", 0.0)
 
             retrain_threshold = 30
-            current_retrain_count = getattr(self.lgbm_model, 'retrain_count', 0)
+            # [FIX] experience_retrain_count kullan (retrain_count değil)
+            # retrain_count her train() çağrısında artar → initial_train sonrası 1 olur
+            # Bu yüzden 30 trade sonrası retrain hiç tetiklenmiyordu
+            current_exp_count = getattr(self.lgbm_model, 'experience_retrain_count', 0)
 
             if total_closed >= retrain_threshold:
-                target_retrain_count = total_closed // retrain_threshold
+                target_exp_count = total_closed // retrain_threshold
 
-                if target_retrain_count > current_retrain_count:
+                if target_exp_count > current_exp_count:
                     logger.info(f"\n🧠 [RETRAIN] {total_closed} kapalı işleme ulaşıldı! Model kendi tecrübelerinden yeniden eğitiliyor...")
                     try:
                         if hasattr(self, 'retrain_from_experience'):
@@ -1968,7 +1993,7 @@ class MLTradingPipeline:
                     except Exception as e:
                         logger.error(f"Eğitim tetiklenemedi: {e}")
 
-                    self.lgbm_model.retrain_count = target_retrain_count
+                    self.lgbm_model.experience_retrain_count = target_exp_count
 
             next_target = ((total_closed // retrain_threshold) + 1) * retrain_threshold
             kalan_islem = next_target - total_closed
@@ -2292,8 +2317,10 @@ class MLTradingPipeline:
                     stub.symbol = symbol
                     stub.coin = "BTC"
                     stub.price = entry_price
-                    stub.change_24h = 0.0
-                    stub.volume_24h = 0.0
+                    stub.change_24h = float(
+                        (entry_price / df_ind['close'].iloc[max(0, i-24)] - 1) * 100
+                    )
+                    stub.volume_24h = float(df_ind['volume'].iloc[max(0, i-24):i+1].sum() * entry_price)
                     stub.ic_confidence = 65.0
                     stub.ic_direction = direction
                     stub.significant_count = 10
@@ -2305,14 +2332,26 @@ class MLTradingPipeline:
                     stub.sl_price = entry_price - sl_distance if direction == "LONG" else entry_price + sl_distance
                     stub.tp_price = entry_price + sl_distance * RR_RATIO if direction == "LONG" else entry_price - sl_distance * RR_RATIO
                     stub.risk_reward = RR_RATIO
-                    stub.position_size = 0.0
-                    stub.leverage = 1
+                    stub.position_size = 50.0
+                    stub.leverage = 6
+                    # Bar timestamp — temporal feature'lar için
+                    bar_ts = df_ind.index[i]
+                    if hasattr(bar_ts, 'to_pydatetime'):
+                        bar_ts = bar_ts.to_pydatetime()
+                        if bar_ts.tzinfo is None:
+                            from datetime import timezone as _tz
+                            bar_ts = bar_ts.replace(tzinfo=_tz.utc)
+                    stub.bar_dt = bar_ts
 
-                    fv = self._build_feature_vector(df_slice, stub, target_col)
+                    # [BUG FIX] _build_feature_vector() tanımsız → feature_eng.build_features() kullan
+                    fv = self.feature_eng.build_features(
+                        analysis=stub,
+                        ohlcv_df=df_slice,
+                    )
                     if fv is None:
                         continue
 
-                    rows_X.append(fv)
+                    rows_X.append(fv.to_dict())
                     rows_y.append(float(r_multiple))
                     rows_dir.append(direction)
                 except Exception:
@@ -3087,6 +3126,35 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 10) -> No
 
     if not pipeline.lgbm_model.is_trained:
         pipeline.initial_train()
+
+    # [STARTUP RETRAIN FIX] initial_train sonrası hemen retrain kontrolü yap
+    # Sorun: Retrain sadece run_cycle() içinde kontrol ediliyordu.
+    # Eğer daily halt tetiklenirse run_cycle() çalışmaz → retrain asla tetiklenmez.
+    # Çözüm: Startup'ta, ilk döngüden ÖNCE retrain gerekip gerekmediğini kontrol et.
+    # Not: experience_retrain_count kullanıyoruz (retrain_count değil).
+    # Neden: retrain_count her train() çağrısında artar (initial_train dahil).
+    # Bu yüzden initial_train sonrası retrain_count=1 olur ve kontrol yanlış atlanır.
+    # experience_retrain_count sadece retrain_from_experience() tarafından artırılır.
+    try:
+        closed_count = pipeline.trade_memory._count_closed()
+        retrain_threshold = 30
+        current_exp_count = getattr(pipeline.lgbm_model, 'experience_retrain_count', 0)
+        target_exp_count  = closed_count // retrain_threshold
+
+        if closed_count >= retrain_threshold and target_exp_count > current_exp_count:
+            logger.info(f"\n🧠 [STARTUP RETRAIN] {closed_count} kapalı trade bulundu — başlangıçta retrain tetikleniyor...")
+            try:
+                pipeline.retrain_from_experience()
+            except Exception as re:
+                logger.error(f"Startup retrain hatası: {re}")
+            pipeline.lgbm_model.experience_retrain_count = target_exp_count
+            logger.info("✅ Startup retrain tamamlandı.")
+        elif closed_count >= retrain_threshold:
+            logger.info(f"ℹ️ Retrain zaten yapılmış (experience_count={current_exp_count}), atlanıyor.")
+        else:
+            logger.info(f"ℹ️ Startup retrain gerekmiyor ({closed_count}/{retrain_threshold} trade).")
+    except Exception as e:
+        logger.warning(f"Startup retrain kontrol hatası (kritik değil): {e}")
 
     while pipeline._is_running:
         if pipeline._kill_switch:
