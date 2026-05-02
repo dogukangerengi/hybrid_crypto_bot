@@ -859,4 +859,3 @@ class TradeMemory:
         # Aşırı outlier'ları kırp: -2.5R / +2.5R sınırı
         # Veri hatası veya slippage kaynaklı uç değerler modeli bozmasın.
         return max(-2.5, min(2.5, r))
-s
