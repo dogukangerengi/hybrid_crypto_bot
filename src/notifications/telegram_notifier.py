@@ -9,9 +9,9 @@
 # - Mevcut AnalysisReport formatı korundu
 #
 # Entegrasyonlar:
-# - execution.bitget_executor → ExecutionResult, OrderResult
+# - execution.binance_executor → ExecutionResult, OrderResult
 # - execution.risk_manager → TradeCalculation, RiskCheckStatus
-# - ai.gemini_optimizer → AIDecisionResult, GateAction
+# - ai.ml_optimizer → AIDecisionResult, GateAction
 # - config → TelegramConfig (token, chat_id)
 #
 # Kullanım:
@@ -272,7 +272,7 @@ class TelegramNotifier:
         Parameters:
         ----------
         decision_result : AIDecisionResult
-            ai.gemini_optimizer'dan gelen karar.
+            ai.ml_optimizer'dan gelen karar.
         """
         d = decision_result
         
@@ -328,7 +328,7 @@ class TelegramNotifier:
         Parameters:
         ----------
         exec_result : ExecutionResult
-            execution.bitget_executor'dan gelen sonuç.
+            execution.binance_executor'dan gelen sonuç.
         """
         e = exec_result
         
@@ -443,7 +443,7 @@ class TelegramNotifier:
 💰 Bakiye: ${balance:,.2f}
 🔧 Mod: {mode}
 📊 Tarama: Aktif
-🤖 AI: Gemini aktif
+🤖 AI: ML Modeli aktif
 
 ━━━━━━━━━━━━━━━━━━━━━
 ⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"""

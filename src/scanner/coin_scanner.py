@@ -1,7 +1,7 @@
 # =============================================================================
 # DİNAMİK COİN TARAYICI (COIN SCANNER)
 # =============================================================================
-# Amaç: Bitget USDT-M Futures çiftlerini tarayıp IC analize gönderilecek
+# Amaç: Binance USD-M Futures çiftlerini tarayıp IC analize gönderilecek
 #        en iyi coin'leri otomatik seçmek.
 #
 # Pipeline:
@@ -61,7 +61,7 @@ class CoinScanResult:
     Attributes:
     ----------
     symbol : str
-        Bitget Futures sembolü (örn: 'BTC/USDT:USDT')
+        Binance Futures sembolü (örn: 'BTC/USDT:USDT')
     coin : str
         Kısa isim (örn: 'BTC') — Telegram mesajlarında kullanılır
     price : float
@@ -103,7 +103,7 @@ class CoinScanResult:
 
 class CoinScanner:
     """
-    Bitget USDT-M Futures çiftlerini tarayıp IC analiz için en uygun
+    Binance USD-M Futures çiftlerini tarayıp IC analiz için en uygun
     coin'leri seçen dinamik tarayıcı.
     
     Filtreleme Mantığı (sırasıyla):
@@ -167,7 +167,7 @@ class CoinScanner:
         
         Parameters:
         ----------
-        fetcher : BitgetFetcher, optional
+        fetcher : BinanceFetcher, optional
             Veri çekme nesnesi. None ise yeni oluşturulur.
             Dışarıdan verme avantajı: aynı CCXT exchange bağlantısını paylaşır
             (market data tekrar yüklenmez → ~2s tasarruf).
@@ -228,7 +228,7 @@ class CoinScanner:
             Seçilecek coin sayısı. None ise config'den okunur (varsayılan 20).
             
         force_refresh : bool
-            True ise cache'i yoksay, Bitget API'den taze veri çek.
+            True ise cache'i yoksay, Binance API'den taze veri çek.
             
         Returns:
         -------
@@ -365,8 +365,8 @@ class CoinScanner:
     
     def _fetch_all_tickers(self, symbols: List[str]) -> Dict:
         try:
-            # Binance'den ticker çek, Bitget formatında döndür
-            # ESKİ: self.fetcher.exchange.fetch_tickers() → Bitget → BOŞ VERİ
+            # Binance'den ticker çek, Binance formatında döndür
+            # ESKİ: self.fetcher.exchange.fetch_tickers() → Binance → BOŞ VERİ
             # YENİ: self.fetcher.fetch_tickers(symbols)   → Binance → DOLU VERİ
             all_tickers = self.fetcher.fetch_tickers(symbols)
             

@@ -3,7 +3,7 @@
 # =============================================================================
 # Düzeltmeler v2.0:
 # - Tamamen Binance USDT-M Futures (ccxt 'future' tipi) uyumlu hale getirildi.
-# - Bitget'e özel 'planType' ve 'productType' parametreleri temizlendi.
+# - Binance'e özel 'planType' ve 'productType' parametreleri temizlendi.
 # - Sembol yapısı Binance formatına uyarlandı (Örn: BTC/USDT).
 # - Binance'in yerleşik STOP_MARKET ve TAKE_PROFIT_MARKET emir tipleri entegre edildi.
 # - Margin Type (Isolated) ayarı Binance standartlarına uygun olarak güncellendi.
@@ -605,7 +605,7 @@ class BinanceExecutor:
         Binance USDT-M Futures'ta cancel_all_orders endpoint'i (fapiPrivateDeleteAllOpenOrders)
         tek çağrıda tüm emir tiplerini siler.
         
-        NOT: Eski kodda params={'stop': True} kullanılıyordu — bu Bitget'e özel bir parametre.
+        NOT: Eski kodda params={'stop': True} kullanılıyordu — bu Binance'e özel bir parametre.
         Binance'de bu parametre tanınmıyor ve koşullu emirler (STOP_MARKET, TAKE_PROFIT_MARKET)
         silinmeden kalıyordu. Bu düzeltme ile tüm emirler tek çağrıda temizleniyor.
         """

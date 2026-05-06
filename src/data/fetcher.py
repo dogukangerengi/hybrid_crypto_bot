@@ -7,7 +7,7 @@
 # - OHLCV (mum veri)  → Binance fetch_ohlcv + pagination
 # - Market bilgisi    → Binance markets (contract size, precision vb.)
 #
-# Binance OHLCV limiti: 1000 mum/istek → Bitget'e göre 5 kat daha hızlı ve stabil!
+# Binance OHLCV limiti: 1000 mum/istek → Binance'e göre 5 kat daha hızlı ve stabil!
 # =============================================================================
 
 import ccxt                                    # Borsa unified API'si
@@ -50,7 +50,7 @@ class BinanceFetcher:
         "1h": 60, "2h": 120, "4h": 240, "6h": 360, "12h": 720, "1d": 1440,
     }
     
-    # Binance tek istekte max 1000 mum verir (Bitget'in 200 sınırından çok daha iyi)
+    # Binance tek istekte max 1000 mum verir (Binance'in 200 sınırından çok daha iyi)
     MAX_CANDLES_PER_REQUEST = 1000
     
     # IC analizi için önerilen minimum bar sayıları

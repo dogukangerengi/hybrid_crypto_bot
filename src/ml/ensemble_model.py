@@ -188,7 +188,6 @@ class EnsembleCalibratorMock:
         self.lgbm = lgbm_reg
         self.rf = rf_reg
         self.feature_names = feature_names
-        self._train_median: Optional[pd.Series] = None
 
     @property
     def feature_importances_(self):
@@ -199,9 +198,7 @@ class EnsembleCalibratorMock:
         return (lgbm_norm + rf_norm) / 2
 
     def _impute_for_rf(self, X):
-        if self._train_median is not None:
-            return X.fillna(self._train_median)
-        return X.fillna(0)
+        return X.fillna(-999)
 
     def predict(self, X):
         return (self._predict_r(X) > 0).astype(int)
@@ -230,7 +227,6 @@ class EnsemblePredictor:
         self.calibrator: Optional[EnsembleCalibratorMock] = None
         self.model = None
         self.feature_names: List[str] = []
-        self._train_median: Optional[pd.Series] = None
         self.is_trained = False
         self.retrain_count = 0           # Toplam train() çağrı sayısı (initial + retrain)
         self.experience_retrain_count = 0  # Sadece retrain_from_experience() sayısı
@@ -291,7 +287,7 @@ class EnsemblePredictor:
     def _mi_feature_filter(X_train: pd.DataFrame, y_train: np.ndarray,
                             mi_threshold: float = 0.01,
                             max_features: int = 20) -> List[str]:
-        X_filled = X_train.fillna(X_train.median()).fillna(0)
+        X_filled = X_train.fillna(-999)
         mi = mutual_info_regression(X_filled, y_train, random_state=42)
         mi_series = pd.Series(mi, index=X_train.columns).sort_values(ascending=False)
         kept = mi_series[mi_series >= mi_threshold].index.tolist()
@@ -352,11 +348,10 @@ class EnsemblePredictor:
                               min_child_samples=10, reg_alpha=0.1, reg_lambda=0.1,
                               random_state=42, verbose=-1)
         lgbm.fit(X_tr_s, y_tr)
-        med = X_tr_s.median()
         rf = RandomForestRegressor(n_estimators=300, max_depth=5,
                                     min_samples_leaf=10, random_state=42, n_jobs=-1)
-        rf.fit(X_tr_s.fillna(med), y_tr)
-        pred = (lgbm.predict(X_te_s) + rf.predict(X_te_s.fillna(med))) / 2.0
+        rf.fit(X_tr_s.fillna(-999), y_tr)
+        pred = (lgbm.predict(X_te_s) + rf.predict(X_te_s.fillna(-999))) / 2.0
         return pred, selected
 
     def _calibrate_thresholds(self, X_tr, y_tr, directions_tr) -> Dict[str, float]:
@@ -539,12 +534,10 @@ class EnsemblePredictor:
                                           min_child_samples=10, reg_alpha=0.1, reg_lambda=0.1,
                                           random_state=42, verbose=-1)
         self.lgbm_model.fit(X, y)
-        self._train_median = X.median()
         self.rf_model = RandomForestRegressor(n_estimators=300, max_depth=5,
                                                 min_samples_leaf=10, random_state=42, n_jobs=-1)
-        self.rf_model.fit(X.fillna(self._train_median), y)
+        self.rf_model.fit(X.fillna(-999), y)
         self.calibrator = EnsembleCalibratorMock(self.lgbm_model, self.rf_model, self.feature_names)
-        self.calibrator._train_median = self._train_median
         self.model = self.calibrator
 
         # [SORUN 5 DÜZELTMESİ] — n_folds=0 ise is_trained=False
@@ -591,18 +584,30 @@ class EnsemblePredictor:
                 X[col] = np.nan
         X = X[self.feature_names]
         pred_lgbm = float(self.lgbm_model.predict(X)[0])
-        pred_rf = float(self.rf_model.predict(X.fillna(self._train_median))[0])
+        pred_rf = float(self.rf_model.predict(X.fillna(-999))[0])
         pred_r = (pred_lgbm + pred_rf) / 2.0
         uncertainty = abs(pred_lgbm - pred_rf)
         threshold = self.threshold_long if ic_direction == "LONG" else self.threshold_short
+        
+        # [EXPECTED VALUE KARAR MEKANİZMASI]
+        # Regresyon çıktısı (pred_r) sigmoid fonksiyonu ile kazanma olasılığına dönüştürülür
+        win_prob = 1.0 / (1.0 + np.exp(-2.0 * pred_r))
+        loss_prob = 1.0 - win_prob
+        
+        # EV = (Win Prob * Reward) - (Loss Prob * Risk)
+        # Model varsayılan 1.5 Risk/Reward oranına göre eğitildiği için:
+        reward_r = 1.5
+        risk_r = 1.0
+        expected_value = (win_prob * reward_r) - (loss_prob * risk_r)
 
-        if pred_r >= threshold:
+        # Karar verme ölçütü artık EV'nin güvenli threshold'u geçmesi
+        if expected_value >= threshold:
             decision = MLDecision.LONG if ic_direction == "LONG" else MLDecision.SHORT
-            confidence = 60.0 + ((pred_r - threshold) / 0.5) * 40.0
+            confidence = 50.0 + (expected_value / reward_r) * 50.0
             confidence = min(100.0, float(confidence))
         else:
             decision = MLDecision.WAIT
-            confidence = 50.0 - ((threshold - pred_r) / 0.5) * 50.0
+            confidence = 50.0 - (abs(expected_value) / risk_r) * 50.0
             confidence = max(0.0, float(confidence))
 
         return MLDecisionResult(

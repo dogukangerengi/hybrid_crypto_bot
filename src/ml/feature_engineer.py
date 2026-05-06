@@ -4,8 +4,6 @@
 # Amaç: Mevcut IC analiz pipeline'ından gelen verileri ve ham OHLCV
 #        datasını LightGBM'in anlayacağı sayısal feature vektörüne çevirmek.
 #
-# Gemini'den Farkı:
-# - Gemini: "Bu bağlamda sinyal mantıklı mı?" sorusunu semantik cevaplıyordu
 # - FeatureEngineer: Aynı soruyu SAYISAL feature'lar + istatistiksel model ile cevaplar
 # - Avantaj: Geçmiş trade'lerden öğrenir, feedback loop var, deterministik
 #
@@ -53,7 +51,6 @@ logger = logging.getLogger(__name__)
 class MLDecision(Enum):
     """
     ML modelinin nihai kararı.
-    Gemini'deki AIDecision enum'unun ML karşılığı.
     """
     LONG = "LONG"                              # Alış sinyali
     SHORT = "SHORT"                            # Satış sinyali
@@ -77,7 +74,6 @@ class MLDecision(Enum):
 class MLDecisionResult:
     """
     ML pipeline'ının nihai karar objesi.
-    Gemini'deki AIDecisionResult'ın ML karşılığı.
     
     Bu obje execution modülüne gönderilir.
     Mevcut main.py'deki `_evaluate_coin` fonksiyonunda
@@ -246,14 +242,11 @@ class FeatureEngineer:
     """
     IC analiz sonuçları + OHLCV verisi → LightGBM feature matrix.
     
-    Bu sınıf Gemini optimizer'ın yerini almak için tasarlandı:
-    - Gemini: prompt + API call → JSON karar
     - FeatureEngineer: sayısal feature'lar → LightGBM tahmin
     
     Pipeline Entegrasyonu:
     main.py'deki _evaluate_coin() fonksiyonunda:
     
-    ESKİ (Gemini):
         ai_input = AIAnalysisInput(...)
         ai_result = self.ai_optimizer.get_decision(ai_input)
     
@@ -405,7 +398,6 @@ class FeatureEngineer:
 
         # ── Kategori Bazlı IC'ler ──
         # Her kategori (trend/momentum/volatility/volume) için en iyi IC
-        # Gemini bunu prompt'ta "hangi kategoriler uyumlu" olarak değerlendiriyordu
         # LightGBM'de bunlar ayrı feature → kategori etkileşimlerini öğrenebilir
         category_tops = getattr(analysis, 'category_tops', {})
 
@@ -433,7 +425,6 @@ class FeatureEngineer:
         """
         Piyasa bağlamı feature'ları.
         
-        Gemini'nin "market regime" ve "bağlamsal değerlendirme" 
         yeteneğinin sayısal karşılığı. Volatilite, hacim, momentum
         gibi piyasa koşullarını kodlar.
         
@@ -503,7 +494,6 @@ class FeatureEngineer:
         Motivasyon: Tek bir TF'de güçlü sinyal olabilir ama diğer TF'ler
         zıt yönde gösterebilir. Cross-TF uyumu yüksek = sinyal güvenilir.
         
-        Gemini bunu prompt'ta "timeframe sıralaması" olarak görüyordu.
         Burada sayısal metrikler olarak kodlanıyor.
         
         Parameters:
@@ -589,7 +579,6 @@ class FeatureEngineer:
         """
         OHLCV verisinden price action feature'ları çıkar.
         
-        Bu feature'lar Gemini'nin "piyasa dinamik" değerlendirmesinin
         karşılığı. Son N bar'ın momentum, volatilite ve trend istatistikleri.
         
         İstatistiksel Dikkat:
@@ -729,7 +718,6 @@ class FeatureEngineer:
         Risk hesaplama feature'ları.
         
         ATR, SL/TP mesafeleri ve Risk/Reward oranı.
-        Gemini bunu "risk hesaplamaları" bölümünde prompt olarak alıyordu.
         
         Parameters:
         ----------

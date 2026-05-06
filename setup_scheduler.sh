@@ -116,8 +116,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 load_dotenv(Path('$PROJECT_DIR/.env'))
 from config import cfg
-print(f'   Bitget:   {\"✅\" if cfg.exchange.is_configured() else \"❌ Key eksik\"}')
-print(f'   Gemini:   {\"✅\" if cfg.ai.is_configured() else \"❌ Key eksik\"}')
+print(f'   Binance:   {\"✅\" if cfg.exchange.is_configured() else \"❌ Key eksik\"}')
+print(f'   ML Modeli:   {\"✅\" if cfg.ai.is_configured() else \"❌ Key eksik\"}')
 print(f'   Telegram: {\"✅\" if cfg.telegram.is_configured() else \"❌ Key eksik\"}')
 " 2>/dev/null || echo "   ⚠️ Config kontrol edilemedi"
         
@@ -202,9 +202,9 @@ if notifier.is_configured():
 else:
     print('   ⚠️ Telegram yapılandırılmamış')
 
-print('\n3. Bitget bağlantı testi...')
-from execution import BitgetExecutor
-executor = BitgetExecutor(dry_run=True)
+print('\n3. Binance bağlantı testi...')
+from execution import BinanceExecutor
+executor = BinanceExecutor(dry_run=True)
 print('   ✅ Executor başlatıldı (DRY RUN)')
 "
         ;;
@@ -218,7 +218,7 @@ print('   ✅ Executor başlatıldı (DRY RUN)')
         echo "  logs       Son logları göster"
         echo "  run        Manuel tek çalıştırma (DRY RUN, top 15)"
         echo "  cycle      Kısa tek döngü (DRY RUN, top 15)"
-        echo "  test       Bağlantı testi (Config + Telegram + Bitget)"
+        echo "  test       Bağlantı testi (Config + Telegram + Binance)"
         exit 1
         ;;
 esac

@@ -4,8 +4,6 @@
 # Amaç: Her trade'in açılış özelliklerini ve kapanış sonucunu kaydet.
 #       Yeterli trade birikince LightGBM modeli gerçek trade verisiyle retrain et.
 #
-# Gemini'den farkı:
-# - Gemini sadece "şu an ne yapayım?" diye sorardı → geçmişten öğrenmiyordu
 # - TradeMemory → her trade bir eğitim örneği haline gelir
 # - Model zamanla kendi hatalarından öğrenir (online/incremental learning)
 #

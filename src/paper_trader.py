@@ -46,6 +46,7 @@ class TradeStatus(Enum):
     CLOSED_SL = "closed_sl"                    # Stop-loss ile kapandı
     CLOSED_MANUAL = "closed_manual"            # Manuel kapandı
     CLOSED_KILL = "closed_kill"                # Kill switch ile kapandı
+    CLOSED_TIMEOUT = "closed_timeout"          # 24 saat TIMEOUT ile kapandı
 
 
 class TradeDirection(Enum):
@@ -93,7 +94,7 @@ class PaperTrade:
     ic_direction: str                          # IC'nin önerdiği yön
     best_timeframe: str                        # En iyi zaman dilimi
     market_regime: str                         # Piyasa rejimi (trending/ranging)
-    ai_decision: Optional[str] = None          # Gemini kararı (LONG/SHORT/WAIT)
+    ai_decision: Optional[str] = None          # ML Modeli kararı (LONG/SHORT/WAIT)
     ai_confidence: Optional[float] = None      # AI güven skoru
     
     # ---- Zaman Damgaları ----
@@ -162,7 +163,7 @@ class PaperTrade:
         exit_price: float,
         status: TradeStatus,
         reason: str = "",
-        fee_rate: float = 0.0006              # Bitget maker fee: %0.06
+        fee_rate: float = 0.0006              # Binance maker fee: %0.06
     ) -> None:
         """
         Trade'i kapat ve PnL hesapla.

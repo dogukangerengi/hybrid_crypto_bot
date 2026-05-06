@@ -120,11 +120,11 @@ if [ -f ".env" ]; then
     echo -e "${GREEN}✅ .env dosyası mevcut${NC}"
     
     # Key'lerin doldurulup doldurulmadığını kontrol et
-    if grep -q "your_bitget" .env 2>/dev/null; then
-        echo -e "${YELLOW}   ⚠️  Bitget API key'leri henüz girilmemiş!${NC}"
+    if grep -q "your_binance" .env 2>/dev/null; then
+        echo -e "${YELLOW}   ⚠️  Binance API key'leri henüz girilmemiş!${NC}"
         echo "   → .env dosyasını düzenle: code .env"
     else
-        echo "   → Bitget key'leri girilmiş ✓"
+        echo "   → Binance key'leri girilmiş ✓"
     fi
 else
     # .env.example'dan kopyala
@@ -153,12 +153,12 @@ fi
 # ADIM 6: BAĞLANTI TESTİ
 # =========================================================================
 echo ""
-echo -e "${YELLOW}[6/6] Bitget bağlantı testi...${NC}"
+echo -e "${YELLOW}[6/6] Binance bağlantı testi...${NC}"
 echo "   (API key yoksa sadece public testler çalışır)"
 echo ""
 
 cd src
-python test_bitget_connection.py
+python test_binance_connection.py
 cd ..
 
 # =========================================================================
@@ -181,7 +181,7 @@ echo "  2. Sanal ortamı aktif et (her terminal açılışında):"
 echo "     → source venv/bin/activate"
 echo ""
 echo "  3. Bağlantıyı tekrar test et:"
-echo "     → cd src && python test_bitget_connection.py"
+echo "     → cd src && python test_binance_connection.py"
 echo ""
 echo "  4. Geliştirmeye başla! 🚀"
 echo ""

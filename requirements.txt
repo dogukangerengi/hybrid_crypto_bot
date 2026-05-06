@@ -28,8 +28,6 @@ ccxt>=4.2.0                # Unified borsa API'si - Bitget dahil 100+ borsa
 # -----------------------------------------------------------------------------
 # YAPAY ZEKA (GOOGLE GEMİNİ)
 # -----------------------------------------------------------------------------
-google-generativeai>=0.8.0 # Gemini Pro API - grafik analizi + entry optimizasyon
-Pillow>=10.0.0             # Görüntü işleme (chart → Gemini'ye gönderme)
 mplfinance>=0.12.10b0      # Profesyonel candlestick grafik oluşturma
 
 # -----------------------------------------------------------------------------
