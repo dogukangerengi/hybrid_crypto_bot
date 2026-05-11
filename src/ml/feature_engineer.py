@@ -616,15 +616,15 @@ class FeatureEngineer:
         # Son N bar'daki yüzde değişim
         # Kısa vadeli momentum: fiyat hangi yönde hareket ediyor?
         features['px_momentum_5'] = float(                   # Son 5 bar getiri (%)
-            (close.iloc[-1] / close.iloc[-6] - 1) * 100
+            np.log(close.iloc[-1] / close.iloc[-6]) * 100
             if len(close) > 6 else np.nan
         )
         features['px_momentum_10'] = float(                  # Son 10 bar getiri (%)
-            (close.iloc[-1] / close.iloc[-11] - 1) * 100
+            np.log(close.iloc[-1] / close.iloc[-11]) * 100
             if len(close) > 11 else np.nan
         )
         features['px_momentum_20'] = float(                  # Son 20 bar getiri (%)
-            (close.iloc[-1] / close.iloc[-21] - 1) * 100
+            np.log(close.iloc[-1] / close.iloc[-21]) * 100
             if len(close) > 21 else np.nan
         )
 

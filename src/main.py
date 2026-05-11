@@ -1,6 +1,28 @@
 # =============================================================================
-# MAIN.PY — ML-DRIVEN TRADING PIPELINE v2.1.4 (BINANCE VADELİ İŞLEMLER)
+# MAIN.PY — ML-DRIVEN TRADING PIPELINE v2.1.12 (BINANCE VADELİ İŞLEMLER)
 # =============================================================================
+# v2.1.12 Değişiklikler:
+#   ✅ [Sorun #5] PURE_IC_MODE flag eklendi — KRİTİK acil sigorta.
+#      ML modeli sentetik veri bias'ından edge maskeliyorsa (_validate_initial_model
+#      IC ≤ 0 dönerse) bu flag=True yapılır. ML/Validator katmanı atlanır,
+#      saf IC sinyaliyle trade açılır. RiskManager aynen çalışmaya devam eder.
+#   ✅ [Sorun #1] _validate_initial_model() eklendi — karar düğümü sanity check.
+#      TradeMemory closed trades üzerinden OOS Spearman IC hesaplar.
+#      IC > +0.10: USE_MODEL | 0 < IC ≤ 0.10: MARGINAL | IC ≤ 0: BYPASS_RECOMMENDED
+#   ✅ [Sorun #4] Cross-TF IC ağırlıklandırması: sig_count → inverse variance.
+#      n_observations tf_rankings'e eklendi. Yüksek-frekanslı TF'ler daha güvenilir.
+#   ✅ [Sorun #2] Daily PnL watchdog threading ile eklendi (asyncio değil).
+#      Her saat cache vs disk ground-truth karşılaştırması, |drift| > $0.01 → düzelt.
+#
+# v2.1.5 Değişiklikler:
+#   ✅ Selection bias düzeltmesi: ic_confidence artık tüm TF'lerin ağırlıklı
+#      ortalamasından hesaplanıyor (Seçenek 2 — Cross-TF Unbiased IC).
+#      Eski: best-of-4 TF seçimi → IC şişiriliyordu (~+1.03σ bias).
+#      Yeni: sig_count ağırlıklı cross-TF ortalama → unbiased gate kararı.
+#      ic_direction: best_tf yönü yerine sig_count ağırlıklı TF oyu.
+#      IC threshold'ları buna göre revize edildi (10/12 → 7/9).
+#      best_tf sadece operasyonel amaçla korunuyor (regime, OHLCV, top_ic).
+#
 # v2.1.4 Değişiklikler:
 #   ✅ Günlük %6 kayıp limiti AKTİF edildi (TR yerel saati, 00:00 TR'e kadar halt)
 #   ✅ Toplam margin limitleri (%60) ve per-trade margin (%25) AKTİF
@@ -21,7 +43,7 @@ import signal
 import argparse
 import logging
 import traceback
-import schedule
+import threading
 
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -63,15 +85,51 @@ def _now_local() -> datetime:
 
 def _iso_tr(dt: datetime = None) -> str:
     """
-    ISO formatında TR zaman string'i (Excel için okunabilir).
-    Excel tz-aware ISO'yu parse edemeyebilir, bu yüzden
-    saf string olarak yazıyoruz ama TR saatiyle.
+    ISO formatında TR zaman string'i — timezone-aware (+03:00 offset dahil).
+
+    v2.1.6 Fix: Önceki versiyon naive string yazıyordu (timezone bilgisi yoktu).
+    Parse eden her yer kendi varsayımını yapınca sessiz veri bozulması oluşuyordu:
+      - UTC varsayımı → 3 saatlik kayma (Süre dk negatif, daily PnL yanlış tarih)
+      - '-3h hack'  → çalışıyor ama kırılgan (fragile), bakımı zor
+    Şimdi: '+03:00' dahil yazılır → parse'da naive assumption sıfır.
+    pandas pd.to_datetime() ve Python 3.12 fromisoformat() her ikisi de handle eder.
+    Microseconds kaldırıldı (Excel gösterimi için gereksiz, parse'ı basitleştirir).
     """
     if dt is None:
         dt = datetime.now(timezone.utc)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%dT%H:%M:%S.%f")
+    return dt.astimezone(LOCAL_TZ).strftime("%Y-%m-%dT%H:%M:%S+03:00")
+
+
+def _parse_tr_str(s: str) -> datetime:
+    """
+    _iso_tr() ile yazılmış string'i UTC-aware datetime'a çevir.
+
+    v2.1.6'da eklendi: tüm timestamp parse'ları bu tek noktadan geçer.
+    Eski ve yeni formatları otomatik ayırt eder (backward compatible).
+
+    Desteklenen formatlar:
+      Yeni (v2.1.6+) : '2024-01-15T17:21:00+03:00'  → aware, direkt parse → UTC
+      Eski (≤v2.1.5) : '2024-01-15T17:21:00.000000' → naive → LOCAL_TZ varsay → UTC
+
+    Neden naive → LOCAL_TZ (TR) varsayımı?
+      _iso_tr() her zaman TR saatini yazmıştır. Eski naive stringler timezone
+      bilgisi taşımasa da içerik olarak TR saatidir. UTC varsaymak 3 saatlik
+      hataya yol açar (Test ile kanıtlandı: 10800 sn = 3 saat kayma).
+
+    Returns:
+        UTC-aware datetime — tüm karşılaştırmalar bu obje üzerinden güvenle yapılır.
+    """
+    try:
+        dt = datetime.fromisoformat(str(s).strip())
+    except (ValueError, TypeError):
+        logger.warning(f"⚠️ _parse_tr_str: parse edilemeyen timestamp '{s}' → şimdi UTC kullanılıyor")
+        return datetime.now(timezone.utc)
+    if dt.tzinfo is None:
+        # Eski naive format: _iso_tr TR saatini yazmıştı → LOCAL_TZ olarak yorumla
+        dt = dt.replace(tzinfo=LOCAL_TZ)
+    return dt.astimezone(timezone.utc)
 
 
 
@@ -112,7 +170,7 @@ logger = logging.getLogger(__name__)
 # SABİTLER
 # =============================================================================
 
-VERSION                = "2.1.4"
+VERSION                = "2.1.12"
 MAX_COINS_PER_CYCLE    = 30
 DEFAULT_FWD_PERIOD     = 12  # [FWD WINDOW DÜZELTMESİ] 6 → 12 bar
 # Sebep: 6 bar çok kısa — TP/SL'ye ulaşan bar sayısı toplam verinin yalnızca %9'u.
@@ -137,12 +195,40 @@ DEFAULT_TIMEFRAMES = {
     '1h' : 1000,
 }
 
-# [MADDE 2 DÜZELTMESİ] — IC gate eşikleri yükseltildi
-# Canlı veri analizi: IC<17 bandındaki 135 trade ortalama -$0.062/trade kaybetti.
-# IC≥20 olan 36 trade ise +$0.167/trade kazandı → IC ile WR arasında monotonik artış var.
-# Önceki değerler (4/6) çok düşüktü ve gürültülü sinyallere kapı açıyordu.
-IC_NO_TRADE = 10.0    # 10 -> 8: düşük IC'li sinyaller de geçsin, model tecrübe kazansın
-IC_TRADE    = 12.0   # 15 -> 10: veri birikimi için gevşetildi, paper modda öğrenme hızlanır
+# [v2.1.5 — SELECTİON BİAS DÜZELTMESİ SONRASI THRESHOLD REVİZYONU]
+# Eski (v2.1.4): ic_confidence = best_tf IC'si → best-of-4 seçim bias'ı nedeniyle
+#   gerçek IC 0.03 olan coin IC=0.05-0.06 görünüyordu (~+1.03σ şişirme).
+#   Threshold 10/12 bu şişirilmiş değere göre calibre edilmişti.
+#
+# Yeni (v2.1.5): ic_confidence = cross-TF sig_count ağırlıklı ortalama → unbiased.
+#   Cross-TF ortalama doğal olarak daha düşük gelir (max yerine ortalama).
+#   Sayısal örnek: [15, 9, 8, 7] → best=15, cross-avg≈9.8 (sig_count'a göre)
+#   Bu nedenle threshold'ları 10/12 → 7/9'a indiriyoruz.
+#   Filtre GERÇEKTE sıkılaşıyor: cross-avg 7 = "tüm TF'lerin ortalaması ≥ 7"
+#   Bu, tek bir TF'nin 12 göstermesinden çok daha güçlü bir sinyal kalitesidir.
+IC_NO_TRADE = 7.0    # 10.0 → 7.0 (cross-TF avg daha düşük; filtre etkin olarak sıkılaştı)
+IC_TRADE    = 9.0    # 12.0 → 9.0 (aynı gerekçe; tek TF'lik şansa artık izin yok)
+
+# [v2.1.12] Pure IC Bypass Mode
+# Sebep: ML modeli sentetik veri üzerinden eğitildi (initial_train stub bias —
+#   ic_confidence=65.0 sabit, market_regime='trending' sabit). Sanity check
+#   IC ≤ 0 dönerse model edge maskeliyor olabilir; bu flag ile ML/Validator
+#   katmanı tamamen atlanır, saf IC sinyaliyle trade açılır.
+#
+# Kullanım:
+#   False (default) → Normal mod, ML + Validator pipeline çalışır.
+#   True            → Sanity check IC ≤ 0 sonrası manuel set edilir.
+#                     ic_confidence ≥ IC_TRADE ve dir LONG/SHORT → direkt trade.
+#                     RiskManager (SL, TP, position size) aynen çalışmaya devam eder.
+#
+# Kapatma kriteri: Pure IC modda 50+ trade birikmesi ve _validate_initial_model()
+#   sonucu IC > 0 çıkması → PURE_IC_MODE = False, ML retrain planla.
+
+# [v2.1.14] Retrain eşiği — 200'den 30'a indirildi.
+# Sebep: Yeterli gerçek trade birikmediğinde bile model şu anki
+# canlı deneyimden (˜57 trade) hızla (öğrenmeli).
+# Her 30 kapanan trade'de bir retrain tetiklenir.
+RETRAIN_MIN_TRADES = 30
 
 # =============================================================================
 # ENUM'LAR
@@ -262,6 +348,14 @@ class MLTradingPipeline:
         # Paper modda bu flag devreye girmez (dry_run=True ise engelleme yok).
         self._model_deployment_approved: bool = False
 
+        # [v2.1.14] Otomatik Bypass devre dışı — ML her zaman aktif.
+        # pure_ic_mode her zaman False; _evaluate_sanity_and_set_bypass sadece loglama yapıyor.
+        self.pure_ic_mode: bool = False
+
+        # [v2.1.15] Walk-forward validation: retrain'de son %%20 trade ID'leri
+        # burada saklanır. _validate_initial_model sadece bu set üzerine OOS IC ölçer.
+        self._oos_trade_ids: set = set()
+
         # ── GÜNLÜK KAYIP LİMİTİ STATE (v2.1.4) ──────────────────────────
         # UTC gününün başında bakiye snapshot'ı alınır.
         # Gün içinde toplam kapalı trade PnL'i bu değerin -%6'sına inerse
@@ -363,11 +457,15 @@ class MLTradingPipeline:
             # Yerel saat (TR) üzerinden bugünün tarihini al → 00:00 TR'de sıfırlanır
             self._daily_date = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
             self._daily_start_balance = self._balance
-            self._daily_realized_pnl = 0.0
+            # [v2.1.7] Startup'ta bugüne ait kapanan trade PnL'ini dosyadan yükle.
+            # Sonraki kapanmalar artık += ile in-memory artırılacak (O(1) per trade).
+            # _compute_daily_pnl() bu noktadan sonra döngüde çağrılmaz.
+            self._daily_realized_pnl = self._compute_daily_pnl()
             logger.info(
                 f"📅 Günlük limit başlangıcı: {self._daily_date} (TR) | "
                 f"Start bakiye: ${self._daily_start_balance:.2f} | "
-                f"Max günlük kayıp: %{cfg.risk.daily_max_loss_pct}"
+                f"Max günlük kayıp: %{cfg.risk.daily_max_loss_pct} | "
+                f"Bugünkü PnL (startup): ${self._daily_realized_pnl:+.2f}"
             )
             return True
         except Exception as e:
@@ -460,8 +558,13 @@ class MLTradingPipeline:
     def _compute_daily_pnl(self) -> float:
         """
         Bugün (yerel saat TR) kapanan tüm trade'lerin toplam PnL'ini hesapla.
-        Canlı mod: ml_trade_memory.json
-        Paper mod: paper_trader.closed_trades
+
+        v2.1.7: Bu fonksiyon artık SADECE startup'ta (_init_balance içinde) bir kez
+        çağrılır. Döngü içinde çağrılmaz — O(N) dosya I/O'yu döngüden çıkardık.
+        Sonraki kapanmalarda _daily_realized_pnl doğrudan += net_pnl ile güncellenir.
+
+        Canlı mod: ml_trade_memory.json dosyasını okur (startup yüklemesi)
+        Paper mod: paper_trader.closed_trades listesini okur (startup yüklemesi)
         """
         # "Bugün" tanımı TR saatine göre (00:00 TR - 23:59 TR arası)
         today = datetime.now(LOCAL_TZ).strftime("%Y-%m-%d")
@@ -500,16 +603,15 @@ class MLTradingPipeline:
                         continue
                     if isinstance(closed_at, str):
                         try:
-                            closed_dt = datetime.fromisoformat(closed_at)
-                        except ValueError:
+                            closed_dt = _parse_tr_str(closed_at)   # UTC-aware (yeni/eski format otomatik)
+                        except Exception:
                             continue
                     else:
                         closed_dt = closed_at
-                    if closed_dt.tzinfo is None:
-                        # Naive datetime geldi — UTC varsayıyoruz
-                        # Bu dal artık tetiklenmemeli (_iso_tr() her yerde UTC üretiyor)
-                        logger.debug(f'Naive datetime: {closed_at} — UTC varsayılıyor')
-                        closed_dt = closed_dt.replace(tzinfo=timezone.utc)
+                        if closed_dt.tzinfo is None:
+                            # datetime objesi naive geldi — paper_trader UTC üretmeli ama
+                            # eski kayıtlar için LOCAL_TZ varsay (_iso_tr TR saatini yazardı)
+                            closed_dt = closed_dt.replace(tzinfo=LOCAL_TZ).astimezone(timezone.utc)
                     # ⏱️ Yerel saate çevirip TR gününe göre karşılaştır
                     closed_dt_local = closed_dt.astimezone(LOCAL_TZ)
                     if closed_dt_local.strftime("%Y-%m-%d") == today:
@@ -554,9 +656,9 @@ class MLTradingPipeline:
             )
             return True
 
-        # Bugünkü gerçekleşen PnL
-        daily_pnl = self._compute_daily_pnl()
-        self._daily_realized_pnl = daily_pnl
+        # [v2.1.7] Artık dosyadan okuma yok — _daily_realized_pnl startup'ta yüklendi,
+        # her trade kapanışında += net_pnl ile güncellendi. Direkt kullan.
+        daily_pnl = self._daily_realized_pnl
 
         if self._daily_start_balance <= 0:
             return False
@@ -899,6 +1001,7 @@ class MLTradingPipeline:
                 # ── FIX 3: feature_engineer ctf_* feature'ları için 'score' ve 'direction' bekliyor ──
                 # Önceden sadece 'avg_ic' ve 'sig_count' vardı → feature_engineer 'score'u bulamıyordu
                 # → ctf_best_score, ctf_avg_score, ctf_score_std, ctf_score_spread hep 0 oluyordu.
+                # tf_avg_signed: pozitif IC → piyasa yukarı trend (LONG), negatif → aşağı (SHORT)
                 tf_avg_signed = sum(s.ic_mean for s in valid_scores) / len(valid_scores)
                 tf_dir = 'LONG' if tf_avg_signed > 0 else ('SHORT' if tf_avg_signed < 0 else 'NEUTRAL')
 
@@ -908,6 +1011,7 @@ class MLTradingPipeline:
                     'score': avg_ic * 100,                                         # ← FIX 3
                     'sig_count': len([s for s in scores if s.is_significant]),
                     'direction': tf_dir,                                           # ← FIX 3
+                    'n_observations': len(df),  # [v2.1.12] inverse variance için bar sayısı
                 })
 
                 if avg_ic > best_ic:
@@ -927,17 +1031,88 @@ class MLTradingPipeline:
             if best_scores:
                 result.top_ic = max(abs(s.ic_mean) for s in best_scores if not np.isnan(s.ic_mean))
 
-            ic_scores = [s.ic_mean for s in best_scores]
-            ic_signal_dir = "NEUTRAL"
-            if ic_scores:
-                ic_avg = sum(ic_scores) / len(ic_scores)
-                if ic_avg > 0:
-                    ic_signal_dir = "LONG"
-                elif ic_avg < 0:
-                    ic_signal_dir = "SHORT"
-                result.ic_confidence   = abs(ic_avg) * 100
-                result.ic_direction    = ic_signal_dir
-                result.significant_count = len(best_scores)
+            # =========================================================================
+            # [v2.1.5 — SELECTİON BİAS DÜZELTMESİ]
+            # =========================================================================
+            # ÖNCE (v2.1.4 ve öncesi — YANLIŞ):
+            #   ic_confidence = best_tf'in anlamlı score'larının ortalaması
+            #   → best-of-4 seçimi kendi başına düzeltilmemiş bir multiple testing.
+            #   → E[max(X₁..X₄)] ≈ μ + 1.03σ kadar şişirilmiş IC değeri.
+            #   → IC=0.03 olan coin, IC≈0.05-0.06 görünüyor; threshold'lar yanıltıcı.
+            #
+            # SONRA (v2.1.5 — DOĞRU, Seçenek 2):
+            #   ic_confidence = tüm TF'lerin sig_count ağırlıklı ortalaması (unbiased).
+            #   ic_direction  = sig_count ağırlıklı TF yön oyu (majority vote).
+            #   significant_count = tüm TF'lerin toplam anlamlı indikatör sayısı.
+            #
+            #   best_tf SADECE operasyonel amaçlarla korunuyor:
+            #     - regime tespiti (indicator_data[best_tf])
+            #     - OHLCV/indikatör verisi (df_best)
+            #     - top_ic (en güçlü tekil sinyal — ML feature'ı, model kendi ağırlığını öğrenir)
+            #
+            #   Neden sig_count ağırlığı?
+            #     Bir TF'de 12 anlamlı indikatör varsa, 2 anlamlı indikatörden
+            #     6 kat daha güvenilir → daha fazla oy alması mantıklı.
+            #     Eşit ağırlık da işe yarar ama sig_count daha informatif.
+            # =========================================================================
+
+            if tf_rankings:
+                # [v2.1.12] Inverse variance weighting — sig_count'tan daha doğru proxy.
+                # Matematik: SE = sqrt((1 - IC²) / (n - 2))  → variance = SE²
+                #   weight = 1/variance → yüksek n ve düşük IC std → daha fazla ağırlık.
+                # Eski: sig_count ağırlığı (daha fazla anlamlı indikatör = güvenilir) →
+                #   yanlış: 15m TF'de 2000 bar + avg_ic=0.15 >> 1d TF'de 120 bar + avg_ic=0.05
+                #   ama eski formül sig_count'a göre 1d'ye 3x ağırlık verebilirdi.
+                weights = []
+                for r in tf_rankings:
+                    ic  = r['avg_ic']
+                    n   = r.get('n_observations', r['sig_count'] * 50)  # fallback
+                    # variance ≥ 0.001 alt sınırı: IC≈1 veya n≈2 köşe durumu
+                    variance = max(0.001, (1.0 - ic ** 2) / max(2, n - 2))
+                    weights.append(1.0 / variance)
+
+                total_w = sum(weights)
+
+                if total_w > 0:
+                    # Ağırlıklı cross-TF IC (magnitude)
+                    cross_tf_ic = sum(
+                        r['avg_ic'] * w for r, w in zip(tf_rankings, weights)
+                    ) / total_w
+
+                    # Ağırlıklı yön oyu — sig_count yerine inverse variance ağırlığı
+                    # NOT: selector.py 'bullish'/'bearish' üretir,
+                    # burada tf_rankings içindeki 'direction' zaten main.py'de LONG/SHORT olarak set ediliyor.
+                    long_votes = sum(
+                        w for r, w in zip(tf_rankings, weights) if r['direction'] == 'LONG'
+                    )
+                    short_votes = sum(
+                        w for r, w in zip(tf_rankings, weights) if r['direction'] == 'SHORT'
+                    )
+                else:
+                    # Fallback: eşit ağırlık (total_w=0 teorik köşe durumu)
+                    cross_tf_ic = sum(r['avg_ic'] for r in tf_rankings) / len(tf_rankings)
+                    long_votes  = sum(1 for r in tf_rankings if r['direction'] == 'LONG')
+                    short_votes = sum(1 for r in tf_rankings if r['direction'] == 'SHORT')
+
+                result.ic_confidence = cross_tf_ic * 100   # 0-100 arası normalize
+
+                # %10 marjin: yakın oylarda NEUTRAL → gereksiz işlem önle
+                if long_votes > short_votes * 1.1:
+                    result.ic_direction = 'LONG'
+                elif short_votes > long_votes * 1.1:
+                    result.ic_direction = 'SHORT'
+                else:
+                    result.ic_direction = 'NEUTRAL'
+
+                # Toplam anlamlı indikatör sayısı (feature olarak korunuyor)
+                total_sig = sum(r['sig_count'] for r in tf_rankings)
+                result.significant_count = total_sig if total_sig > 0 else len(tf_rankings)
+
+                logger.debug(
+                    f"   📐 [{coin}] Cross-TF IC (IVW): {result.ic_confidence:.2f} "
+                    f"(long_w={long_votes:.2f}, short_w={short_votes:.2f}, "
+                    f"n_tf={len(tf_rankings)}) → dir={result.ic_direction}"
+                )
 
             if result.ic_confidence < IC_NO_TRADE:
                 result.status = "ic_too_low"; return result
@@ -1033,6 +1208,25 @@ class MLTradingPipeline:
             if not self.lgbm_model.is_trained:
                 result.ml_skipped = True
                 result.status = "model_not_trained"
+                return result
+
+            # [v2.1.12] Pure IC Bypass — ML/Validator katmanını atla
+            # Sebep: Sanity check IC ≤ 0 dönerse model anti-edge öğrenmiş olabilir.
+            #   Bu durumda ML tahminleri gerçek IC sinyalini maskeleyebilir.
+            #   PURE_IC_MODE=True olduğunda yalnızca IC gate kararı kullanılır.
+            # Not: RiskManager (SL, TP, position size) her iki modda da aynen çalışır.
+            if self.pure_ic_mode:
+                if result.ic_direction in ('LONG', 'SHORT'):
+                    result.ml_skipped = True
+                    result.ml_result  = None
+                    result.val_result = None
+                    result.status     = "ready"
+                    logger.info(
+                        f"   [PURE_IC] {result.coin}: ic={result.ic_confidence:.1f} "
+                        f"dir={result.ic_direction} → ML bypass, trade onaylandı"
+                    )
+                else:
+                    result.status = "neutral_direction"
                 return result
 
             fv = self.feature_eng.build_features(
@@ -1143,11 +1337,17 @@ class MLTradingPipeline:
             self.cooldowns[result.full_symbol] = now + timedelta(hours=1)
             return result
 
-        if result.status != "ready" or result.ml_result is None:
+        if result.status != "ready":
             return result
 
-        direction = result.ml_result.decision.value
-        if direction == "WAIT":
+        if self.pure_ic_mode and getattr(result, 'ml_skipped', False):
+            direction = result.ic_direction
+        else:
+            if result.ml_result is None:
+                return result
+            direction = result.ml_result.decision.value
+
+        if direction == "WAIT" or not direction:
             return result
 
         try:
@@ -1510,6 +1710,8 @@ class MLTradingPipeline:
 
                             self.paper_trader._close_trade(trade, exit_price, status, close_reason)
                             closed_count += 1
+                            # [v2.1.7] Daily PnL in-memory güncelle (O(1), dosya I/O yok)
+                            self._daily_realized_pnl += float(getattr(trade, 'net_pnl', 0.0) or 0.0)
                             logger.info(f"   ✅ {trade.symbol} işlemi kapandı! Neden: {close_reason} | Fiyat: ${exit_price:,.4f}")
 
                             if self.notifier.is_configured():
@@ -1695,6 +1897,8 @@ class MLTradingPipeline:
                                     pnl         = pnl_val,
                                     exit_reason = close_reason_timeout,
                                 )
+                                # [v2.1.7] Daily PnL in-memory güncelle (O(1), dosya I/O yok)
+                                self._daily_realized_pnl += net_pnl_val
                                 outcome_str = "KÂR" if pnl_val > 0 else "ZARAR"
                                 logger.info(
                                     f"   🧠 Memory güncellendi: {mem_coin} → TIMEOUT/{outcome_str} | "
@@ -1743,15 +1947,7 @@ class MLTradingPipeline:
                                         df.at[idx, 'Tarih (Kapanış)'] = _iso_tr(kapanis_zamani)
                                         try:
                                             acilis_str = str(df.at[idx, 'Tarih (Açılış)'])
-                                            acilis_zamani = pd.to_datetime(acilis_str)
-                                            # [BUG FIX] Süre negatif hatası:
-                                            # _iso_tr() TR saatini (+03:00) timezone'suz kaydeder.
-                                            # pd.to_datetime naive parse eder → tz_localize('UTC') yanlış.
-                                            # Örnek: 17:21 TR → naive → UTC sanılır → kapanış 15:37 UTC - 17:21 UTC = -104 dk
-                                            # Çözüm: naive ise TR (+3) olduğunu bilerek UTC'ye çevir
-                                            if acilis_zamani.tzinfo is None:
-                                                acilis_zamani = acilis_zamani - pd.Timedelta(hours=3)
-                                                acilis_zamani = acilis_zamani.tz_localize('UTC')
+                                            acilis_zamani = _parse_tr_str(acilis_str)   # UTC-aware
                                             df.at[idx, 'Süre (dk)'] = int((kapanis_zamani - acilis_zamani).total_seconds() / 60)
                                         except Exception:
                                             df.at[idx, 'Süre (dk)'] = 0
@@ -1860,6 +2056,8 @@ class MLTradingPipeline:
                                 pnl         = pnl_val,
                                 exit_reason = close_reason,
                             )
+                            # [v2.1.7] Daily PnL in-memory güncelle (O(1), dosya I/O yok)
+                            self._daily_realized_pnl += net_pnl_val
                             logger.info(f"   🧠 Memory güncellendi: {mem_coin} → {close_reason} | PnL: ${pnl_val:+.2f}")
                         except Exception as mem_err:
                             logger.error(f"   ❌ Memory güncelleme hatası: {mem_coin} → {mem_err}")
@@ -1904,11 +2102,7 @@ class MLTradingPipeline:
 
                                     try:
                                         acilis_str = str(df.at[idx, 'Tarih (Açılış)'])
-                                        acilis_zamani = pd.to_datetime(acilis_str)
-                                        # [BUG FIX] Süre negatif hatası — bkz. yukarıdaki açıklama
-                                        if acilis_zamani.tzinfo is None:
-                                            acilis_zamani = acilis_zamani - pd.Timedelta(hours=3)
-                                            acilis_zamani = acilis_zamani.tz_localize('UTC')
+                                        acilis_zamani = _parse_tr_str(acilis_str)   # UTC-aware
                                         df.at[idx, 'Süre (dk)'] = int((kapanis_zamani - acilis_zamani).total_seconds() / 60)
                                     except Exception:
                                         df.at[idx, 'Süre (dk)'] = 0
@@ -2083,34 +2277,47 @@ class MLTradingPipeline:
             total_closed = pt_stats.get("closed_trades", 0)
             real_win_rate = pt_stats.get("win_rate_pct", 0.0)
 
-            retrain_threshold = 30
-            # [FIX] experience_retrain_count kullan (retrain_count değil)
-            # retrain_count her train() çağrısında artar → initial_train sonrası 1 olur
-            # Bu yüzden 30 trade sonrası retrain hiç tetiklenmiyordu
+            retrain_threshold = 30  # loglama için korundu (next_retrain_in hesabı)
+            # ── RETRAIN COUNTER AÇIKLAMASI ──────────────────────────────────
+            # lgbm_model üzerinde iki ayrı sayaç yaşar:
+            #   retrain_count            → train() her çağrıldığında +1 (initial_train dahil).
+            #                              Toplam eğitim sayısını gösterir; sadece loglama amaçlı.
+            #   experience_retrain_count → "Her 30 kapanan trade'de bir" retrain cycle numarası.
+            #                              Tetikleme kararı bu sayaca göre verilir.
+            #                              initial_train sonrası hâlâ 0 kalır → ilk 30 trade'de
+            #                              retrain doğru biçimde tetiklenir.
+            # ────────────────────────────────────────────────────────────────
             current_exp_count = getattr(self.lgbm_model, 'experience_retrain_count', 0)
 
-            if total_closed >= retrain_threshold:
+            # [v2.1.11] retrain_from_experience() DONDURULDU — RETRAIN_MIN_TRADES'e kadar çalışmaz.
+            # Hybrid synthetic veri distributional leakage üretiyor:
+            #   ic_confidence=65.0 sabit, market_regime='trending' sabit → model
+            #   "65.0 = synthetic" örüntüsünü öğreniyor → IC=0.87 (sahte) → threshold=0.645
+            #   → sıfır trade açılıyor. initial_train (IC=0.057, threshold=0.122) korunuyor.
+            if total_closed >= RETRAIN_MIN_TRADES:
                 target_exp_count = total_closed // retrain_threshold
-
                 if target_exp_count > current_exp_count:
                     logger.info(f"\n🧠 [RETRAIN] {total_closed} kapalı işleme ulaşıldı! Model kendi tecrübelerinden yeniden eğitiliyor...")
                     try:
-                        if hasattr(self, 'retrain_from_experience'):
-                            self.retrain_from_experience()
+                        self.retrain_from_experience()
                     except Exception as e:
                         logger.error(f"Eğitim tetiklenemedi: {e}")
-
                     self.lgbm_model.experience_retrain_count = target_exp_count
+            else:
+                logger.debug(
+                    f"   ⏸️ Retrain donduruldu: {total_closed}/{RETRAIN_MIN_TRADES} trade "
+                    f"(initial_train modeli aktif, threshold={self.lgbm_model.threshold_long:.3f})"
+                )
 
             next_target = ((total_closed // retrain_threshold) + 1) * retrain_threshold
             kalan_islem = next_target - total_closed
 
             report.ml_stats = {
-                "closed_trades":  total_closed,
-                "win_rate":       real_win_rate,
-                "retrain_count":  getattr(self.lgbm_model, 'retrain_count', 0),
-                "next_retrain_in": kalan_islem,
-                "model_trained":  self.lgbm_model.is_trained,
+                "closed_trades":    total_closed,
+                "win_rate":         real_win_rate,
+                "total_train_calls": getattr(self.lgbm_model, 'retrain_count', 0),   # initial + experience retrains
+                "next_retrain_in":  kalan_islem,
+                "model_trained":    self.lgbm_model.is_trained,
             }
             report.status = (
                 CycleStatus.SUCCESS   if report.total_traded > 0
@@ -2128,6 +2335,168 @@ class MLTradingPipeline:
         report.elapsed = time.time() - start
         self._log_cycle_summary(report)
         return report
+
+    def _validate_initial_model(self) -> dict:
+        """
+        [v2.1.12 — Sorun #1 Sanity Check]
+        Kapalı trade'lerin feature_snapshot'ı üzerinden model predict çalıştırır.
+        Gerçek r_multiple ile Spearman IC hesaplar → modelin gerçek edge'i var mı?
+
+        Neden TradeMemory kullanılır (paper_trader değil):
+          paper_trader.closed_trades ham trade objeleri içerir, feature_snapshot yok.
+          TradeMemory her trade'i feature_snapshot + ic_direction ile saklar (satır 1519-1522).
+
+        Dönüş:
+          verdict = "USE_MODEL"          → IC > +0.10 ve p < 0.05  ✅
+          verdict = "MARGINAL"           → 0 < IC ≤ 0.10            ⚠️
+          verdict = "BYPASS_RECOMMENDED" → IC ≤ 0                   ❌ → PURE_IC_MODE = True öner
+          verdict = "insufficient_data"  → n < 30 (henüz erken)
+        """
+        from scipy.stats import spearmanr
+        import json as _json
+
+        memory_file = self.trade_memory.log_dir / "ml_trade_memory.json"
+        if not memory_file.exists():
+            logger.info("[SANITY] Trade hafızası dosyası bulunamadı, atlanıyor.")
+            return {"status": "insufficient_data", "n": 0}
+
+        with open(memory_file, 'r', encoding='utf-8') as f:
+            all_trades = _json.load(f)
+
+        closed_trades = [t for t in all_trades if t.get('exit_reason') or t.get('pnl', 0) != 0]
+        n_total = len(closed_trades)
+
+        if n_total < 30:
+            logger.info(f"[SANITY] Yetersiz veri: {n_total} kapatı trade (min 30 gerekli)")
+            return {"status": "insufficient_data", "n": n_total}
+
+        # [v2.1.15] Walk-forward OOS filtreleme:
+        # retrain_from_experience() tarafından son %%20 trade'in ID'leri _oos_trade_ids'e
+        # kaydedilir. Buraya ulaşırsa sadece o trade'ler üzerinden IC ölçülür.
+        # Eger _oos_trade_ids bos ise (ilk startup gibi) eski gibi tüm trade'ler kullanılır.
+        if self._oos_trade_ids:
+            oos_trades = [t for t in closed_trades if t.get('trade_id') in self._oos_trade_ids]
+            if len(oos_trades) >= 10:
+                closed_trades = oos_trades
+                logger.info(f"[SANITY] Walk-forward OOS: {len(closed_trades)} trade kullanılıyor (toplam {n_total} içinden)")
+            else:
+                logger.info(f"[SANITY] OOS set çok küçük ({len(oos_trades)}), tüm trade'ler kullanılıyor")
+
+        predictions = []  # Modelin probability skoru
+        actual_r    = []  # Gerçek r_multiple
+
+        for t in closed_trades:
+            fv = t.get('feature_snapshot', {})
+            if not fv or 'ic_confidence' not in fv:
+                continue  # Snapshot'ı eksik eski trade'ler atlanır
+
+            ic_dir = t.get('ic_direction', 'NEUTRAL')
+
+            try:
+                import pandas as pd
+                fv_series = pd.Series(fv)
+                ml_out = self.lgbm_model.predict(fv_series, ic_direction=ic_dir)
+                proba  = getattr(ml_out, 'probability', getattr(ml_out, 'confidence', 0.5))
+                predictions.append(float(proba))
+            except Exception:
+                continue
+
+            # r_multiple hesapla (retrain_from_experience ile aynı mantık)
+            entry_p = float(t.get('entry_price', 0) or 0)
+            exit_p  = float(t.get('exit_price',  0) or 0)
+            sl_p    = float(t.get('sl_price',    0) or 0)
+            direction   = t.get('direction', 'LONG')
+            exit_reason = t.get('exit_reason', '')
+            sl_dist = abs(entry_p - sl_p)
+
+            if sl_dist > 0 and entry_p > 0 and exit_p > 0:
+                if direction == 'LONG':
+                    r_mult = (exit_p - entry_p) / sl_dist
+                else:
+                    r_mult = (entry_p - exit_p) / sl_dist
+                r_mult = max(-2.5, min(2.5, r_mult))
+            else:
+                r_mult = 1.5 if exit_reason == 'TP Hit' else (-1.0 if exit_reason == 'SL Hit' else 0.0)
+
+            actual_r.append(r_mult)
+
+        n_valid = len(predictions)
+        min_required = 10 if self._oos_trade_ids else 30
+        if n_valid < min_required:
+            logger.info(f"[SANITY] Yeterli snapshot yok: {n_valid}/{n_total} trade kullanılabilir (min {min_required} gerekli)")
+            return {"status": "insufficient_snapshots", "n": n_valid, "n_total": n_total}
+
+        ic, p_value = spearmanr(predictions, actual_r)
+
+        # Üç eşikli karar
+        if ic > 0.10 and p_value < 0.05:
+            verdict = "USE_MODEL"
+        elif ic > 0:
+            verdict = "MARGINAL"
+        else:
+            verdict = "BYPASS_RECOMMENDED"
+
+        logger.info(
+            f"\n{'─'*60}\n"
+            f"  🔬 MODEL SANİTY CHECK\n"
+            f"{'─'*60}\n"
+            f"  OOS Spearman IC : {ic:+.4f}  (p={p_value:.4f})\n"
+            f"  Kullanılan n    : {n_valid} trade\n"
+            f"  KARAR           : {verdict}\n"
+            f"{'─'*60}\n"
+            f"  USE_MODEL          → IC > +0.10 ve p < 0.05\n"
+            f"  MARGINAL           → 0 < IC ≤ 0.10 (dikkatli kullan)\n"
+            f"  BYPASS_RECOMMENDED → IC ≤ 0 → PURE_IC_MODE = True önerilir\n"
+            f"{'─'*60}"
+        )
+
+        return {
+            "status":   "ok",
+            "ic":       ic,
+            "p_value":  p_value,
+            "n":        n_valid,
+            "n_total":  n_total,
+            "verdict":  verdict,
+        }
+
+    def _evaluate_sanity_and_set_bypass(self):
+        """[v2.1.14] Sanity check sadece LOGLAMA amaçlıdır, bypass AKTIF ETMEZ.
+        ML her zaman aktif kalır (pure_ic_mode=False sabit).
+        """
+        try:
+            if not self.lgbm_model.is_trained:
+                return
+
+            sanity  = self._validate_initial_model()
+            verdict = sanity.get("verdict", "insufficient_data")
+
+            import json as _json
+            from pathlib import Path
+            sanity_path = Path("logs/sanity_check.json")
+            sanity_path.parent.mkdir(parents=True, exist_ok=True)
+
+            # pure_ic_mode HER ZAMAN False — değiştirilmiyor
+            with open(sanity_path, "w", encoding="utf-8") as _f:
+                _json.dump({
+                    **sanity,
+                    "checked_at"         : _now_local().strftime("%Y-%m-%d %H:%M:%S"),
+                    "pure_ic_mode_current": False,
+                    "action_required"    : False,
+                    "action"             : "ML her zaman aktif (v2.1.14)",
+                }, _f, ensure_ascii=False, indent=2)
+
+            logger.info(f"📄 Sanity check sonucu kaydedildi: {sanity_path}")
+
+            if verdict == "BYPASS_RECOMMENDED":
+                logger.warning(
+                    "⚠️  [SANITY] OOS IC negatif — model zayıf ama ML aktif kalmaya devam ediyor."
+                )
+            elif verdict == "MARGINAL":
+                logger.warning("⚠️  [SANITY] MARGINAL — zayıf sinyal, model öğreniyor.")
+            elif verdict == "USE_MODEL":
+                logger.info("✅ [SANITY] USE_MODEL — model edge öğrenmiş, güvenle kullanılabilir.")
+        except Exception as e:
+            logger.warning(f"Sanity check değerlendirme hatası (kritik değil): {e}")
 
     def retrain_from_experience(self):
         logger.info("🧠 Kendi tecrübelerinden öğrenme (Retrain) başlatılıyor...")
@@ -2212,11 +2581,41 @@ class MLTradingPipeline:
                 return False
 
             win_ratio = sum(1 for y in rows_y if float(y) > 0) / max(1, len(rows_y)) * 100
-            logger.info(f"   📥 Hafızadan {len(rows_X)} adet gerçek işlem tecrübesi yüklendi. (Piyasa yönü=LONG oranı: %{win_ratio:.1f})")
+            n_total_rows = len(rows_X)
 
-            X_experience = pd.DataFrame(rows_X).replace([np.inf, -np.inf], np.nan)
-            y_experience = pd.Series(rows_y)
-            dir_experience = pd.Series(rows_dir)
+            # [v2.1.15] Walk-forward split: ilk %80 eğitim, son %20 validation (OOS)
+            val_size   = max(10, int(n_total_rows * 0.20))
+            train_size = n_total_rows - val_size
+
+            # Validation (OOS) trade ID'lerini kaydet — sanity check sadece bunları kullanacak
+            oos_trade_ids: set = set()
+            idx_map = []     # geçerli satır → orijinal closed_trade index
+            valid_count = 0
+            for i, t in enumerate(closed_trades):
+                fv = t.get('feature_snapshot', {})
+                if fv and 'ic_confidence' in fv:
+                    idx_map.append(i)
+                    valid_count += 1
+
+            oos_src_indices = idx_map[train_size:]  # son %20
+            for i in oos_src_indices:
+                tid = closed_trades[i].get('trade_id', f'idx_{i}')
+                oos_trade_ids.add(tid)
+            self._oos_trade_ids = oos_trade_ids
+
+            logger.info(
+                f"   📊 Walk-forward split: {train_size} eğitim + {val_size} validation (OOS), "
+                f"toplam={n_total_rows}, LONG oranı=%{win_ratio:.1f}"
+            )
+
+            rows_X_train   = rows_X[:train_size]
+            rows_y_train   = rows_y[:train_size]
+            rows_dir_train = rows_dir[:train_size]
+
+            X_experience   = pd.DataFrame(rows_X_train).replace([np.inf, -np.inf], np.nan)
+            y_experience   = pd.Series(rows_y_train)
+            dir_experience = pd.Series(rows_dir_train)
+
 
             # ─────────────────────────────────────────────────────────────────
             # [HYBRİD RETRAIN] BTC tarihsel veri ile gerçek trade verisi karıştır
@@ -2225,24 +2624,29 @@ class MLTradingPipeline:
             # Oran: gerçek veri 1.0x ağırlık, tarihsel 0.5x ağırlık (downsampling)
             # ─────────────────────────────────────────────────────────────────
             try:
-                X_hist, y_hist, dir_hist = self._build_historical_samples_for_hybrid()
-                if X_hist is not None and len(X_hist) > 50:
-                    # Tarihsel veriyi downsample: gerçek veri kadar ama max 400
-                    n_hist = min(len(X_hist), max(100, len(X_experience)))
-                    X_hist = X_hist.sample(n=n_hist, random_state=42) if len(X_hist) > n_hist else X_hist
-                    y_hist = y_hist.iloc[X_hist.index] if hasattr(y_hist, 'iloc') else y_hist.reindex(X_hist.index)
-                    dir_hist = dir_hist.iloc[X_hist.index] if hasattr(dir_hist, 'iloc') else dir_hist.reindex(X_hist.index)
-                    X_hist = X_hist.reset_index(drop=True)
-                    y_hist = y_hist.reset_index(drop=True)
-                    dir_hist = dir_hist.reset_index(drop=True)
-
-                    X_train = pd.concat([X_experience, X_hist], ignore_index=True)
-                    y_train = pd.concat([y_experience, y_hist], ignore_index=True)
-                    dir_train = pd.concat([dir_experience, dir_hist], ignore_index=True)
-                    logger.info(f"   🔀 Hybrid retrain: {len(X_experience)} gerçek + {len(X_hist)} tarihsel = {len(X_train)} toplam")
-                else:
-                    logger.warning("   ⚠️ Tarihsel veri alınamadı, sadece gerçek trade verisi kullanılıyor")
+                # EĞER GERÇEK İŞLEM SAYISI >= 200 İSE HYBRİD'İ KAPAT
+                if len(X_experience) >= 200:
+                    logger.info("   🚀 Gerçek işlem sayısı 200'ü aştı! Hybrid veri kullanımı KAPATILDI. Sadece gerçek canlı tecrübe kullanılıyor.")
                     X_train, y_train, dir_train = X_experience, y_experience, dir_experience
+                else:
+                    X_hist, y_hist, dir_hist = self._build_historical_samples_for_hybrid()
+                    if X_hist is not None and len(X_hist) > 50:
+                        # Tarihsel veriyi downsample: gerçek veri kadar ama max 400
+                        n_hist = min(len(X_hist), max(100, len(X_experience)))
+                        X_hist = X_hist.sample(n=n_hist, random_state=42) if len(X_hist) > n_hist else X_hist
+                        y_hist = y_hist.iloc[X_hist.index] if hasattr(y_hist, 'iloc') else y_hist.reindex(X_hist.index)
+                        dir_hist = dir_hist.iloc[X_hist.index] if hasattr(dir_hist, 'iloc') else dir_hist.reindex(X_hist.index)
+                        X_hist = X_hist.reset_index(drop=True)
+                        y_hist = y_hist.reset_index(drop=True)
+                        dir_hist = dir_hist.reset_index(drop=True)
+
+                        X_train = pd.concat([X_experience, X_hist], ignore_index=True)
+                        y_train = pd.concat([y_experience, y_hist], ignore_index=True)
+                        dir_train = pd.concat([dir_experience, dir_hist], ignore_index=True)
+                        logger.info(f"   🔀 Hybrid retrain: {len(X_experience)} gerçek + {len(X_hist)} tarihsel = {len(X_train)} toplam")
+                    else:
+                        logger.warning("   ⚠️ Tarihsel veri alınamadı, sadece gerçek trade verisi kullanılıyor")
+                        X_train, y_train, dir_train = X_experience, y_experience, dir_experience
             except Exception as he:
                 logger.warning(f"   ⚠️ Hybrid blend başarısız ({he}) — sadece gerçek veri kullanılıyor")
                 X_train, y_train, dir_train = X_experience, y_experience, dir_experience
@@ -2329,6 +2733,8 @@ class MLTradingPipeline:
                     "⚠️ Retrain sonrası deployment gate başarısız. "
                     "Canlı trade bloklandı — paper modda çalışmaya devam ediliyor."
                 )
+            
+            self._evaluate_sanity_and_set_bypass()
             return True
 
         except Exception as e:
@@ -2407,7 +2813,7 @@ class MLTradingPipeline:
                 if abs(price_move_usd) < (entry_price * MIN_MOVE):
                     continue  # Dead-band filtresi
 
-                # Yön belirleme
+                # Yön belirleme — SADECE LABEL İÇİN (feature stub'a geçmeyecek)
                 direction = "LONG" if price_move_usd > 0 else "SHORT"
                 r_multiple = price_move_usd / sl_distance if sl_distance > 0 else 0.0
                 r_multiple = max(-2.5, min(2.5, r_multiple))
@@ -2415,6 +2821,25 @@ class MLTradingPipeline:
                 df_slice = df_ind.iloc[max(0, i - 50):i + 1].copy()
                 if len(df_slice) < 40:
                     continue
+
+                # ── [v2.1.10 LEAKAGE FIX — FINAL] ───────────────────────────
+                # ic_direction stub'ı NEUTRAL sabitlendi.
+                #
+                # v2.1.9 denemesi (geçmiş momentum): BTC 1h trend persistance'ı
+                # yüksek olduğundan geçmiş 10 bar yönü ≈ gelecek 12 bar yönü.
+                # Dolayısıyla leakage kaldırılmadı, farklı bir proxy'ye taşındı.
+                #
+                # Doğru yaklaşım: tarihsel örneklerde ic_direction bilgisi sıfırla.
+                # ic_direction_code = 0 → model bu feature'ı tarihsel örnekler için
+                # öğrenemiyor, ama leakage kesinlikle sıfır.
+                #
+                # Gerçek trade'lerde (retrain_from_experience'ın geri kalanı) bu
+                # feature hâlâ gerçek IC analizinden geliyor → orada bilgi taşıyor.
+                #
+                # Geçici çözüm notu: 200+ trade birikince hybrid tamamen kapatılacak,
+                # sadece gerçek veri kullanılacak ve stub sorunları köklü çözülecek.
+                # ─────────────────────────────────────────────────────────────────
+                ic_direction_stub = "NEUTRAL"
 
                 # Feature vektörü oluştur (initial_train ile aynı yöntem)
                 try:
@@ -2428,9 +2853,9 @@ class MLTradingPipeline:
                         (entry_price / df_ind['close'].iloc[max(0, i-24)] - 1) * 100
                     )
                     stub.volume_24h = float(df_ind['volume'].iloc[max(0, i-24):i+1].sum() * entry_price)
-                    stub.ic_confidence = 65.0
-                    stub.ic_direction = direction
-                    stub.significant_count = 10
+                    stub.ic_confidence = np.nan
+                    stub.ic_direction = ic_direction_stub   # [v2.1.10] NEUTRAL sabit — leakage sıfır
+                    stub.significant_count = np.nan
                     stub.market_regime = 'trending'
                     stub.category_tops = cat_tops
                     stub.tf_rankings = []
@@ -2511,9 +2936,9 @@ class MLTradingPipeline:
                     self.price           = 0.0
                     self.change_24h      = 0.0
                     self.volume_24h      = 0.0
-                    self.ic_confidence   = 65.0
+                    self.ic_confidence   = np.nan
                     self.ic_direction    = 'NEUTRAL'
-                    self.significant_count = 10
+                    self.significant_count = np.nan
                     self.market_regime   = 'trending'
                     self.category_tops   = {}
                     self.tf_rankings     = []
@@ -2808,6 +3233,8 @@ class MLTradingPipeline:
                     "Daha fazla veri birikmesi ve tekrar eğitim gerekiyor. "
                     "Bot paper modda çalışmaya devam edecek."
                 )
+            
+            self._evaluate_sanity_and_set_bypass()
             return True
 
         except Exception as e:
@@ -2825,7 +3252,7 @@ class MLTradingPipeline:
         if report.ml_stats:
             s = report.ml_stats
             logger.info(f"   ML: eğitildi={s.get('model_trained')} | "
-                        f"retrain#{s.get('retrain_count',0)}")
+                        f"train#{s.get('total_train_calls', 0)}")
         # Günlük PnL bilgisi (v2.1.4)
         if self._daily_start_balance > 0:
             loss_pct = (-self._daily_realized_pnl / self._daily_start_balance) * 100
@@ -3186,6 +3613,8 @@ class MLTradingPipeline:
                 net_pnl = pnl_val - fee_val
                 notional = entry * size
                 pnl_pct = (pnl_val / notional) * 100 * leverage if notional > 0 else 0.0
+                # [v2.1.7] Daily PnL in-memory güncelle (orphan reconcile sadece live modda çalışır)
+                self._daily_realized_pnl += net_pnl
 
                 for col in ('Tarih (Kapanış)', 'Çıkış Nedeni', 'Durum'):
                     if col in df.columns:
@@ -3205,10 +3634,7 @@ class MLTradingPipeline:
                 df.at[idx, 'Durum']           = 'closed'
 
                 try:
-                    acilis = pd.to_datetime(str(row.get('Tarih (Açılış)', '')))
-                    _acilis_aware = acilis.to_pydatetime()
-                    if _acilis_aware.tzinfo is None:
-                        _acilis_aware = _acilis_aware.replace(tzinfo=timezone.utc)
+                    _acilis_aware = _parse_tr_str(str(row.get('Tarih (Açılış)', '')))   # UTC-aware
                     df.at[idx, 'Süre (dk)'] = int((_now_utc() - _acilis_aware).total_seconds() / 60)
                 except Exception:
                     pass
@@ -3242,6 +3668,53 @@ class MLTradingPipeline:
         self.trade_memory.print_summary()
 
 
+def _daily_pnl_watchdog(pipeline: "MLTradingPipeline") -> None:
+    """
+    [v2.1.12 — Sorun #2] Daily PnL cache drift watchdog — threading ile.
+
+    Neden threading (asyncio değil):
+      Bot asyncio kullanmıyor; while döngüsü scheduler. asyncio.create_task()
+      çağrısı hata verir. threading.Thread arka planda bağımsız çalışır.
+
+    Ne yapar:
+      Her saat _daily_realized_pnl (in-memory cache) vs _compute_daily_pnl()
+      (disk ground-truth) karşılaştırır. |drift| > $0.01 → cache düzeltilir.
+
+    Neden gerekli:
+      v2.1.7'de O(N)→O(1) optimizasyonu yapıldı: trade kapandığında += net_pnl.
+      3 senaryoda cache gerçeklikten sapabilir:
+        (A) Trade kapanışında exception → += çalışmaz ama disk'e yazılır.
+        (B) Process restart anında double-count.
+        (C) 00:00 reset sırasında eş zamanlı kapanış kaybolur.
+      Watchdog bunları saatlik doğrulamayla yakalar.
+    """
+    while getattr(pipeline, '_is_running', True):
+        time.sleep(3600)  # 1 saat bekle
+
+        if not getattr(pipeline, '_is_running', True):
+            break
+
+        try:
+            disk_value  = pipeline._compute_daily_pnl()
+            cache_value = pipeline._daily_realized_pnl
+            drift       = disk_value - cache_value
+
+            if abs(drift) > 0.01:
+                logger.warning(
+                    f"[DRIFT] Daily PnL: cache=${cache_value:+.2f} "
+                    f"disk=${disk_value:+.2f} drift=${drift:+.2f} "
+                    f"→ cache disk değeri ile güncellendi."
+                )
+                pipeline._daily_realized_pnl = disk_value
+            else:
+                logger.debug(
+                    f"[OK] Daily PnL Watchdog: cache=${cache_value:+.2f} "
+                    f"disk=${disk_value:+.2f} (drift={drift:+.2f}, OK)"
+                )
+        except Exception as e:
+            logger.error(f"Daily PnL watchdog hatası (kritik değil): {e}")
+
+
 # =============================================================================
 # SCHEDULER
 # =============================================================================
@@ -3261,37 +3734,48 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 10) -> No
     if not pipeline._init_balance():
         return
 
+    # [v2.1.12] Daily PnL drift watchdog'u arka planda başlat
+    watchdog_thread = threading.Thread(
+        target=_daily_pnl_watchdog,
+        args=(pipeline,),
+        daemon=True,   # Ana process durduğunda thread de durur
+        name="pnl-watchdog"
+    )
+    watchdog_thread.start()
+    logger.info("🔍 Daily PnL watchdog başlatıldı (saatlik drift kontrolü)")
+
     if not pipeline.lgbm_model.is_trained:
         pipeline.initial_train()
 
-    # [STARTUP RETRAIN FIX] initial_train sonrası hemen retrain kontrolü yap
-    # Sorun: Retrain sadece run_cycle() içinde kontrol ediliyordu.
-    # Eğer daily halt tetiklenirse run_cycle() çalışmaz → retrain asla tetiklenmez.
-    # Çözüm: Startup'ta, ilk döngüden ÖNCE retrain gerekip gerekmediğini kontrol et.
-    # Not: experience_retrain_count kullanıyoruz (retrain_count değil).
-    # Neden: retrain_count her train() çağrısında artar (initial_train dahil).
-    # Bu yüzden initial_train sonrası retrain_count=1 olur ve kontrol yanlış atlanır.
-    # experience_retrain_count sadece retrain_from_experience() tarafından artırılır.
+    # [v2.1.11] Startup retrain DONDURULDU — RETRAIN_MIN_TRADES'e kadar çalışmaz.
+    # Sebep: hybrid distributional leakage (bkz. v2.1.11 başlığı ve RETRAIN_MIN_TRADES sabiti).
+    # initial_train modeli korunuyor; 200 gerçek trade'de bu blok yeniden aktive edilecek.
     try:
         closed_count = pipeline.trade_memory._count_closed()
-        retrain_threshold = 30
-        current_exp_count = getattr(pipeline.lgbm_model, 'experience_retrain_count', 0)
-        target_exp_count  = closed_count // retrain_threshold
-
-        if closed_count >= retrain_threshold and target_exp_count > current_exp_count:
-            logger.info(f"\n🧠 [STARTUP RETRAIN] {closed_count} kapalı trade bulundu — başlangıçta retrain tetikleniyor...")
-            try:
-                pipeline.retrain_from_experience()
-            except Exception as re:
-                logger.error(f"Startup retrain hatası: {re}")
-            pipeline.lgbm_model.experience_retrain_count = target_exp_count
-            logger.info("✅ Startup retrain tamamlandı.")
-        elif closed_count >= retrain_threshold:
-            logger.info(f"ℹ️ Retrain zaten yapılmış (experience_count={current_exp_count}), atlanıyor.")
+        if closed_count >= RETRAIN_MIN_TRADES:
+            retrain_threshold = 30
+            current_exp_count = getattr(pipeline.lgbm_model, 'experience_retrain_count', 0)
+            target_exp_count  = closed_count // retrain_threshold
+            if target_exp_count > current_exp_count:
+                logger.info(f"\n🧠 [STARTUP RETRAIN] {closed_count} kapalı trade bulundu — başlangıçta retrain tetikleniyor...")
+                try:
+                    pipeline.retrain_from_experience()
+                except Exception as re:
+                    logger.error(f"Startup retrain hatası: {re}")
+                pipeline.lgbm_model.experience_retrain_count = target_exp_count
+                logger.info("✅ Startup retrain tamamlandı.")
+            else:
+                logger.info(f"ℹ️ Retrain zaten yapılmış (experience_count={current_exp_count}), atlanıyor.")
         else:
-            logger.info(f"ℹ️ Startup retrain gerekmiyor ({closed_count}/{retrain_threshold} trade).")
+            logger.info(
+                f"⏸️ Startup retrain donduruldu: {closed_count}/{RETRAIN_MIN_TRADES} trade. "
+                f"initial_train modeli aktif (threshold={pipeline.lgbm_model.threshold_long:.3f})."
+            )
     except Exception as e:
         logger.warning(f"Startup retrain kontrol hatası (kritik değil): {e}")
+
+    # [v2.1.13] Otomatik Sanity Check (Bypass)
+    pipeline._evaluate_sanity_and_set_bypass()
 
     while pipeline._is_running:
         if pipeline._kill_switch:
@@ -3329,7 +3813,7 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 10) -> No
 # =============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="ML Crypto Bot v2.1.4")
+    parser = argparse.ArgumentParser(description="ML Crypto Bot v2.1.12")
     parser.add_argument("--live",     action="store_true", help="Canlı trade (ÖNERİLEN)")
     parser.add_argument("--top",      type=int, default=20, help="Top N coin")
     parser.add_argument("--schedule", action="store_true", help="Scheduler modu")

@@ -140,7 +140,8 @@ class RiskManager:
     # Config'den daha düşük bir değer gelse bile bu floor korunur.
     # Neden 1.5: Fee + slippage sonrası gerçek edge için minimum eşik.
     # 1:1 RR → komisyon sonrası beklenen değer negatif olur.
-    MIN_RISK_REWARD_HARD_FLOOR = 1.5
+    # DÜZELTME: ML modelin dinamik karar almasını engellememek için taban 1.0'a çekildi.
+    MIN_RISK_REWARD_HARD_FLOOR = 1.0
 
     def __init__(
         self,
@@ -259,10 +260,11 @@ class RiskManager:
     ):
         import math
 
-        RISK_PERCENT = 0.02
-        MAX_TOTAL_MARGIN = 0.65
-        MAX_TRADES = 10
-        MAX_LEVERAGE = 20.0
+        # Hardcoded değerler config.py'deki self.risk_cfg üzerinden alınır
+        RISK_PERCENT = self.risk_cfg.risk_per_trade_pct / 100.0
+        MAX_TOTAL_MARGIN = self.risk_cfg.max_total_margin_pct / 100.0
+        MAX_TRADES = self.risk_cfg.max_open_positions
+        MAX_LEVERAGE = self.risk_cfg.max_leverage
 
         max_margin_per_trade = (self.balance * MAX_TOTAL_MARGIN) / MAX_TRADES
         risk_amount = self.balance * RISK_PERCENT

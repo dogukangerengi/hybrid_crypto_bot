@@ -590,25 +590,21 @@ class EnsemblePredictor:
         threshold = self.threshold_long if ic_direction == "LONG" else self.threshold_short
         
         # [EXPECTED VALUE KARAR MEKANİZMASI]
-        # Regresyon çıktısı (pred_r) sigmoid fonksiyonu ile kazanma olasılığına dönüştürülür
-        win_prob = 1.0 / (1.0 + np.exp(-2.0 * pred_r))
-        loss_prob = 1.0 - win_prob
-        
-        # EV = (Win Prob * Reward) - (Loss Prob * Risk)
-        # Model varsayılan 1.5 Risk/Reward oranına göre eğitildiği için:
-        reward_r = 1.5
-        risk_r = 1.0
-        expected_value = (win_prob * reward_r) - (loss_prob * risk_r)
+        # Model hedef değişken olarak R-multiple kullanılarak eğitildiği için,
+        # çıktı olan pred_r doğrudan Expected Value'dur (Beklenen Değer).
+        expected_value = float(pred_r)
 
         # Karar verme ölçütü artık EV'nin güvenli threshold'u geçmesi
         if expected_value >= threshold:
             decision = MLDecision.LONG if ic_direction == "LONG" else MLDecision.SHORT
-            confidence = 50.0 + (expected_value / reward_r) * 50.0
-            confidence = min(100.0, float(confidence))
+            # Güven skorunu EV'ye göre lineer olarak 50-100 arasına ölçekle (Örn: 2R bekliyorsa %100 güven)
+            confidence = 50.0 + (expected_value * 25.0)
+            confidence = min(100.0, max(50.0, float(confidence)))
         else:
             decision = MLDecision.WAIT
-            confidence = 50.0 - (abs(expected_value) / risk_r) * 50.0
-            confidence = max(0.0, float(confidence))
+            # Beklenen değer eşiği geçemediyse, EV'nin zayıflığına veya negatifliğine göre 0-50 arası ölçekle
+            confidence = 50.0 - (abs(expected_value) * 25.0)
+            confidence = max(0.0, min(50.0, float(confidence)))
 
         return MLDecisionResult(
             decision=decision,
