@@ -88,9 +88,8 @@ DEFAULT_THRESHOLD_SHORT = 0.40
 #   - SHORT sample >100 ve mean_R > 0 (p<0.05): FLOOR_SHORT → 0.30'a düşür
 #   - LONG sample >200 ve SE < 0.1: FLOOR_LONG → 0.05'e düşür
 # Aksi halde mevcut değerleri koru.
-HARD_THRESHOLD_FLOOR_LONG  = 0.08   # 0.10 → 0.08: LONG edge zayıf, biraz gevşetildi
-HARD_THRESHOLD_FLOOR_SHORT = 0.25   # 0.40 → 0.25: Model 0.28-0.37 tahmin ediyor, 0.40 floor
-                                    # tüm SHORT sinyallerini WAIT'e düşürüyordu.
+HARD_THRESHOLD_FLOOR_LONG  = 0.08   # [v2.1.16] REVERTED
+HARD_THRESHOLD_FLOOR_SHORT = 0.25   # [v2.1.16] REVERTED
                                     # OOS SHORT R=+0.3947 güçlü edge var → 0.25 ile geçiyor.
 
 THRESHOLD_GRID_PERCENTILES = [50, 60, 70, 80, 90]

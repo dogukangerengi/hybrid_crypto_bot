@@ -652,6 +652,18 @@ class CoinScanner:
             )
         
         logger.info("=" * 75)
+
+    def get_live_price(self, symbol: str) -> float:
+        """
+        Bir sembolün anlık canlı fiyatını halka açık (public) API üzerinden çeker.
+        DRY RUN modunda executor (authenticated) yerine bu kullanılır.
+        """
+        try:
+            ticker = self.fetcher.get_ticker(symbol)
+            return float(ticker.get('last', 0))
+        except Exception as e:
+            logger.warning(f"⚠️ {symbol} canlı fiyat çekilemedi (Scanner): {e}")
+            return 0.0
     
     # =========================================================================
     # YARDIMCI FONKSİYONLAR (HELPER METHODS)

@@ -206,8 +206,8 @@ DEFAULT_TIMEFRAMES = {
 #   Bu nedenle threshold'ları 10/12 → 7/9'a indiriyoruz.
 #   Filtre GERÇEKTE sıkılaşıyor: cross-avg 7 = "tüm TF'lerin ortalaması ≥ 7"
 #   Bu, tek bir TF'nin 12 göstermesinden çok daha güçlü bir sinyal kalitesidir.
-IC_NO_TRADE = 7.0    # 10.0 → 7.0 (cross-TF avg daha düşük; filtre etkin olarak sıkılaştı)
-IC_TRADE    = 9.0    # 12.0 → 9.0 (aynı gerekçe; tek TF'lik şansa artık izin yok)
+IC_NO_TRADE = 7.0
+IC_TRADE    = 9.0
 
 # [v2.1.12] Pure IC Bypass Mode
 # Sebep: ML modeli sentetik veri üzerinden eğitildi (initial_train stub bias —
@@ -1145,7 +1145,7 @@ class MLTradingPipeline:
                 'trending_up':  1.10,
                 'trending_down': 1.10,
                 'ranging':      0.85,
-                'volatile':     0.50,  # [GÜNCELLENDİ] 0.70 → 0.50
+                'volatile':     0.50,  # [v2.1.16] 0.50 → 0.70 revert: Kullanıcı talebiyle eski katı ayara dönüldü
                 'transitioning': 0.90,
                 'unknown':      0.85,
             }
@@ -1240,6 +1240,9 @@ class MLTradingPipeline:
             result.ml_result = ml_result
 
             if ml_result.decision.value == "WAIT":
+                ev_str = f"{ml_result.predicted_r:+.3f}" if ml_result.predicted_r is not None else "N/A"
+                th_str = f"{ml_result.threshold_used:.3f}" if ml_result.threshold_used is not None else "N/A"
+                logger.info(f"   🟡 {result.coin}: ML 'WAIT' dönüyor (EV={ev_str} < threshold={th_str})")
                 result.status = "wait"; return result
 
             val_result = self.validator.validate(
@@ -1251,6 +1254,8 @@ class MLTradingPipeline:
             is_ok = getattr(val_result, 'is_valid', False) or getattr(val_result, 'is_approved', False)
 
             if not is_ok:
+                reasons = getattr(val_result, 'veto_reasons', [])
+                logger.info(f"   ❌ {result.coin}: Validator REDDEDİLDİ. Sebepler: {'; '.join(reasons)}")
                 result.status = "rejected_by_validator"
                 return result
 
