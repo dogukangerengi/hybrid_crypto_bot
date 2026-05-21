@@ -256,7 +256,8 @@ class RiskManager:
         sl_distance: float,
         min_amount: float = 0.001,
         amount_precision: int = 3,
-        contract_size: float = 1.0
+        contract_size: float = 1.0,
+        market_regime: str = "trending",          # [MADDE 2] Rejim bilgisi
     ):
         import math
 
@@ -268,6 +269,28 @@ class RiskManager:
 
         max_margin_per_trade = (self.balance * MAX_TOTAL_MARGIN) / MAX_TRADES
         risk_amount = self.balance * RISK_PERCENT
+
+        # [MADDE 2] — Rejim bazlı pozisyon küçültme (Shadow Mode)
+        # Ranging rejimde trade açılır (veri toplama için), ama boyut %25'e düşürülür.
+        # Volatile rejimde %60 boyut (WR %33 — yukarı risk alınır ama dikkatli).
+        # Trending rejimde tam boyut.
+        REGIME_SIZE_MULTIPLIERS = {
+            'trending':      1.00,   # Normal boyut
+            'trending_up':   1.00,
+            'trending_down': 1.00,
+            'volatile':      0.60,   # %60 boyut
+            'ranging':       0.25,   # %25 boyut — Shadow Mode
+            'transitioning': 0.80,
+            'unknown':       0.50,   # Bilinmeyen → temkinli
+        }
+        size_multiplier = REGIME_SIZE_MULTIPLIERS.get(market_regime, 0.50)
+        risk_amount *= size_multiplier
+
+        if size_multiplier < 1.0:
+            logger.info(
+                f"   💰 Shadow Mode: rejim={market_regime} ×{size_multiplier} "
+                f"| ayarlı risk=${risk_amount:.2f}"
+            )
 
         if sl_distance <= 0:
             sl_distance = entry_price * 0.01
@@ -385,7 +408,8 @@ class RiskManager:
         risk_reward: float = None,
         min_amount: float = 0.001,
         amount_precision: int = 3,
-        contract_size: float = 1.0
+        contract_size: float = 1.0,
+        market_regime: str = "trending",          # [MADDE 2] Rejim
     ) -> TradeCalculation:
         direction = direction.upper()
         checks = {}
@@ -393,11 +417,15 @@ class RiskManager:
         warnings = []
 
         logger.info(f"📊 {symbol} {direction} trade hesaplanıyor...")
-        logger.info(f"   Entry: ${entry_price:,.2f} | ATR: ${atr:,.4f} | Bakiye: ${self.balance:,.2f}")
+        logger.info(f"   Entry: ${entry_price:,.2f} | ATR: ${atr:,.4f} | Bakıye: ${self.balance:,.2f}")
 
         sl = self.calculate_stop_loss(entry_price, direction, atr, atr_multiplier)
         tp = self.calculate_take_profit(entry_price, direction, sl.distance, risk_reward)
-        pos = self.calculate_position_size(entry_price, sl.distance, min_amount, amount_precision, contract_size)
+        # [MADDE 2] market_regime parametresi iletildi
+        pos = self.calculate_position_size(
+            entry_price, sl.distance, min_amount, amount_precision, contract_size,
+            market_regime=market_regime,
+        )
 
         passed, msg = self.check_position_limit()
         checks['position_limit'] = passed

@@ -113,12 +113,23 @@ class MLDecisionResult:
         Koşullar (tümü sağlanmalı):
         1. Gate keeper FULL_TRADE demiş (IC >= eşik)
         2. ML kararı LONG veya SHORT (WAIT değil)
-        3. Model güveni >= 60 (düşük güvenli sinyalleri filtrele)
+        3. Model güveni >= 51 (kazanma olasılığı en az %51)
+
+        [DÜZELTME] Eski eşik: confidence >= 53
+        Sorun: Sığlaştırılmış model (max_depth=3) tahminlerini 0.50-0.55 bandında
+        üretiyor. predict() içinde confidence = prob × 100, dolayısıyla LONG threshold
+        0.50 iken yalnızca prob >= 0.53 sinyalleri execute edebiliyordu.
+        Bu, anlamlı sinyallerin %40-60'ını sessizce engelliyordu.
+        
+        Yeni eşik: 51 = %51 kazanma olasılığı.
+        Mantık: Coin-flip sınırı %50. Biz %51+ isteyen bir filtre uyguluyoruz,
+        bu hem istatistiksel anlamlı (rastgele üstü) hem de ulaşılabilir.
+        Risk yönetimi zaten deployment gate + signal validator + RR şartıyla korunuyor.
         """
         return (
             self.gate_action == "FULL_TRADE"           # IC eşiğini geçmiş
             and self.decision in [MLDecision.LONG, MLDecision.SHORT]  # Net yön var
-            and self.confidence >= 53                   # Model yeterince emin
+            and self.confidence >= 51                   # Model %51+ kazanma ihtimali görüyor
         )
 
     def summary(self) -> str:
@@ -412,8 +423,14 @@ class FeatureEngineer:
                     abs(category_tops[cat]['ic'])
                 )
             else:
-                features[f'ic_cat_{cat}'] = np.nan           # Veri yok → NaN (LightGBM handle eder)
-                features[f'ic_cat_{cat}_abs'] = np.nan       # Veri yok → NaN
+                # Kategori verisi yok (o coin/TF için bu kategori hesaplanamadı)
+                # Eski davranış: np.nan → snapshot'ta bu key eksik kalıyor (42 key)
+                # Yeni davranış: 0.0 → snapshot her zaman 44 key içerir
+                # Mantık: IC = 0 "sinyal yok" anlamına gelir, NaN ile eşdeğer bilgi taşır.
+                # LightGBM NaN'ı da handle eder ama 0.0 ile snapshot boyutu sabit kalır
+                # → get_training_data() bu kayıtları MIN_SNAPSHOT_KEYS filtresinden geçirir.
+                features[f'ic_cat_{cat}'] = 0.0              # Veri yok → 0.0 (sinyal yok)
+                features[f'ic_cat_{cat}_abs'] = 0.0          # Veri yok → 0.0
 
         return features
 

@@ -57,6 +57,11 @@ MAX_MEMORY_SIZE = 2000                         # RAM'de max trade sayısı (eski
 # Bu eşiğin altındaki trade'ler get_training_data()'dan çıkarılır.
 MIN_ABS_R_FOR_TRAINING = 0.12  # |R| < 0.12 → eğitimden çıkar (gürültü)
 
+MIN_SNAPSHOT_KEYS = 40         # Geçerli feature snapshot için minimum key sayısı
+                               # Bu değerin altındaki snapshot'lar bozuk kabul edilir
+                               # (IC analizi başarısız olmuş → sadece 5 risk key kaydedilmiş)
+                               # get_training_data() bu kayıtları eğitimden çıkarır
+
 
 # =============================================================================
 # ENUM: TRADE DURUMU
@@ -131,6 +136,10 @@ class TradeRecord:
     # ── Sonuç ──
     pnl:              float = 0.0             # Gerçekleşen PnL ($), 0 = açık
     pnl_pct:          float = 0.0            # PnL yüzde
+    r_multiple:       Optional[float] = None # Gerçek R-multiple: (çıkış-giriş)/SL_mesafesi
+                                             # +1.5 = TP tam vuruldu, -1.0 = SL tam vuruldu
+                                             # close_trade() anında compute_actual_r_multiple() ile doldurulur
+                                             # None = henüz kapanmamış (OPEN trade)
     outcome:          str   = TradeOutcome.UNKNOWN  # WIN / LOSS / UNKNOWN
     exit_reason:      str   = ""             # 'SL', 'TP', 'MANUAL', 'TIMEOUT'
 
@@ -342,6 +351,14 @@ class TradeMemory:
             if record.direction == "SHORT":
                 record.pnl_pct = -record.pnl_pct  # SHORT'ta yön tersine döner
 
+        # R-multiple hesapla ve kaydet
+        # Eski davranış: r_multiple sadece get_training_data() içinde hesaplanıyordu,
+        # JSON'a yazılmıyordu → tüm kayıtlarda None kalıyordu.
+        # Yeni davranış: trade kapanınca hesaplanıp diske yazılır → geçmişe dönük analiz mümkün.
+        record.r_multiple = TradeMemory.compute_actual_r_multiple(record)
+        # Not: TIMEOUT durumunda SL'e/TP'ye değmediği için r_multiple düşük çıkabilir.
+        # Bu kayıtlar get_training_data()'da MIN_ABS_R_FOR_TRAINING filtresiyle zaten elenir.
+
         # Süre hesapla (dakika)
         try:
             opened = datetime.fromisoformat(record.opened_at)
@@ -461,6 +478,10 @@ class TradeMemory:
             r for r in self._records.values()
             if r.status == TradeStatus.CLOSED
             and r.feature_snapshot                 # Feature snapshot boş değilse
+            and len(r.feature_snapshot) >= MIN_SNAPSHOT_KEYS  # Yeterli key sayısı (>= 40)
+            # Bozuk snapshot guard: IC analizi başarısız olunca sadece 5 risk key kaydediliyor.
+            # Bu kayıtlar model için anlamsız — IC/CTF/price-action feature'ları eksik.
+            # MIN_SNAPSHOT_KEYS = 40 eşiği: tam snapshot 44 key, eksik snapshot 5 key.
             and r.outcome in (TradeOutcome.WIN, TradeOutcome.LOSS)
         ]
 

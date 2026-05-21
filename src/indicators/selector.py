@@ -202,7 +202,8 @@ class IndicatorSelector:
     def calculate_ic(
         self,
         indicator: pd.Series,
-        forward_return: pd.Series
+        forward_return: pd.Series,
+        min_obs: int = None
     ) -> Tuple[float, float]:
         """
         Tek bir indikatör için IC (Information Coefficient) hesaplar.
@@ -222,6 +223,9 @@ class IndicatorSelector:
         forward_return : pd.Series
             İleri getiriler (t+n zamanında)
             
+        min_obs : int, optional
+            Minimum gözlem sayısı. Eğer None ise self.MIN_OBSERVATIONS kullanılır.
+            
         Returns:
         -------
         Tuple[float, float]
@@ -236,7 +240,8 @@ class IndicatorSelector:
         ret_clean = forward_return[valid_mask]
         
         # Minimum gözlem kontrolü
-        if len(ind_clean) < self.MIN_OBSERVATIONS:
+        min_required = min_obs if min_obs is not None else self.MIN_OBSERVATIONS
+        if len(ind_clean) < min_required:
             return np.nan, 1.0  # Yetersiz veri → IC belirsiz, p = 1 (anlamlı değil)
         
         # Sabit seri kontrolü (std = 0 → korelasyon hesaplanamaz)
@@ -296,14 +301,30 @@ class IndicatorSelector:
         
         # NaN olmayan gözlem sayısı
         valid_mask = ~(indicator.isna() | forward_return.isna())
-        n_obs = valid_mask.sum()
+        
+        # [MADDE 4] IC Purging (Veri Sızıntısı & Örtüşen Getiri Engelleme)
+        # Eğer fwd_ret_5 gibi >1 barlık bir getiri kullanılıyorsa, ardışık barlardaki
+        # getiriler birbirinin içine geçer (overlap). Bu durum bağımsız gözlem varsayımını
+        # bozar ve IC'nin istatistiksel anlamlılığını (t-stat) yapay olarak şişirir.
+        # Çözüm: Veriyi hedef periyot kadar seyrelterek (stride) tam bağımsız örneklemler al.
+        period_str = target_col.split('_')[-1]
+        period = int(period_str) if period_str.isdigit() else 1
+        step = max(1, period)
+        
+        # Sadece geçerli maske üzerinden değil, orijinal indeksten belirli adımlarla al
+        # (Daha güvenli yöntem: valid mask uygulandıktan sonra stride yapmak)
+        ind_clean = indicator[valid_mask][::step]
+        ret_clean = forward_return[valid_mask][::step]
+        n_obs = len(ind_clean)
         
         # Minimum gözlem kontrolü
-        if n_obs < self.MIN_OBSERVATIONS:
+        # Purging (step) nedeniyle örneklem boyutu düşer, min_obs eşiğini orantılı esnet
+        min_required = max(30, self.MIN_OBSERVATIONS // step)
+        if n_obs < min_required:
             return self._empty_score(indicator_col, category, n_obs)
-        
+            
         # IC hesapla
-        ic_mean, p_value = self.calculate_ic(indicator, forward_return)
+        ic_mean, p_value = self.calculate_ic(ind_clean, ret_clean, min_obs=min_required)
         
         if np.isnan(ic_mean):
             return self._empty_score(indicator_col, category, n_obs)

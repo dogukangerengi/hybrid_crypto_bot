@@ -1,8 +1,16 @@
 # =============================================================================
-# ENSEMBLE MODEL v3.3 — CLASSIFICATION (PROBABILITY) BASED DIRECTION-AWARE
+# ENSEMBLE MODEL v3.4 — CLASSIFICATION (PROBABILITY) BASED DIRECTION-AWARE
 # =============================================================================
-# Replaces Regression (R-multiple prediction) with Classification (Win Probability).
-# Asymmetric thresholds are now based on % probabilities (e.g., 0.52 = 52%).
+# v3.4 Değişiklikler:
+#   ✅ [Threshold Koruma] n_folds==0 ise mevcut threshold korunur.
+#      n_folds>0 ise kalibre edilmiş threshold güncellenir.
+#      Sorun: initial_train LONG=0.517, SHORT=0.520 kalibre ediyordu.
+#      Startup retrain n_folds=0 ile üzerine yazıp DEFAULT (0.55) dönüyordu.
+#      Tüm EV değerleri 0.32-0.51 arasında kaldığından sıfır trade açılıyordu.
+#   ✅ [is_trained=True Her Zaman] Model fitlenmişse is_trained=True.
+#      n_folds=0 sadece CV validasyonunun başarısız olduğunu gösterir.
+#      Deployment gate canlı modda kalite kontrolünü üstlenir.
+#   ✅ [retrain_count++] Her eğitimde sayaç artar (train#1, train#2...).
 # =============================================================================
 
 import os
@@ -28,21 +36,34 @@ logger = logging.getLogger(__name__)
 # CONSTANTS
 # =============================================================================
 
-MIN_TRAIN_SAMPLES = 120
+MIN_TRAIN_SAMPLES = 44   # [v2.1.19] 60 → 44: CV_MIN_TRAIN ile hizalandı
+                         # Eski 60: tutarsızdı, CV_MIN_TRAIN=50'den büyüktü.
 CV_N_SPLITS = 5
 CV_EMBARGO_GAP = 5
-CV_MIN_TRAIN = 100
+CV_MIN_TRAIN = 44        # [v2.1.19] 50 → 44: fold formülü 44+5+15=64 < 67 trade
+                         # Eski 50: 50+5+15=70 > 67 → fold üretilmiyordu → kısır döngü
+                         # (bot trade açamıyor → veri birikmiyor → fold hâlâ yok)
+                         # 44 ile n=67'de 2 fold çıkar: (67-44)//15=1 → effective=max(2,1)=2
 NESTED_CV_HOLDOUT = 0.20
 
-# Varsayılan kazanma olasılığı eşikleri (%52 ve %55)
+# Varsayilan kazanma olasiligi esikleri (%52 ve %55)
 DEFAULT_THRESHOLD_LONG = 0.52
 DEFAULT_THRESHOLD_SHORT = 0.55
 
 # === HARD THRESHOLD FLOORS (PROBABILITY) ===
-HARD_THRESHOLD_FLOOR_LONG  = 0.50   # Model %50'den emin değilse asla LONG girme
-HARD_THRESHOLD_FLOOR_SHORT = 0.52   # Model %52'den emin değilse asla SHORT girme
+HARD_THRESHOLD_FLOOR_LONG  = 0.50   # Model %50'den emin degilse asla LONG girme
+HARD_THRESHOLD_FLOOR_SHORT = 0.52   # Model %52'den emin degilse asla SHORT girme
 
-THRESHOLD_GRID_PERCENTILES = [50, 60, 70, 80, 90]
+# [MADDE 7] Weekend threshold multiplier
+# Cumartesi-Pazar gunleri likidite duser, spread artar, false signal orani yukselir.
+# Threshold'u %8 sikilastirarak sadece guclu sinyaller gecsin.
+WEEKEND_THRESHOLD_MULTIPLIER = 1.08  # 1.08x = %8 daha siki
+
+# [DÜZELTME] 90. persentil kaldırıldı (model zayıfken çok seçici eşik buluyordu),
+# 40. persentil eklendi (daha permissive bir taban oluşturarak sinyallerin geçmesine izin verir).
+# Eski: [50, 60, 70, 80, 90] → Sorun: zayıf modelde 80-90. persentil eşiği prob=0.60+ gibi
+# ulaşılamaz değerlere çıkıyordu. Yeni yapıda taban 40. persentile indi.
+THRESHOLD_GRID_PERCENTILES = [40, 50, 60, 70, 80]
 
 DROPPED_FEATURES_HARD = {
     "risk_sl_distance_pct", "risk_rr_ratio", "ic_direction_code",
@@ -453,14 +474,35 @@ class EnsemblePredictor:
         # Y (Hedef) değişkeni _evaluate_walk_forward'a hala R-Multiple olarak gider
         metrics = self._evaluate_walk_forward(X, y, directions_arr)
 
-        floored_long, floored_short = _enforce_threshold_floors(
-            metrics.threshold_long, metrics.threshold_short
-        )
-        self.threshold_long = floored_long
-        self.threshold_short = floored_short
-
-        metrics.threshold_long = floored_long
-        metrics.threshold_short = floored_short
+        # [v3.4 — Threshold Koruma + is_trained Düzeltmesi]
+        #
+        # SORUN: n_folds==0 olduğunda _evaluate_walk_forward 0.0 döndürüyor.
+        # _enforce_threshold_floors bunu HARD_FLOOR değerlerine çekiyor:
+        #   LONG=0.50, SHORT=0.52 gibi başlıyor ama persentil kalibrasyonu
+        #   yoksa DEFAULT (0.52/0.55) veya floor'a düşüyor.
+        # Bu, initial_train'in iyi kalibre ettiği threshold'u (örn. LONG=0.517,
+        # SHORT=0.520) startup retrain'in n_folds=0 ile üzerine yazıp
+        # DEFAULT'a (0.55) döndürmesine yol açıyordu → sıfır trade.
+        #
+        # DÜZELTME: n_folds>0 ise kalibre edilmiş threshold güncellenir.
+        #           n_folds==0 ise mevcut threshold KORUNUR — eski kalibrasyon
+        #           daha güvenilir.
+        if metrics.n_folds > 0:
+            floored_long, floored_short = _enforce_threshold_floors(
+                metrics.threshold_long, metrics.threshold_short
+            )
+            self.threshold_long  = floored_long
+            self.threshold_short = floored_short
+            metrics.threshold_long  = floored_long
+            metrics.threshold_short = floored_short
+        else:
+            # Mevcut threshold'u koru, metriklere de yansıt
+            logger.warning(
+                f"⚠️ n_folds=0 — threshold korunuyor: "
+                f"LONG={self.threshold_long:.3f}, SHORT={self.threshold_short:.3f}"
+            )
+            metrics.threshold_long  = self.threshold_long
+            metrics.threshold_short = self.threshold_short
 
         # Sınıflandırma için y'yi 1-0 yapıyoruz
         y_bin = (y > 0).astype(int)
@@ -481,15 +523,18 @@ class EnsemblePredictor:
         self.calibrator = EnsembleCalibratorMock(self.lgbm_model, self.rf_model, self.feature_names)
         self.model = self.calibrator
 
-        if metrics.n_folds == 0 or metrics.spearman_ic == 0.0:
+        # [v3.4] is_trained her zaman True — model fitlendi, tahmin yapabilir.
+        # Eski mantık: n_folds==0 → is_trained=False → predict() hep WAIT → sonsuz döngü.
+        # n_folds==0 sadece CV validasyonunun başarısız olduğunu gösterir.
+        # Deployment gate (IC >= 0.05) canlı modda kalite kontrolünü üstlenir.
+        # retrain_count her zaman artar → log'da train#1, train#2 görünür.
+        if metrics.n_folds == 0:
             logger.warning(
-                "⚠️ Model train edildi ama CV metrikleri güvenilmez. "
-                "is_trained=False — cold start fallback aktif kalacak."
+                "⚠️ Walk-forward fold üretilemedi — model eğitildi ama CV metrikleri yok. "
+                "is_trained=True ile devam (deployment gate kalite güvencesi sağlar)."
             )
-            self.is_trained = False
-        else:
-            self.is_trained = True
-            self.retrain_count += 1
+        self.is_trained   = True   # model fitlendi → tahmin yapabilir
+        self.retrain_count += 1    # her eğitimde sayaç artar
 
         self.last_metrics = metrics
         self._log_training_report(metrics)
@@ -510,41 +555,119 @@ class EnsemblePredictor:
         logger.info("=" * 60)
 
     def predict(self, feature_vector, ic_direction: Optional[str] = None) -> MLDecisionResult:
+        """
+        [MADDE 1] Counterfactual dual-predict.
+
+        Onceki davranis: ic_direction LONG/SHORT degilse WAIT don.
+        ML modeli IC'nin soyledigini echo ediyordu.
+
+        Yeni davranis: LONG ve SHORT olasiliklari AYRI AYRI hesaplanir.
+        IC yonu sadece bir feature olarak modele girer (ic_direction_code).
+        En yuksek olasiliga sahip yon secilir.
+
+        [MADDE 7] Weekend Threshold:
+        Cumartesi-Pazar gunlerinde threshold WEEKEND_THRESHOLD_MULTIPLIER ile carpilir.
+        """
         if not self.is_trained:
             return MLDecisionResult(MLDecision.WAIT, 0.0)
-        if ic_direction not in ("LONG", "SHORT"):
-            return MLDecisionResult(MLDecision.WAIT, 0.0)
-        
-        X = self._coerce_to_frame(feature_vector, ic_direction=ic_direction)
-        for col in self.feature_names:
-            if col not in X.columns:
-                X[col] = np.nan
-        X = X[self.feature_names]
-        
-        # Regressor yerine predict_proba kullanıp kazanma (1) olasılığını alıyoruz
-        pred_lgbm = float(self.lgbm_model.predict_proba(X)[0, 1])
-        pred_rf = float(self.rf_model.predict_proba(X.fillna(-999))[0, 1])
-        
-        pred_prob = (pred_lgbm + pred_rf) / 2.0
-        uncertainty = abs(pred_lgbm - pred_rf)
-        threshold = self.threshold_long if ic_direction == "LONG" else self.threshold_short
-        
-        # Expected value artık doğrudan % olasılık (Örn: 0.58 = %58 kazanma şansı)
-        expected_value = float(pred_prob)
 
-        if expected_value >= threshold:
-            decision = MLDecision.LONG if ic_direction == "LONG" else MLDecision.SHORT
-            confidence = expected_value * 100.0  
-            confidence = min(100.0, max(50.0, float(confidence)))
+        # [MADDE 1] Her iki yon icin olasilik hesapla (counterfactual)
+        # IC yon bilgisi feature olarak gonderilir ama karar mekanizmasi
+        # artik IC'ye mutlak bagimli degil.
+
+        # Yon 1: LONG olasiligi
+        X_long = self._coerce_to_frame(feature_vector, ic_direction="LONG")
+        for col in self.feature_names:
+            if col not in X_long.columns:
+                X_long[col] = np.nan
+        X_long = X_long[self.feature_names]
+
+        prob_long_lgbm = float(self.lgbm_model.predict_proba(X_long)[0, 1])
+        prob_long_rf = float(self.rf_model.predict_proba(X_long.fillna(-999))[0, 1])
+        prob_long = (prob_long_lgbm + prob_long_rf) / 2.0
+
+        # Yon 2: SHORT olasiligi
+        X_short = self._coerce_to_frame(feature_vector, ic_direction="SHORT")
+        for col in self.feature_names:
+            if col not in X_short.columns:
+                X_short[col] = np.nan
+        X_short = X_short[self.feature_names]
+
+        prob_short_lgbm = float(self.lgbm_model.predict_proba(X_short)[0, 1])
+        prob_short_rf = float(self.rf_model.predict_proba(X_short.fillna(-999))[0, 1])
+        prob_short = (prob_short_lgbm + prob_short_rf) / 2.0
+
+        # [MADDE 7] Weekend threshold
+        from datetime import datetime, timezone
+        now = datetime.now(timezone.utc)
+        is_weekend = now.weekday() >= 5  # 5=Saturday, 6=Sunday
+        wknd_mult = WEEKEND_THRESHOLD_MULTIPLIER if is_weekend else 1.0
+
+        # [MADDE 8.C] Adaptive Thresholds (Regime Awareness)
+        # Piyasanin genel yonune gore LONG/SHORT esiklerini asimetrik ayarla
+        regime_mult_long = 1.0
+        regime_mult_short = 1.0
+        
+        change_24h = 0.0
+        if 'mkt_change_24h' in X_long.columns and not pd.isna(X_long['mkt_change_24h'].iloc[0]):
+            change_24h = float(X_long['mkt_change_24h'].iloc[0])
+            if change_24h > 3.0:    # Boga piyasasi (guclu yukselis)
+                regime_mult_long = 0.96   # LONG'u gevset (%4 daha kolay)
+                regime_mult_short = 1.05  # SHORT'u sikilastir (%5 daha zor)
+            elif change_24h < -3.0: # Ayi piyasasi (guclu dusus)
+                regime_mult_long = 1.05   # LONG'u sikilastir
+                regime_mult_short = 0.96  # SHORT'u gevset
+
+        thr_long  = min(0.70, max(HARD_THRESHOLD_FLOOR_LONG, self.threshold_long * wknd_mult * regime_mult_long))
+        thr_short = min(0.70, max(HARD_THRESHOLD_FLOOR_SHORT, self.threshold_short * wknd_mult * regime_mult_short))
+
+        if is_weekend or regime_mult_long != 1.0:
+            logger.debug(
+                f"  Thresholds ayarlandi: LONG {self.threshold_long:.3f}->{thr_long:.3f}, "
+                f"SHORT {self.threshold_short:.3f}->{thr_short:.3f} "
+                f"(Weekend: {is_weekend}, 24h: {change_24h:+.1f}%)"
+            )
+
+        # Karar: En yuksek olasilik esigi gecen yon secilir
+        long_passes  = prob_long >= thr_long
+        short_passes = prob_short >= thr_short
+
+        if long_passes and short_passes:
+            # Ikisi de geciyor — yuksek olasiliği sec
+            if prob_long >= prob_short:
+                decision = MLDecision.LONG
+                pred_prob = prob_long
+                threshold = thr_long
+            else:
+                decision = MLDecision.SHORT
+                pred_prob = prob_short
+                threshold = thr_short
+        elif long_passes:
+            decision = MLDecision.LONG
+            pred_prob = prob_long
+            threshold = thr_long
+        elif short_passes:
+            decision = MLDecision.SHORT
+            pred_prob = prob_short
+            threshold = thr_short
         else:
             decision = MLDecision.WAIT
-            confidence = expected_value * 100.0
+            pred_prob = max(prob_long, prob_short)
+            threshold = thr_long if prob_long >= prob_short else thr_short
+
+        uncertainty = abs(prob_long - prob_short)
+
+        if decision != MLDecision.WAIT:
+            confidence = pred_prob * 100.0
+            confidence = min(100.0, max(50.0, float(confidence)))
+        else:
+            confidence = pred_prob * 100.0
             confidence = max(0.0, min(50.0, float(confidence)))
 
         return MLDecisionResult(
             decision=decision,
             confidence=float(confidence),
-            predicted_r=float(pred_prob), # Geriye dönük uyumluluk için değişken ismini koruduk
+            predicted_r=float(pred_prob),
             threshold_used=float(threshold),
             fold_uncertainty=float(uncertainty),
             feature_vector=feature_vector

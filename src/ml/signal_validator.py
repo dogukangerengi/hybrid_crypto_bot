@@ -102,6 +102,12 @@ IC_MODEL_DISAGREE_PENALTY = 1.00   # Eski: 0.85  → nötr (yeterli veri bekleni
 # öğrenecek veri biriktirir. Eşiğe ulaşınca veto otomatik devreye girer.
 COLD_START_MIN_TRADES = 20                     # Bu kadar kapalı trade birikene kadar veto devre dışı
 
+# [MADDE 3] Exhaustion (crowded trade) parametreleri
+# Tüm TF'ler uyumlu (agreement=1.0) VE her iki eşik de aşılırsa → exhaustion
+# AND mantığı: sadece biri aşıldığında normal vol/momentum hareketleri engellenmez
+EXHAUSTION_MKT_24H_THRESHOLD  = 7.0           # |mkt_change_24h| > 7% (AND)
+EXHAUSTION_MOMENTUM_5_THRESHOLD = 3.0         # |px_momentum_5| > 3%  (AND)
+
 
 # =============================================================================
 # DOĞRULAMA SONUÇ DATACLASS
@@ -141,6 +147,9 @@ class ValidationResult:
     anomaly_ratio: float = 0.0                 
     anomaly_features: List[str] = field(default_factory=list)  
     anomaly_passed: bool = True                
+
+    # [MADDE 3] Exhaustion Guard
+    exhaustion_passed: bool = True             # TF uyumu + aşırı hareket = crowded trade riski
 
     # Veto sebepleri
     veto_reasons: List[str] = field(default_factory=list)
@@ -245,7 +254,10 @@ class SignalValidator:
         # ── 4. Feature Anomaly ──
         self._check_anomaly(feature_vector, result)
 
-        # ── 5. Final Güven Hesaplama ──
+        # ── 5. [MADDE 3] Exhaustion Guard ──
+        self._check_exhaustion(feature_vector, result)
+
+        # ── 6. Final Güven Hesaplama ──
         self._compute_final_confidence(model_confidence, result)
 
         if self.verbose:
@@ -467,6 +479,56 @@ class SignalValidator:
             result.is_valid = False
         else:
             result.is_valid = True
+
+    def _check_exhaustion(
+        self,
+        feature_vector: MLFeatureVector,
+        result: ValidationResult
+    ) -> None:
+        """
+        [MADDE 3] Exhaustion (crowded trade) kontrolü.
+
+        Tüm TF'ler aynı yöne işaret ediyorsa (ctf_direction_agreement=1.0)
+        VE 24h değişim BÜYÜK VE kısa momentum da aşırıysa:
+        hareket muhtemelen tamamlanmış ve mean reversion yakın.
+
+        AND mantığı kullanılıyor: her iki eşik de aşılmalı.
+        Sadece biri aşıldığında normal piyasa hareketleri bloklanmaz.
+
+        Veri kanıtı (130 closed trade):
+            ctf_dir_agreement=1.0  → 92 trade, WR %41, PnL −$102 (en kötü)
+            ctf_dir_agreement=0.75 → 15 trade, WR %47, PnL +$38 (en iyi)
+        """
+        try:
+            features = feature_vector.to_dict() if hasattr(feature_vector, 'to_dict') else {}
+
+            agreement  = features.get('ctf_direction_agreement', 0.0)
+            mkt_change = abs(features.get('mkt_change_24h', 0.0))
+            momentum_5 = abs(features.get('px_momentum_5', 0.0))
+
+            # Sadece TÜM TF'ler uyumluysa exhaustion kontrolü
+            if agreement < 1.0:
+                result.exhaustion_passed = True   # Disagreement var → veto yok
+                return
+
+            # TF'ler uyumlu — HER İKİ eşik de aşılmalı (AND mantığı)
+            is_extreme_24h = mkt_change > EXHAUSTION_MKT_24H_THRESHOLD
+            is_extreme_mom = momentum_5  > EXHAUSTION_MOMENTUM_5_THRESHOLD
+
+            if is_extreme_24h and is_extreme_mom:   # AND: ikisi birlikte
+                result.exhaustion_passed = False
+                result.veto_reasons.append(
+                    f"Exhaustion riski: TF uyum=%100 VE "
+                    f"|24h|={mkt_change:.1f}%>{EXHAUSTION_MKT_24H_THRESHOLD} "
+                    f"VE |mom5|={momentum_5:.1f}%>{EXHAUSTION_MOMENTUM_5_THRESHOLD} "
+                    f"(AND mantığı)"
+                )
+            else:
+                result.exhaustion_passed = True
+
+        except Exception as e:
+            logger.warning(f"⚠️ Exhaustion check hatası: {e}. Kontrol atlanıyor.")
+            result.exhaustion_passed = True
 
     def get_regime_info(self) -> Dict[str, float]:
         """Aktif rejim penaltılarını döndür."""

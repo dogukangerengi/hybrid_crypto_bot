@@ -28,7 +28,7 @@
 import sys                                     # Path ayarları
 import time                                    # Performans ölçümü
 import logging                                 # Log yönetimi
-import numpy as np                             # Sayısal hesaplamalar (percentile rank)
+import numpy as np                             # type: ignore
 import pandas as pd                            # DataFrame (rapor çıktısı)
 from pathlib import Path                       # Platform-bağımsız dosya yolları
 from typing import Dict, List, Optional        # Tip belirteçleri
@@ -37,7 +37,7 @@ from datetime import datetime, timezone        # Zaman damgası (cache için)
 
 # Proje config import
 sys.path.insert(0, str(Path(__file__).parent.parent))  # → src/
-from config import cfg, get_setting            # Merkezi config + yaml okuyucu
+from config import get_setting                 # Merkezi config + yaml okuyucu
 
 # Data modülü import (BinanceFetcher)
 from data.fetcher import BinanceFetcher         # CCXT üzerinden Binance API
@@ -291,8 +291,26 @@ class CoinScanner:
         scored = self._calculate_scores(passed)
         scored.sort(key=lambda x: x.composite_score, reverse=True)
         
-        # Top N seç
-        top_coins = scored[:top_n]
+        # [MADDE 8.B] Coin Universe Balancing (Yönsel Dengeleme)
+        # Sadece en yüksek skorlu coinleri seçmek yerine,
+        # trend yönlerine göre LONG (change_24h > 0) ve SHORT (change_24h < 0)
+        # eğilimli coinleri dengeli şekilde seç.
+        bullish_coins = [c for c in scored if c.change_24h > 0]
+        bearish_coins = [c for c in scored if c.change_24h <= 0]
+        
+        half_n = top_n // 2
+        
+        bullish_count = min(len(bullish_coins), half_n)
+        bearish_count = min(len(bearish_coins), top_n - bullish_count)
+        
+        if bearish_count < half_n:
+            bullish_count = min(len(bullish_coins), top_n - bearish_count)
+            
+        top_coins = bullish_coins[:bullish_count] + bearish_coins[:bearish_count]
+        top_coins.sort(key=lambda x: x.composite_score, reverse=True)
+        
+        if self.verbose:
+            logger.info(f"  [5/5] Universe Balanced: {bullish_count} Bullish, {bearish_count} Bearish coin seçildi")
         
         # Cache güncelle
         self._last_scan = scored
@@ -496,6 +514,14 @@ class CoinScanner:
                 r.passed_filters = False
                 r.filter_reason = "price_too_low"
                 continue
+                
+            # Filtre 4: Maksimum volatilite (Vol%)
+            # Gerekçe: %10'dan fazla günlük hareket eden coinlerde fiyat tamamen gürültüden (noise) ibaret olabilir
+            # Ayrıca SL/TP hesaplamalarında risk sınırlarını patlatma olasılığı çok yüksektir.
+            if r.volatility > 10.0:
+                r.passed_filters = False
+                r.filter_reason = "volatility>10%"
+                continue
             
             # Tüm filtrelerden geçti
             r.passed_filters = True
@@ -585,7 +611,7 @@ class CoinScanner:
         np.ndarray
             0-100 arası percentile rank'lar
         """
-        from scipy.stats import rankdata       # Lazy import (her çağrıda yükleme yok)
+        from scipy.stats import rankdata       # type: ignore
         
         n = len(arr)
         if n <= 1:
@@ -778,21 +804,21 @@ if __name__ == "__main__":
               f"Skor: {c.composite_score:>5.1f}")
     
     # Sembol listesi
-    print(f"\n[3] Sembol listesi (top 10):")
+    print("\n[3] Sembol listesi (top 10):")
     print(f"   {scanner.get_symbols(top_n=10)}")
     
     # Cache testi
-    print(f"\n[4] Cache testi:")
+    print("\n[4] Cache testi:")
     start = time.time()
     _ = scanner.scan(top_n=20)
     print(f"   Cache süresi: {time.time()-start:.4f}s")
     
     # DataFrame rapor
-    print(f"\n[5] DataFrame raporu:")
+    print("\n[5] DataFrame raporu:")
     report = scanner.get_report(top_n=10)
     if not report.empty:
         print(report[['Coin', 'Fiyat ($)', '24h Hacim ($)', 'Spread (%)', 'Skor']].to_string())
     
     print(f"\n{'=' * 65}")
-    print(f"  ✅ TEST TAMAMLANDI")
+    print("  ✅ TEST TAMAMLANDI")
     print(f"{'=' * 65}")

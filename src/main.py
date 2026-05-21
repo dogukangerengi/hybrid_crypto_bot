@@ -1,7 +1,28 @@
 # =============================================================================
-# MAIN.PY — ML-DRIVEN TRADING PIPELINE v2.1.12 (BINANCE VADELİ İŞLEMLER)
+# MAIN.PY — ML-DRIVEN TRADING PIPELINE v2.1.18 (BINANCE VADELİ İŞLEMLER)
 # =============================================================================
-# v2.1.12 Değişiklikler:
+# v2.1.18 Değişiklikler:
+#   ✅ [initial_train Dead-band Geri Alındı] 0.10 → 0.25
+#      Dead-band 0.10'a inince BTC mevcut downtrend döneminde test foldlarında
+#      tek sınıf (all-zeros) oluştu → CV folds=0 → is_trained=False → sonsuz döngü.
+#      initial_train için 0.25 eşiği korunmalı (retrain 0.10'da kalır).
+#   ✅ [Çift Initial_train Guard] _initial_train_attempted flag eklendi.
+#      main() ve run_scheduler() aynı is_trained=False koşulunu görünce her ikisi
+#      de initial_train() çağırıyordu. Flag ile yalnızca bir kez çalışır.
+#
+#   ✅ [Ranging Çift Ceza Düzeltmesi] REGIME_PENALTY['ranging'] 0.85 → 1.00
+#      Ranging coin ×0.75 (ilk blok) + ×0.85 (dict) = ×0.6375 alıyordu.
+#      Bu hard block kadar kısıtlayıcıydı. Artık sadece ×0.75 uygulanır.
+#      IC=27 olan ranging coin artık 27×0.75=20.25 → trade açabilir.
+#   ✅ [Dead-band Gevşetme] 0.25 → 0.10 (hem retrain hem initial_train)
+#      Veri kıtlığı döneminde ±0.10-0.25R arası TIMEOUT trade'leri eğitime girer.
+#      Daha fazla eğitim örneği → model daha hızlı öğrenir.
+#   ✅ [Retrain Sıklığı] 30 → 15 kapanan trade'de bir retrain
+#      Model gerçek piyasa koşullarına daha hızlı adapte olur.
+#   ✅ [Hybrid Kademeli Azaltma] Gerçek trade arttıkça sentetik payı düşer.
+#      Eski: gerçek ve sentetik daima ~eşit oran (leakage sabit kalıyordu).
+#      Yeni: synth_ratio = 1 - (gerçek/150) → 200 trade'de pure gerçek veri.
+#
 #   ✅ [Sorun #5] PURE_IC_MODE flag eklendi — KRİTİK acil sigorta.
 #      ML modeli sentetik veri bias'ından edge maskeliyorsa (_validate_initial_model
 #      IC ≤ 0 dönerse) bu flag=True yapılır. ML/Validator katmanı atlanır,
@@ -37,12 +58,12 @@
 # =============================================================================
 
 import sys
-import os
+# import os
 import time
 import signal
 import argparse
 import logging
-import traceback
+# import traceback
 import threading
 
 from pathlib import Path
@@ -52,7 +73,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from execution.risk_manager import RiskManager
-import numpy as np
+import numpy as np  # type: ignore
 import pandas as pd
 
 # =============================================================================
@@ -134,7 +155,7 @@ def _parse_tr_str(s: str) -> datetime:
 
 
 # ── .env yükle ────────────────────────────────────────────────────────────────
-from dotenv import load_dotenv
+from dotenv import load_dotenv  # type: ignore
 _src_dir  = Path(__file__).parent
 _root_dir = _src_dir.parent
 load_dotenv(_root_dir / ".env")
@@ -145,16 +166,19 @@ from config import cfg
 from scanner import CoinScanner
 from data import BinanceFetcher, DataPreprocessor
 from indicators import IndicatorCalculator, IndicatorSelector
-from execution import RiskManager, BinanceExecutor
+from execution import BinanceExecutor
 from notifications import TelegramNotifier
 from paper_trader import PaperTrader
 from performance_analyzer import PerformanceAnalyzer
 
 # ── ML modülleri (v2.0) ───────────────────────────────────────────────────────
-from ml.feature_engineer import FeatureEngineer, MLFeatureVector
+from ml.feature_engineer import FeatureEngineer
 from ml.ensemble_model import EnsemblePredictor as LGBMSignalModel, MLDecisionResult
 from ml.signal_validator import SignalValidator, ValidationResult
-from ml.trade_memory import TradeMemory, TradeOutcome
+from ml.trade_memory import TradeMemory
+
+# [MADDE 12] Coin Performance Tracker
+from portfolio.coin_performance import CoinPerformanceTracker
 
 # =============================================================================
 # LOGLAMA
@@ -190,9 +214,9 @@ MAX_TRADE_AGE_HOURS    = 24
 
 DEFAULT_TIMEFRAMES = {
     '5m': 1500,
-    '15m': 1000,
-    '30m': 1000,
-    '1h' : 1000,
+    '15m': 1500,
+    '30m': 1500,
+    '1h' : 1500,
 }
 
 # [v2.1.5 — SELECTİON BİAS DÜZELTMESİ SONRASI THRESHOLD REVİZYONU]
@@ -319,6 +343,9 @@ class MLTradingPipeline:
         self.fwd_period = fwd_period
         self.verbose    = verbose
         self.excel_filename = "live_trades.xlsx" if not self.dry_run else "paper_trades.xlsx"
+
+        # ── [MADDE 12] Portfolio Tracker ──
+        self.portfolio_tracker = CoinPerformanceTracker()
 
         self.scanner      = CoinScanner()
         self.fetcher      = BinanceFetcher()
@@ -748,26 +775,23 @@ class MLTradingPipeline:
             logger.debug(f"RiskManager sync hatası (kritik değil): {e}")
 
     # =========================================================================
-    # [MADDE 3] — MODEL DEPLOYMENT GATE KONTROLÜ
+    # [MADDE 9] — MODEL DEPLOYMENT GATE KONTROLÜ (ÇOK KAPILI)
     # =========================================================================
     def _check_deployment_gates(self, metrics) -> bool:
         """
         Model deployment istatistiksel kapılarını kontrol eder.
 
-        eval_harness.py'deki kapıların aynısı burada da uygulanır.
-        Tüm kapılardan geçemeyen model canlı trade'de kullanılmaz.
+        [MADDE 9] Çoklu gate kontrolü:
+        1. IC >= 0.05   → minimum ekonomik anlam (Grinold-Kahn)
+        2. Z >= 1.65    → p < 0.05 istatistiksel anlamlılık (tek kuyruk)
+        3. |L-S| >= 0.05R → model yön ayırt edebiliyor
 
-        İstatistiksel temel:
-        - H0: 'Modelin tahmin gücü yok (IC = 0)'
-        - Aggregated Z ≥ 1.65 → H0 reddedilir (p ≤ 0.05, tek kuyruk)
-        - Z = 0.83 gibi değerler p ≈ 0.20 demektir → H0 reddedilemiyor
+        Onceki: IC > 0 ise onayla. Yeni: tum kapilar gecmeli.
 
         Returns:
             True  → model onaylandı, canlıya geçilebilir
-            False → model yetersiz, paper modda kalınmalı
+            False → model yetersiz, paper modda kalinmali
         """
-        # Aggregated Z-skoru: fold başına IC değerlerinin one-sided testi
-        # Varsayım: fold IC'leri IID → merkezi limit teoremi
         n_folds = getattr(metrics, 'n_folds', 0)
         ic_std  = getattr(metrics, 'ic_std', 1.0)
         aggregated_z = (
@@ -776,76 +800,62 @@ class MLTradingPipeline:
         )
 
         gates = {
-            "Spearman IC ≥ 0.05  (Grinold-Kahn alt sınırı)":  metrics.spearman_ic >= 0.05,
-            "Information Ratio ≥ 0.50  (sinyal/gürültü)":      metrics.information_ratio >= 0.50,
-            "Long-Short Spread ≥ 0.10R  (yön ayırt gücü)":     metrics.long_short_spread >= 0.10,  # 0.20 → 0.10: Mevcut değer +0.135R, eşik biraz iddialıydı. Model gerçek edge görüyor.
-            "Aggregated Z ≥ 1.65  (p ≤ 0.05, tek kuyruk)":    aggregated_z >= 1.65,
+            "IC >= 0.05  (min. ekonomik anlam)": metrics.spearman_ic >= 0.05,
+            "Z >= 1.65    (p <= 0.05, tek kuyruk)": aggregated_z >= 1.65,
+            "|L-S| >= 0.05R  (yon ayirt gucu)": abs(metrics.long_short_spread) >= 0.05,
         }
 
-        _ = all(gates.values())  # loglama için
-
-        # [GATE BYPASS REVİZYONU] Tam bypass yerine akıllı bypass:
-        # - IC < 0 (negatif): ASLA onaylama — negatif IC rastgeleden kötü tahmin yapar
-        # - IC >= 0 ama gate'ler tam geçmiyorsa: Yine de onayla (veri az, eşikler sert)
-        # Önceki: passed = True (her zaman)
-        # Yeni: IC negatifse geçme, pozitifse onayla
-        if metrics.spearman_ic <= 0:
-            passed = False  # NEGATİF veya SIFIR IC — model yararsız/zararlı, trade yapma
-            if metrics.spearman_ic < 0:
-                logger.warning(
-                    f"  ⛔ GATE HARD-BLOCK: IC={metrics.spearman_ic:+.4f} NEGATİF — "
-                    f"model rastgeleden KÖTÜ tahmin yapıyor. Canlı trade engellendi."
-                )
-            else:
-                logger.warning(
-                    f"  ⛔ GATE HARD-BLOCK: IC=0.0 — model eğitilemedi (cold start). "
-                    f"Canlı trade engellendi."
-                )
+        # Hard block: IC negatif veya sifir
+        if metrics.spearman_ic < 0:
+            passed = False
+            logger.warning(
+                f"  ⛔ GATE HARD-BLOCK: IC={metrics.spearman_ic:+.4f} NEGATIF — "
+                f"model rastgeleden KOTU tahmin yapiyor. Canli trade engellendi."
+            )
+        elif metrics.spearman_ic == 0.0:
+            passed = False
+            logger.warning("  ⛔ GATE HARD-BLOCK: IC=0.0 — model egitilmedi (cold start).")
         else:
-            passed = True  # Pozitif IC var, gate'ler tam geçmese de devam et
+            passed = all(gates.values())  # [MADDE 9] Tum kapilar gecmeli
 
-        # ── Log ──────────────────────────────────────────────────────────────
-        logger.info(f"\n{'─'*58}")
-        logger.info("  🔬 MODEL DEPLOYMENT GATE KONTROLÜ")
-        logger.info(f"{'─'*58}")
-        logger.info(f"  Spearman IC    : {metrics.spearman_ic:+.4f}  (eşik: ≥ 0.05)")
-        logger.info(f"  Info Ratio     : {metrics.information_ratio:+.2f}   (eşik: ≥ 0.50)")
-        logger.info(f"  L-S Spread     : {metrics.long_short_spread:+.3f}R  (eşik: ≥ 0.10R)")
-        logger.info(f"  Aggregated Z   : {aggregated_z:+.2f}   (eşik: ≥ 1.65, p≤0.05)")
-        logger.info(f"{'─'*58}")
+        # Log
+        logger.info(f"\n{'-'*60}")
+        logger.info("  MODEL DEPLOYMENT GATE KONTROLU [MADDE 9]")
+        logger.info(f"{'-'*60}")
+        logger.info(f"  Spearman IC    : {metrics.spearman_ic:+.4f}  (esik: >= 0.05)")
+        logger.info(f"  L-S Spread     : {metrics.long_short_spread:+.3f}R  (esik: |>=0.05R)")
+        logger.info(f"  Aggregated Z   : {aggregated_z:+.2f}   (esik: >= 1.65, p<=0.05)")
+        logger.info(f"{'-'*60}")
         for gate_name, gate_result in gates.items():
-            icon = "✅" if gate_result else "❌"
-            logger.info(f"  {icon}  {gate_name}")
-        logger.info(f"{'─'*58}")
+            icon = "OK" if gate_result else "FAIL"
+            logger.info(f"  [{icon}] {gate_name}")
+        logger.info(f"{'-'*60}")
 
         if passed:
-            logger.info("  🟢 KARAR: MODEL ONAYLANDI — Canlı trade'e hazır")
+            logger.info("  KARAR: MODEL ONAYLANDI -- Canli trade'e hazir")
         else:
-            n_failed = sum(1 for v in gates.values() if not v)
+            failed_gates = [k for k, v in gates.items() if not v]
             logger.warning(
-                f"  🔴 KARAR: MODEL REDDEDİLDİ — {n_failed} kapı başarısız\n"
-                f"     Model istatistiksel olarak rastgele tahminden ayırt edilemiyor.\n"
-                f"     Canlı trade DURDURULDU — paper modda çalışmaya devam ediyor."
+                f"  KARAR: MODEL REDDEDILDI -- {len(failed_gates)} kapi basarisiz\n"
+                f"     Canli trade DURDURULDU -- paper modda calismaya devam ediyor."
             )
-            # Telegram bildirimi
             try:
                 if self.notifier.is_configured():
                     gate_lines = "\n".join(
-                        f"{'✅' if v else '❌'} {k}"
+                        f"{'OK' if v else 'FAIL'} {k}"
                         for k, v in gates.items()
                     )
+                    safe_gate_lines = gate_lines.replace('<', '&lt;').replace('>', '&gt;')
                     self.notifier.send_message_sync(
-                        f"⚠️ <b>DEPLOYMENT GATE BAŞARISIZ</b>\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"{gate_lines}\n"
-                        f"━━━━━━━━━━━━━━━━━━━━━\n"
-                        f"📊 Z={aggregated_z:.2f} | IC={metrics.spearman_ic:.4f}\n"
-                        f"🛑 Canlı trade DURDURULDU. Paper modda devam ediyor."
+                        f"DEPLOYMENT GATE BASARISIZ\n"
+                        f"{safe_gate_lines}\n"
+                        f"Z={aggregated_z:.2f} | IC={metrics.spearman_ic:.4f}\n"
+                        f"Canli trade DURDURULDU. Paper modda devam ediyor."
                     )
             except Exception:
                 pass
 
-        logger.info(f"{'─'*58}\n")
+        logger.info(f"{'-'*60}\n")
         return passed
 
     def _detect_regime(self, df: pd.DataFrame) -> str:
@@ -999,10 +1009,33 @@ class MLTradingPipeline:
                     significant = scores[:2]
 
                 # ── FIX 3: feature_engineer ctf_* feature'ları için 'score' ve 'direction' bekliyor ──
-                # Önceden sadece 'avg_ic' ve 'sig_count' vardı → feature_engineer 'score'u bulamıyordu
-                # → ctf_best_score, ctf_avg_score, ctf_score_std, ctf_score_spread hep 0 oluyordu.
-                # tf_avg_signed: pozitif IC → piyasa yukarı trend (LONG), negatif → aşağı (SHORT)
-                tf_avg_signed = sum(s.ic_mean for s in valid_scores) / len(valid_scores)
+                # [MADDE 8.A] Kategori ağırlıklı IC Direction hesaplaması
+                CATEGORY_WEIGHTS = {
+                    'trend': 0.40,
+                    'momentum': 0.30,
+                    'volatility': 0.20,
+                    'volume': 0.10,
+                }
+                
+                cat_scores = {}
+                for s in valid_scores:
+                    cat_scores.setdefault(s.category, []).append(s.ic_mean)
+                
+                tf_weighted_ic = 0.0
+                total_cat_weight = 0.0
+                
+                for cat, ic_list in cat_scores.items():
+                    if ic_list:
+                        cat_avg = sum(ic_list) / len(ic_list)
+                        weight = CATEGORY_WEIGHTS.get(cat, 0.0)
+                        tf_weighted_ic += cat_avg * weight
+                        total_cat_weight += weight
+                
+                if total_cat_weight > 0:
+                    tf_avg_signed = tf_weighted_ic / total_cat_weight
+                else:
+                    tf_avg_signed = sum(s.ic_mean for s in valid_scores) / len(valid_scores)
+                
                 tf_dir = 'LONG' if tf_avg_signed > 0 else ('SHORT' if tf_avg_signed < 0 else 'NEUTRAL')
 
                 tf_rankings.append({
@@ -1123,29 +1156,31 @@ class MLTradingPipeline:
 
             # [HARD BLOCK: Regime Awareness]
             if result.market_regime == 'ranging':
-                logger.info(f"[{symbol}] HARD BLOCK: Piyasa rejimi RANGING (Yatay/Testere). İşlem engellendi.")
-                result.status = "regime_blocked"
-                return result
-
+                # Hard block yerine IC'yi %25 cezalandır, ML karar versin
+                result.ic_confidence *= 0.75
+                logger.info(
+                    f"[{symbol}] RANGING penaltı: IC {result.ic_confidence/0.75:.1f} → "
+                    f"{result.ic_confidence:.1f} (×0.75)"
+                )
+                # Ceza sonrası gate eşiğini geçemiyorsa zaten WAIT döner
 
             # [REJİM ÇARPAN REVİZYONU] — Daha dengeli çarpanlar
             # trending  → ×1.10 (trend sinyalini hafif güçlendir, model güvenilir)
-            # ranging   → ×0.85 (hafif ceza, tamamen engelleme — veri birikimi için)
-            # volatile  → ×0.50 (güçlü ceza — geçmiş 0/4 WIN, -$10.53 kayıp)
-            #             IC=8  + volatile → 4.0 → no_trade (5) altında → elenir ✅
-            #             IC=12 + volatile → 6.0 → trade (8) altında → elenir ✅
-            #             IC=16 + volatile → 8.0 → ancak eşiği geçer (çok güçlü sinyal)
+            # ranging   → ×1.00 (zaten yukarıda ×0.75 penaltı uygulandı, çift ceza önle)
+            # volatile  → ×0.50 (güçlü ceza — yüksek volatilite, model güvensiz)
             #
-            # IC=8 + trending  → 8.8  → trade eşiği (8) geçer ✅
-            # IC=8 + ranging   → 6.8  → trade eşiği geçer ✅
-            # IC=8 + volatile  → 4.0  → no_trade (5) altında → elenir ✅
-            # IC=5 + ranging   → 4.25 → no_trade (5) altında → elenir ✅
+            # [ÇİFT CEZA DÜZELTMESİ v2.1.17]
+            # Eski: ranging ×0.75 (satır ~1127) + ×0.85 (bu dict) = ×0.6375 TOPLAM
+            # Sorun: IC=20 (full_trade eşiği) → 20×0.6375=12.75 → trade eşiği geçemiyor
+            #        Yani soft penalty aslında hard block kadar katıydı.
+            # Yeni: ranging ×0.75 (satır ~1127) + ×1.00 (bu dict) = ×0.75 TOPLAM
+            #       IC=27 olan bir ranging coin artık 27×0.75=20.25 → tam eşikte trade açabilir.
             REGIME_PENALTY = {
                 'trending':     1.10,
                 'trending_up':  1.10,
                 'trending_down': 1.10,
-                'ranging':      0.85,
-                'volatile':     0.50,  # [v2.1.16] 0.50 → 0.70 revert: Kullanıcı talebiyle eski katı ayara dönüldü
+                'ranging':      1.00,  # [v2.1.17] 0.85 → 1.00: yukarıdaki ×0.75 yeterli, çift ceza kaldırıldı
+                'volatile':     0.50,
                 'transitioning': 0.90,
                 'unknown':      0.85,
             }
@@ -1368,10 +1403,11 @@ class MLTradingPipeline:
                 self._sync_risk_manager()
 
                 trade_calc = self.risk_manager.calculate_trade(
-                    symbol      = result.full_symbol,
-                    direction   = direction,
-                    entry_price = live_price,
-                    atr         = result.atr,
+                    symbol        = result.full_symbol,
+                    direction     = direction,
+                    entry_price   = live_price,
+                    atr           = result.atr,
+                    market_regime = getattr(result, 'market_regime', 'trending'),  # [MADDE 2]
                 )
 
                 if not trade_calc.is_approved():
@@ -1402,7 +1438,7 @@ class MLTradingPipeline:
             )
 
             if self.dry_run:
-                t = self.paper_trader.open_trade(
+                self.paper_trader.open_trade(
                     symbol        = result.coin,
                     full_symbol   = result.full_symbol,
                     direction     = direction,
@@ -1500,6 +1536,12 @@ class MLTradingPipeline:
 
                         islem_hacmi = exec_res.actual_entry * result.position_size
 
+                        # [MADDE 11] ml_direction/ml_confidence doğru dolduruldu
+                        _ml_dir  = direction  # ML kararı (IC'den değil, ml_result'tan)
+                        _ml_conf = 0.0
+                        if result.ml_result is not None:
+                            _ml_conf = getattr(result.ml_result, 'confidence', 0.0)
+
                         yeni_islem = {
                             "ID": str(uuid.uuid4())[:8],
                             "Tarih (Açılış)": _iso_tr(_now_utc()),  # UTC üretilir, TR gösterilir
@@ -1522,7 +1564,11 @@ class MLTradingPipeline:
                             "IC Yön": getattr(result, 'ic_direction', ''),
                             "TF": getattr(result, 'best_timeframe', ''),
                             "Rejim": getattr(result, 'market_regime', ''),
-                            "AI Karar": direction,
+                            # [MADDE 11] AI/ML bilgisi — artık doğru kaynak
+                            "AI Yön": _ml_dir,
+                            "AI Güven": round(_ml_conf, 1),
+                            "ML-IC": "✓" if _ml_dir == getattr(result, 'ic_direction', '') else "✗",
+                            "AI Karar": _ml_dir,   # Geriye dönük uyumluluk
                             "Durum": "open",
                             "Çıkış Nedeni": "",
                             "Süre (dk)": ""
@@ -1572,6 +1618,20 @@ class MLTradingPipeline:
                         fv_dict['risk_position_size_log'] = float(np.log10(result.position_size + 1))
                 except Exception as e:
                     logger.debug(f"Risk feature override hatası (kritik değil): {e}")
+
+                # ── SNAPSHOT DOĞRULAMA ──
+                # Bozuk snapshot guard: IC analizi başarısız olursa fv_dict sadece
+                # 5 risk key içerir (risk_atr_pct, risk_rr_ratio, risk_sl_distance_pct,
+                # risk_leverage, risk_position_size_log). Bu snapshot eğitimde işe yaramaz.
+                # Trade memory'ye kaydedilir ama get_training_data() MIN_SNAPSHOT_KEYS
+                # filtresiyle eğitimden çıkarır. Burada log'a düşürülür ki takip edilsin.
+                _MIN_SNAPSHOT_KEYS = 40  # tam snapshot = 44 key; bozuk snapshot = 5 key
+                if len(fv_dict) < _MIN_SNAPSHOT_KEYS:
+                    logger.warning(
+                        f"   ⚠️ EKSIK SNAPSHOT: {result.coin} için feature_snapshot yalnızca "
+                        f"{len(fv_dict)} key içeriyor (beklenen >= {_MIN_SNAPSHOT_KEYS}). "
+                        f"IC analizi tamamlanamadı olabilir. Bu trade eğitime girmeyecek."
+                    )
 
                 mem_rec = self.trade_memory.open_trade(
                     symbol           = result.full_symbol,
@@ -1629,7 +1689,7 @@ class MLTradingPipeline:
                         ohlcv_cache[fetch_symbol] = self.fetcher.fetch_ohlcv(
                             fetch_symbol, timeframe="1m", limit=5
                         )
-                    except Exception as _e:
+                    except Exception:
                         ohlcv_cache[fetch_symbol] = None
 
             for trade in trades_to_check:
@@ -1717,6 +1777,10 @@ class MLTradingPipeline:
                             closed_count += 1
                             # [v2.1.7] Daily PnL in-memory güncelle (O(1), dosya I/O yok)
                             self._daily_realized_pnl += float(getattr(trade, 'net_pnl', 0.0) or 0.0)
+                            
+                            # [MADDE 12] Coin performansını kaydet
+                            self.portfolio_tracker.record_trade(trade.symbol, float(getattr(trade, 'net_pnl', 0.0) or 0.0))
+                            
                             logger.info(f"   ✅ {trade.symbol} işlemi kapandı! Neden: {close_reason} | Fiyat: ${exit_price:,.4f}")
 
                             if self.notifier.is_configured():
@@ -1904,6 +1968,10 @@ class MLTradingPipeline:
                                 )
                                 # [v2.1.7] Daily PnL in-memory güncelle (O(1), dosya I/O yok)
                                 self._daily_realized_pnl += net_pnl_val
+                                
+                                # [MADDE 12] Coin performansını kaydet
+                                self.portfolio_tracker.record_trade(mem_coin, net_pnl_val)
+                                
                                 outcome_str = "KÂR" if pnl_val > 0 else "ZARAR"
                                 logger.info(
                                     f"   🧠 Memory güncellendi: {mem_coin} → TIMEOUT/{outcome_str} | "
@@ -2063,6 +2131,10 @@ class MLTradingPipeline:
                             )
                             # [v2.1.7] Daily PnL in-memory güncelle (O(1), dosya I/O yok)
                             self._daily_realized_pnl += net_pnl_val
+                            
+                            # [MADDE 12] Coin performansını kaydet
+                            self.portfolio_tracker.record_trade(mem_coin, net_pnl_val)
+                            
                             logger.info(f"   🧠 Memory güncellendi: {mem_coin} → {close_reason} | PnL: ${pnl_val:+.2f}")
                         except Exception as mem_err:
                             logger.error(f"   ❌ Memory güncelleme hatası: {mem_coin} → {mem_err}")
@@ -2244,10 +2316,14 @@ class MLTradingPipeline:
                         logger.info(f"   ❄️ {c.coin} atlanıyor (Soğuma süresinde - Kalan: {kalan_dk} dk)")
                         continue
                     else:
-                        if c.coin in self.cooldowns:
-                            del self.cooldowns[c.coin]
                         if c.symbol in self.cooldowns:
                             del self.cooldowns[c.symbol]
+
+                # [MADDE 12] Coin Performance Cooldown kontrolü
+                is_allowed, reason = self.portfolio_tracker.is_coin_allowed(c.coin)
+                if not is_allowed:
+                    logger.info(f"   🚫 {c.coin} atlanıyor (Portfolio Cooldown: {reason})")
+                    continue
 
                 r = self._analyze_coin(c.symbol, c.coin, scan_result=c)   # ← FIX 1: scanner verisi geçiriliyor
 
@@ -2256,7 +2332,7 @@ class MLTradingPipeline:
                 if r.ic_confidence >= IC_TRADE:
                     report.total_above_gate += 1
 
-            logger.info(f"\n💹 Execution...")
+            logger.info("\n💹 Execution...")
             for r in results:
                 if r.status == "ready":
                     # ── Her execute öncesi tekrar halt kontrolü (güvenlik) ──
@@ -2282,14 +2358,14 @@ class MLTradingPipeline:
             total_closed = pt_stats.get("closed_trades", 0)
             real_win_rate = pt_stats.get("win_rate_pct", 0.0)
 
-            retrain_threshold = 30  # loglama için korundu (next_retrain_in hesabı)
+            retrain_threshold = 15  # [v2.1.17] 30 → 15: her 15 kapanan trade'de retrain
             # ── RETRAIN COUNTER AÇIKLAMASI ──────────────────────────────────
             # lgbm_model üzerinde iki ayrı sayaç yaşar:
             #   retrain_count            → train() her çağrıldığında +1 (initial_train dahil).
             #                              Toplam eğitim sayısını gösterir; sadece loglama amaçlı.
-            #   experience_retrain_count → "Her 30 kapanan trade'de bir" retrain cycle numarası.
+            #   experience_retrain_count → "Her 15 kapanan trade'de bir" retrain cycle numarası.
             #                              Tetikleme kararı bu sayaca göre verilir.
-            #                              initial_train sonrası hâlâ 0 kalır → ilk 30 trade'de
+            #                              initial_train sonrası hâlâ 0 kalır → ilk 15 trade'de
             #                              retrain doğru biçimde tetiklenir.
             # ────────────────────────────────────────────────────────────────
             current_exp_count = getattr(self.lgbm_model, 'experience_retrain_count', 0)
@@ -2357,7 +2433,7 @@ class MLTradingPipeline:
           verdict = "BYPASS_RECOMMENDED" → IC ≤ 0                   ❌ → PURE_IC_MODE = True öner
           verdict = "insufficient_data"  → n < 30 (henüz erken)
         """
-        from scipy.stats import spearmanr
+        from scipy.stats import spearmanr  # type: ignore
         import json as _json
 
         memory_file = self.trade_memory.log_dir / "ml_trade_memory.json"
@@ -2570,10 +2646,13 @@ class MLTradingPipeline:
                     else:
                         r_multiple = 0.0
                         
-                # --- YENİ EKLENEN DEAD-BAND (ÖLÜ BÖLGE) FİLTRESİ ---
-                # TIMEOUT olan ve çok küçük kâr/zarar (-0.25R ile +0.25R arası) eden işlemleri
-                # gürültü (noise) olmaması için eğitimden dışlıyoruz.
-                if exit_reason == "TIMEOUT" and abs(r_multiple) < 0.25:
+                # --- DEAD-BAND (ÖLÜ BÖLGE) FİLTRESİ ---
+                # TIMEOUT olan ve çok küçük kâr/zarar eden işlemleri gürültü olarak çıkar.
+                # [v2.1.17] Eşik 0.25 → 0.10'a indirildi.
+                # Neden: 72 gerçek trade ile veri kıtlığı var. ±0.10R ile ±0.25R arası
+                # trade'ler gürültü sayılıp çıkarılıyordu. Bu trade'ler modelin
+                # "küçük ödül/ceza" öğrenmesi için önemli. Veri bollaşınca 0.20'ye çekilebilir.
+                if exit_reason == "TIMEOUT" and abs(r_multiple) < 0.10:
                     continue
                 
                 target = float(r_multiple)
@@ -2624,31 +2703,48 @@ class MLTradingPipeline:
 
             # ─────────────────────────────────────────────────────────────────
             # [HYBRİD RETRAIN] BTC tarihsel veri ile gerçek trade verisi karıştır
-            # Sorun: 360 gerçek trade → gürültülü, az veri → model çöküyor (IC≈0)
-            # Çözüm: BTC 1h tarihsel veri ile blend → modeli sabitler
-            # Oran: gerçek veri 1.0x ağırlık, tarihsel 0.5x ağırlık (downsampling)
+            # [v2.1.17] KADEMELİ AZALTMA: gerçek trade arttıkça sentetik payı düşer.
+            # Eski: n_hist = max(100, len(real)) → sentetik hiç azalmıyordu!
+            #       44 gerçek + 100 sentetik, 120 gerçek + 120 sentetik (eşit oran)
+            # Yeni: synth_ratio = 1 - (gerçek / 150) → doğrusal düşüş
+            #       44 gerçek → ratio=0.71 → ~31 sentetik
+            #       80 gerçek → ratio=0.47 → ~37 sentetik
+            #      120 gerçek → ratio=0.20 → ~24 sentetik (min 30)
+            #      200 gerçek → pure real (sentetik sıfır)
+            # Avantaj: leakage (ic_confidence=65 sabit) etkisi kademeli azalır.
             # ─────────────────────────────────────────────────────────────────
             try:
-                # EĞER GERÇEK İŞLEM SAYISI >= 200 İSE HYBRİD'İ KAPAT
-                if len(X_experience) >= 200:
-                    logger.info("   🚀 Gerçek işlem sayısı 200'ü aştı! Hybrid veri kullanımı KAPATILDI. Sadece gerçek canlı tecrübe kullanılıyor.")
+                # [v2.1.19] 50+ gerçek trade varsa hybrid'i kapat — saf gerçek veri kullan.
+                # Eski eşik 200'di: 200 trade'e kadar BTC sentetik karıştırılıyordu.
+                # Sorun: BTC sentetik veride IC sabit, CTF NaN → model kirleniyor.
+                # Yeni eşik 50: 50+ gerçek trade yeterliyse hiç sentetik ekleme.
+                if len(X_experience) >= 50:
+                    logger.info(
+                        f"   ✅ Saf gerçek veri modu: {len(X_experience)} trade — BTC hybrid atlandı."
+                    )
                     X_train, y_train, dir_train = X_experience, y_experience, dir_experience
                 else:
                     X_hist, y_hist, dir_hist = self._build_historical_samples_for_hybrid()
                     if X_hist is not None and len(X_hist) > 50:
-                        # Tarihsel veriyi downsample: gerçek veri kadar ama max 400
-                        n_hist = min(len(X_hist), max(100, len(X_experience)))
-                        X_hist = X_hist.sample(n=n_hist, random_state=42) if len(X_hist) > n_hist else X_hist
-                        y_hist = y_hist.iloc[X_hist.index] if hasattr(y_hist, 'iloc') else y_hist.reindex(X_hist.index)
-                        dir_hist = dir_hist.iloc[X_hist.index] if hasattr(dir_hist, 'iloc') else dir_hist.reindex(X_hist.index)
-                        X_hist = X_hist.reset_index(drop=True)
-                        y_hist = y_hist.reset_index(drop=True)
-                        dir_hist = dir_hist.reset_index(drop=True)
+                        # [v2.1.17] Kademeli azaltma: gerçek trade arttıkça sentetik payı düşür
+                        synth_ratio = max(0.10, 1.0 - len(X_experience) / 150.0)
+                        n_hist_cap  = max(30, int(len(X_experience) * synth_ratio))
+                        n_hist      = min(len(X_hist), n_hist_cap)
 
-                        X_train = pd.concat([X_experience, X_hist], ignore_index=True)
-                        y_train = pd.concat([y_experience, y_hist], ignore_index=True)
+                        X_hist    = X_hist.sample(n=n_hist, random_state=42) if len(X_hist) > n_hist else X_hist
+                        y_hist    = y_hist.iloc[X_hist.index]    if hasattr(y_hist,    'iloc') else y_hist.reindex(X_hist.index)
+                        dir_hist  = dir_hist.iloc[X_hist.index]  if hasattr(dir_hist,  'iloc') else dir_hist.reindex(X_hist.index)
+                        X_hist    = X_hist.reset_index(drop=True)
+                        y_hist    = y_hist.reset_index(drop=True)
+                        dir_hist  = dir_hist.reset_index(drop=True)
+
+                        X_train   = pd.concat([X_experience, X_hist],   ignore_index=True)
+                        y_train   = pd.concat([y_experience, y_hist],   ignore_index=True)
                         dir_train = pd.concat([dir_experience, dir_hist], ignore_index=True)
-                        logger.info(f"   🔀 Hybrid retrain: {len(X_experience)} gerçek + {len(X_hist)} tarihsel = {len(X_train)} toplam")
+                        logger.info(
+                            f"   🔀 Hybrid retrain: {len(X_experience)} gerçek + {len(X_hist)} tarihsel = {len(X_train)} toplam "
+                            f"(synth_ratio={synth_ratio:.2f})"
+                        )
                     else:
                         logger.warning("   ⚠️ Tarihsel veri alınamadı, sadece gerçek trade verisi kullanılıyor")
                         X_train, y_train, dir_train = X_experience, y_experience, dir_experience
@@ -2666,62 +2762,72 @@ class MLTradingPipeline:
                 report_dir.mkdir(parents=True, exist_ok=True)
                 report_path = report_dir / "model_egitim_raporu.xlsx"
 
-                with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
-                    # --- 1. SAYFA: GENEL METRİKLER ---
-                    z_score = (metrics.spearman_ic * np.sqrt(metrics.n_train_samples - 3)) if metrics.n_train_samples > 3 else 0.0
-                    
-                    df_metrics = pd.DataFrame([{
-                        "Tarih": _now_local().strftime("%Y-%m-%d %H:%M:%S"),  # TR saati
-                        "Kaynak": "retrain_from_experience",
-                        "Eğitim Satır Sayısı": len(X_experience),
-                        "Kazanma Oranı (Win Rate)": f"{sum(1 for val in y_experience if float(val) > 0) / max(1, len(y_experience)) * 100:.1f}%",
-                        "Spearman IC Skoru": round(metrics.spearman_ic, 4),
-                        "Bilgi Oranı (IR)": round(metrics.information_ratio, 2),
-                        "Z-Skoru": round(z_score, 2),
-                        "Long-Short Spread (R)": round(metrics.long_short_spread, 3),
-                        "MAE (Hata Payı)": round(metrics.mae, 4)
-                    }])
-                    df_metrics.to_excel(writer, sheet_name="1_Genel_Metrikler", index=False)
-
-                    # --- 2. SAYFA: KOLON ÖNEMLERİ (GÜVENLİ BLOK) ---
-                    try:
-                        importance = None
-                        kalan_kolonlar = None
-                        
-                        if hasattr(self.lgbm_model, 'feature_importances_'):
-                            importance = self.lgbm_model.feature_importances_() if callable(self.lgbm_model.feature_importances_) else self.lgbm_model.feature_importances_
-                        elif hasattr(self.lgbm_model, 'model') and hasattr(self.lgbm_model.model, 'feature_importances_'):
-                            importance = self.lgbm_model.model.feature_importances_
-                            
-                        if importance is not None:
-                            if hasattr(self.lgbm_model, 'feature_names') and self.lgbm_model.feature_names:
-                                kalan_kolonlar = self.lgbm_model.feature_names
-                            else:
-                                kalan_kolonlar = X_experience.columns[:len(importance)]
-                            
-                            if len(kalan_kolonlar) == len(importance):
-                                df_imp = pd.DataFrame({
-                                    "Feature (Kolon)": kalan_kolonlar,
-                                    "Önem Puanı": importance
-                                }).sort_values(by="Önem Puanı", ascending=False)
-                            else:
-                                df_imp = pd.DataFrame({"Hata": [f"Uyuşmazlık! Kolon:{len(kalan_kolonlar)}, Puan:{len(importance)}"]})
-                        else:
-                            df_imp = pd.DataFrame({"Bilgi": ["Model önem puanı üretmedi"]})
-                            
-                        df_imp.to_excel(writer, sheet_name="2_Kolon_Onemleri", index=False)
-                    except Exception as e:
-                        pd.DataFrame({"Hata": [str(e)]}).to_excel(writer, sheet_name="2_Kolon_Onemleri", index=False)
-
-                    # --- 3. SAYFA: GEÇMİŞ HAM VERİ ---
-                    df_raw = X_experience.copy()
-                    df_raw['TARGET_SONUC'] = y_experience.values
-                    df_raw['TARGET_ACIKLAMA'] = df_raw['TARGET_SONUC'].apply(
-                        lambda x: "KAZANÇ (Pozitif R)" if float(x) > 0 else "ZARAR (Negatif R)"
+                # [v2.1.18] n_folds==0 ise Excel'i üzerine YAZMA.
+                # Neden: startup retrain n_folds=0 ile bitiyor (n~80 < min_train=120).
+                # Bu retrain, initial_train'in iyi metriklerini (CV=3, IC=+0.26) sıfır ile
+                # üzerine yazıyordu → raporda Spearman IC, IR, Z-Skoru, L-S Spread hep 0.
+                # Düzeltme: n_folds==0 ise rapor atlanır, önceki Excel dosyası korunur.
+                if metrics.n_folds == 0:
+                    logger.info(
+                        "ℹ️ Retrain raporu atlandı (n_folds=0 — önceki Excel raporu korunuyor)."
                     )
-                    df_raw.to_excel(writer, sheet_name="3_Gecmis_Ham_Veri", index=False)
+                else:
+                    with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
+                        # --- 1. SAYFA: GENEL METRİKLER ---
+                        z_score = (metrics.spearman_ic * np.sqrt(metrics.n_train_samples - 3)) if metrics.n_train_samples > 3 else 0.0
+                        
+                        df_metrics = pd.DataFrame([{
+                            "Tarih": _now_local().strftime("%Y-%m-%d %H:%M:%S"),  # TR saati
+                            "Kaynak": "retrain_from_experience",
+                            "Eğitim Satır Sayısı": len(X_experience),
+                            "Kazanma Oranı (Win Rate)": f"{sum(1 for val in y_experience if float(val) > 0) / max(1, len(y_experience)) * 100:.1f}%",
+                            "Spearman IC Skoru": round(metrics.spearman_ic, 4),
+                            "Bilgi Oranı (IR)": round(metrics.information_ratio, 2),
+                            "Z-Skoru": round(z_score, 2),
+                            "Long-Short Spread (R)": round(metrics.long_short_spread, 3),
+                            "MAE (Hata Payı)": round(metrics.mae, 4)
+                        }])
+                        df_metrics.to_excel(writer, sheet_name="1_Genel_Metrikler", index=False)
 
-                logger.info(f"📊 Retrain raporu Excel olarak kaydedildi: {report_path}")
+                        # --- 2. SAYFA: KOLON ÖNEMLERİ (GÜVENLİ BLOK) ---
+                        try:
+                            importance = None
+                            kalan_kolonlar = None
+                            
+                            if hasattr(self.lgbm_model, 'feature_importances_'):
+                                importance = self.lgbm_model.feature_importances_() if callable(self.lgbm_model.feature_importances_) else self.lgbm_model.feature_importances_
+                            elif hasattr(self.lgbm_model, 'model') and hasattr(self.lgbm_model.model, 'feature_importances_'):
+                                importance = self.lgbm_model.model.feature_importances_
+                                
+                            if importance is not None:
+                                if hasattr(self.lgbm_model, 'feature_names') and self.lgbm_model.feature_names:
+                                    kalan_kolonlar = self.lgbm_model.feature_names
+                                else:
+                                    kalan_kolonlar = X_experience.columns[:len(importance)]
+                                
+                                if len(kalan_kolonlar) == len(importance):
+                                    df_imp = pd.DataFrame({
+                                        "Feature (Kolon)": kalan_kolonlar,
+                                        "Önem Puanı": importance
+                                    }).sort_values(by="Önem Puanı", ascending=False)
+                                else:
+                                    df_imp = pd.DataFrame({"Hata": [f"Uyuşmazlık! Kolon:{len(kalan_kolonlar)}, Puan:{len(importance)}"]})
+                            else:
+                                df_imp = pd.DataFrame({"Bilgi": ["Model önem puanı üretmedi"]})
+                                
+                            df_imp.to_excel(writer, sheet_name="2_Kolon_Onemleri", index=False)
+                        except Exception as e:
+                            pd.DataFrame({"Hata": [str(e)]}).to_excel(writer, sheet_name="2_Kolon_Onemleri", index=False)
+
+                        # --- 3. SAYFA: GEÇMİŞ HAM VERİ ---
+                        df_raw = X_experience.copy()
+                        df_raw['TARGET_SONUC'] = y_experience.values
+                        df_raw['TARGET_ACIKLAMA'] = df_raw['TARGET_SONUC'].apply(
+                            lambda x: "KAZANÇ (Pozitif R)" if float(x) > 0 else "ZARAR (Negatif R)"
+                        )
+                        df_raw.to_excel(writer, sheet_name="3_Gecmis_Ham_Veri", index=False)
+
+                    logger.info(f"📊 Retrain raporu Excel olarak kaydedildi: {report_path}")
             
             except Exception as ex:
                 logger.error(f"⚠️ Excel raporu oluşturulurken hata (kritik değil): {ex}")
@@ -2960,7 +3066,7 @@ class MLTradingPipeline:
             rows_y = []
             rows_dir = [] # YENİ EKLENDİ
 
-            train_cat_tops = {}
+            # train_cat_tops kullanılmıyor
             all_scores = self.selector.evaluate_all_indicators(df_ind, target_col)
 
             # [SORUN 2 DÜZELTMESİ] — Temiz helper kullan
@@ -2970,7 +3076,8 @@ class MLTradingPipeline:
                 'trend':      ['ADX', 'Aroon', 'PSAR', 'DPO', 'Vortex', 'KST', 'Ichimoku', 'SMA', 'EMA', 'WMA'],
                 'volatility': ['BBW', 'BBU', 'BBL', 'BBM', 'ATR', 'NATR', 'Keltner', 'Donchian'],
             }
-            train_cat_tops = self._compute_category_tops(all_scores, CATEGORIES)
+            # Sadece kategorileri hesapla, değişkene atama (unused variable)
+            self._compute_category_tops(all_scores, CATEGORIES)
 
             MIN_MOVE = 0.0025  # Küçük fiyat hareketleri (TIMEOUT dead-band) için alt eşik
             start_idx = 250
@@ -3124,7 +3231,14 @@ class MLTradingPipeline:
                             exit_price = path_df['close'].iloc[-1] if not path_df.empty else entry_price
                             r_multiple = (entry_price - exit_price) / sl_distance
 
-                    if abs(r_multiple) < 0.25:  # dead-band: noise at
+                    if abs(r_multiple) < 0.25:  # [v2.1.18] initial_train dead-band 0.25'te KALDI
+                        # Neden retrain ile farklı?
+                        # - retrain_from_experience: gerçek trade'ler, her biri değerli → 0.10 eşiği
+                        # - initial_train: BTC sentetik barlar, LONG+SHORT çifti üretiliyor
+                        #   Dead-band 0.10'a inince mevcut downtrend döneminde küçük negatif R'lar
+                        #   (±0.10-0.25R arası TIMEOUT barlar) eğitime girdi. Test foldlarında
+                        #   tek sınıf (all-zeros) → CV folds=0 → is_trained=False sonsuz döngüsü.
+                        # initial_train için 0.25 eşiği korunmalı.
                         continue
                     r_multiple = max(-2.0, min(2.0, r_multiple))
 
@@ -3340,7 +3454,11 @@ class MLTradingPipeline:
                 "Fee ($)": (10, '#,##0.00'),
                 "Net PnL ($)": (12, '#,##0.00;(#,##0.00);"-"'),
                 "IC Güven": (10, '0.0'), "IC Yön": (8, None), "TF": (6, None),
-                "Rejim": (14, None), "AI Karar": (10, None), "Durum": (10, None),
+                "Rejim": (14, None),
+                # [MADDE 11] ML/AI kolonları genişletildi
+                "AI Yön": (8, None), "AI Güven": (10, '0.0'), "ML-IC": (7, None),
+                "AI Karar": (10, None),  # Geriye dönük uyumluluk
+                "Durum": (10, None),
                 "Çıkış Nedeni": (14, None), "Süre (dk)": (10, '#,##0')
             }
 
@@ -3402,7 +3520,7 @@ class MLTradingPipeline:
             losing   = int((closed_df['Net PnL ($)'] <= 0).sum())
             win_rate = (winning / closed_trades * 100) if closed_trades > 0 else 0.0
 
-            total_pnl     = float(closed_df['PnL ($)'].sum())
+            # total_pnl kullanılmıyor, silebiliriz
             total_net_pnl = float(closed_df['Net PnL ($)'].sum())
             total_fee     = float(closed_df['Fee ($)'].sum())
 
@@ -3749,16 +3867,22 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 10) -> No
     watchdog_thread.start()
     logger.info("🔍 Daily PnL watchdog başlatıldı (saatlik drift kontrolü)")
 
-    if not pipeline.lgbm_model.is_trained:
-        pipeline.initial_train()
-
-    # [v2.1.11] Startup retrain DONDURULDU — RETRAIN_MIN_TRADES'e kadar çalışmaz.
-    # Sebep: hybrid distributional leakage (bkz. v2.1.11 başlığı ve RETRAIN_MIN_TRADES sabiti).
-    # initial_train modeli korunuyor; 200 gerçek trade'de bu blok yeniden aktive edilecek.
+    # [v2.1.18/19] GUARD + gerçek trade önceliği
+    # 50+ gerçek trade varsa BTC sentetik initial_train yerine gerçek veriyle eğit.
+    # Neden: initial_train'de IC sabit, CTF NaN → model anlamsız veri öğreniyor.
+    # Gerçek tradelerin feature snapshot'larında gerçek IC/CTF/regime değerleri var.
+    if not pipeline.lgbm_model.is_trained and not getattr(pipeline.lgbm_model, '_initial_train_attempted', False):
+        pipeline.lgbm_model._initial_train_attempted = True
+        _real_closed_s = pipeline.trade_memory._count_closed()
+        if _real_closed_s >= 50:
+            logger.info(f"🎓 {_real_closed_s} gerçek trade — initial_train atlanıyor, gerçek veriyle eğitim...")
+            pipeline.retrain_from_experience()
+        else:
+            pipeline.initial_train()
     try:
         closed_count = pipeline.trade_memory._count_closed()
         if closed_count >= RETRAIN_MIN_TRADES:
-            retrain_threshold = 30
+            retrain_threshold = 15  # [v2.1.17] 30 → 15: her 15 trade'de bir retrain
             current_exp_count = getattr(pipeline.lgbm_model, 'experience_retrain_count', 0)
             target_exp_count  = closed_count // retrain_threshold
             if target_exp_count > current_exp_count:
@@ -3845,8 +3969,18 @@ def main():
         sys.exit(1)
 
     if not pipeline.lgbm_model.is_trained:
-        logger.info("🎓 Model eğitilmemiş — ilk eğitim başlıyor...")
-        pipeline.initial_train()
+        # [v2.1.19] 50+ gerçek trade varsa initial_train'i atla, gerçek veriyle eğit.
+        # initial_train BTC sentetik kullanır → IC sabit, CTF NaN → anlamsız.
+        # Gerçek tradelerin snapshot'larında IC, CTF, market regime gerçek değer taşır.
+        _real_closed = pipeline.trade_memory._count_closed()
+        if _real_closed >= 50:
+            logger.info(f"🎓 {_real_closed} gerçek trade bulundu — initial_train atlanıyor, gerçek veriyle eğitim...")
+            pipeline.lgbm_model._initial_train_attempted = True
+            pipeline.retrain_from_experience()
+        else:
+            logger.info("🎓 Model eğitilmemiş — ilk eğitim başlıyor...")
+            pipeline.lgbm_model._initial_train_attempted = True  # [v2.1.18] çift çağrı guard
+            pipeline.initial_train()
 
     if args.schedule:
         run_scheduler(pipeline, args.interval)
