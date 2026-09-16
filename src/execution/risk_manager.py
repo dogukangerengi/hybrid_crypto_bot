@@ -131,17 +131,18 @@ class TradeCalculation:
 
 class RiskManager:
     # SL mesafesi = ATR × multiplier
-    # Geniş stop ile iğnelerden korunmak için 3.0x kullanıyoruz (Swing Trade)
-    DEFAULT_ATR_MULTIPLIER = 3.0
-    MIN_ATR_MULTIPLIER = 2.0
-    MAX_ATR_MULTIPLIER = 5.0
+    # Testere (whipsaw) piyasasından korunmak için 4.0x kullanıyoruz.
+    DEFAULT_ATR_MULTIPLIER = 2.0
+    MIN_ATR_MULTIPLIER = 1.0
+    MAX_ATR_MULTIPLIER = 4.0
 
     # [RR HARD FLOOR] Risk/Reward oranı hiçbir koşulda bu değerin altına inemez.
     # Config'den daha düşük bir değer gelse bile bu floor korunur.
     # Neden 1.5: Fee + slippage sonrası gerçek edge için minimum eşik.
     # 1:1 RR → komisyon sonrası beklenen değer negatif olur.
-    # DÜZELTME: ML modelin dinamik karar almasını engellememek için taban 1.0'a çekildi.
-    MIN_RISK_REWARD_HARD_FLOOR = 1.0
+    # DÜZELTME: Kullanıcı isteği üzerine minimum RR her zaman 1.5 olarak sabitlendi.
+    MIN_RISK_REWARD_HARD_FLOOR = 1.5
+
 
     def __init__(
         self,

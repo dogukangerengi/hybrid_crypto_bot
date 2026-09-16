@@ -818,7 +818,7 @@ class TradeMemory:
         for k, v in features.items():
             try:
                 fv = float(v)                   # Float'a çevir
-                if np.isfinite(fv):             # NaN ve inf'i dışla
+                if not np.isinf(fv):            # Sadece inf'i dışla, NaN'ı koru (LightGBM destekler)
                     clean[str(k)] = fv
             except (TypeError, ValueError):
                 pass                            # Çevrilemeyen değerleri atla

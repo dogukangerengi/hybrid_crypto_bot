@@ -25,7 +25,7 @@ import csv                                     # CSV export için
 import os                                      # Dosya/klasör işlemleri
 import logging                                 # Loglama
 from pathlib import Path                       # Platform-bağımsız path
-from datetime import datetime, timedelta      # Zaman damgaları
+from datetime import datetime, timedelta, timezone      # Zaman damgaları
 from typing import Dict, List, Optional, Tuple, Any  # Tip belirteçleri
 from dataclasses import dataclass, field, asdict  # Yapılandırılmış veri
 from enum import Enum                          # Trade durumları
@@ -120,7 +120,7 @@ class PaperTrade:
     def __post_init__(self):
         """Trade açıldığında zaman damgası ata."""
         if not self.opened_at:
-            self.opened_at = datetime.now().isoformat()
+            self.opened_at = datetime.now(timezone.utc).isoformat()
         if not self.trade_id:
             self.trade_id = str(uuid.uuid4())[:8]  # Kısa UUID
 
@@ -163,7 +163,7 @@ class PaperTrade:
         exit_price: float,
         status: TradeStatus,
         reason: str = "",
-        fee_rate: float = 0.0006              # Binance maker fee: %0.06
+        fee_rate: float = 0.0004              # Binance avg maker/taker fee: %0.04
     ) -> None:
         """
         Trade'i kapat ve PnL hesapla.
@@ -182,11 +182,17 @@ class PaperTrade:
         self.exit_price = exit_price
         self.status = status.value
         self.exit_reason = reason or status.value
-        self.closed_at = datetime.now().isoformat()
+        self.closed_at = datetime.now(timezone.utc).isoformat()
         
         # Süre hesapla
         opened = datetime.fromisoformat(self.opened_at)
+        if opened.tzinfo is None:
+            opened = opened.replace(tzinfo=timezone.utc)
+            
         closed = datetime.fromisoformat(self.closed_at)
+        if closed.tzinfo is None:
+            closed = closed.replace(tzinfo=timezone.utc)
+            
         self.duration_minutes = int((closed - opened).total_seconds() / 60)
         
         # PnL hesapla
@@ -218,7 +224,7 @@ class PaperTrader:
         self,
         initial_balance: float = 1000.0,         # Başlangıç bakiyesi ($)
         log_dir: Path = DEFAULT_LOG_DIR,       # Kayıt dizini
-        fee_rate: float = 0.0006,              # İşlem ücreti (%0.06)
+        fee_rate: float = 0.0004,              # İşlem ücreti (%0.04)
         auto_save: bool = True,                # Her trade'de otomatik kaydet
     ):
         """
@@ -677,7 +683,7 @@ class PaperTrader:
                 "initial_balance": self.initial_balance,
                 "current_balance": self.balance,
                 "total_trades": self.total_trades,
-                "last_updated": datetime.now().isoformat(),
+                "last_updated": datetime.now(timezone.utc).isoformat(),
             },
             "open_trades": [t.to_dict() for t in self.open_trades.values()],
             "closed_trades": [t.to_dict() for t in self.closed_trades],
@@ -892,7 +898,6 @@ class PaperTrader:
             ("IC Yön",         8,  None),                          # IC direction
             ("TF",             6,  None),                          # En iyi timeframe
             ("Rejim",          14, None),                          # Market regime
-            ("AI Karar",       10, None),                          # AI decision
             ("Durum",          14, None),                          # Trade status
             ("Çıkış Nedeni",   14, None),                          # Exit reason
             ("Süre (dk)",      10, '#,##0'),                       # Duration in minutes
@@ -973,7 +978,6 @@ class PaperTrader:
                 trade.ic_direction or "",                          # IC yön
                 trade.best_timeframe or "",                        # TF
                 trade.market_regime or "",                         # Rejim
-                trade.ai_decision or "",                           # AI karar
                 trade.status or "",                                # Durum
                 trade.exit_reason or "",                           # Çıkış nedeni
                 trade.duration_minutes if trade.duration_minutes else None,

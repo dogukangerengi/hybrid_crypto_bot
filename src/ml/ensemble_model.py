@@ -14,7 +14,9 @@
 # =============================================================================
 
 import os
+import json
 import logging
+from pathlib import Path
 import warnings
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -26,7 +28,7 @@ import pandas as pd
 from scipy.stats import spearmanr
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.feature_selection import mutual_info_classif
-from sklearn.metrics import mean_absolute_error
+from sklearn.metrics import mean_absolute_error, roc_auc_score
 from lightgbm import LGBMClassifier
 
 warnings.filterwarnings("ignore")
@@ -51,8 +53,8 @@ DEFAULT_THRESHOLD_LONG = 0.52
 DEFAULT_THRESHOLD_SHORT = 0.55
 
 # === HARD THRESHOLD FLOORS (PROBABILITY) ===
-HARD_THRESHOLD_FLOOR_LONG  = 0.50   # Model %50'den emin degilse asla LONG girme
-HARD_THRESHOLD_FLOOR_SHORT = 0.52   # Model %52'den emin degilse asla SHORT girme
+HARD_THRESHOLD_FLOOR_LONG  = 0.51   # Model %51'den emin degilse asla LONG girme
+HARD_THRESHOLD_FLOOR_SHORT = 0.51   # Model %51'den emin degilse asla SHORT girme
 
 # [MADDE 7] Weekend threshold multiplier
 # Cumartesi-Pazar gunleri likidite duser, spread artar, false signal orani yukselir.
@@ -66,10 +68,9 @@ WEEKEND_THRESHOLD_MULTIPLIER = 1.08  # 1.08x = %8 daha siki
 THRESHOLD_GRID_PERCENTILES = [40, 50, 60, 70, 80]
 
 DROPPED_FEATURES_HARD = {
-    "risk_sl_distance_pct", "risk_rr_ratio", "ic_direction_code",
-    "tmp_dow_sin", "tmp_dow_cos", "tmp_is_weekend",
-    "tmp_hour_sin", "tmp_hour_cos",
+    "risk_sl_distance_pct", "risk_rr_ratio", 
     "ctf_n_timeframes", "mkt_regime_volatile", "mkt_regime_trending",
+    "risk_position_size_log", "risk_leverage",
 }
 
 
@@ -95,16 +96,15 @@ class MLDecisionResult:
 
 @dataclass
 class ModelMetrics:
-    spearman_ic: float = 0.0
-    ic_std: float = 0.0
-    information_ratio: float = 0.0
+    roc_auc: float = 0.5
+    precision_top20: float = 0.0
+    expectancy: float = 0.0
     mae: float = 0.0
     top_quintile_r: float = 0.0
     bottom_quintile_r: float = 0.0
     long_short_spread: float = 0.0
     n_folds: int = 0
     n_train_samples: int = 0
-    aggregated_z: float = 0.0
     long_taken_n: int = 0
     long_taken_mean_r: float = 0.0
     short_taken_n: int = 0
@@ -190,16 +190,65 @@ class EnsemblePredictor:
         self.model = None
         self.feature_names: List[str] = []
         self.is_trained = False
-        self.retrain_count = 0           
-        self.experience_retrain_count = 0  
+        self.retrain_count = 0
+        self.experience_retrain_count = 0
         self.last_metrics: Optional[ModelMetrics] = None
-        
+
         self.threshold_long: float = HARD_THRESHOLD_FLOOR_LONG
         self.threshold_short: float = HARD_THRESHOLD_FLOOR_SHORT
         self.model_dir = model_dir
         os.makedirs(model_dir, exist_ok=True)
-        self.report_path = os.path.join("logs", "reports", "ensemble_egitim_raporu.xlsx")
+        # Fix relative path issue for report_path
+        self.report_path = str(Path(__file__).resolve().parent.parent.parent / "logs" / "reports" / "ensemble_egitim_raporu.xlsx")
         os.makedirs(os.path.dirname(self.report_path), exist_ok=True)
+
+        # [PERSIST] Retrain durumunu diskten yükle
+        # Her restart'ta experience_retrain_count sıfırlanıyor ve threshold'lar
+        # default'a dönüyordu. retrain_state.json ile bu değerler korunur.
+        self._state_file = Path(model_dir) / "retrain_state.json"
+        self._load_state()
+
+    def _load_state(self) -> None:
+        """Retrain durumunu diskten yükler (experience_retrain_count, threshold'lar)."""
+        if not self._state_file.exists():
+            logger.info("📂 retrain_state.json bulunamadı, varsayılan değerlerle başlanıyor.")
+            return
+        try:
+            with open(self._state_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+            self.experience_retrain_count = int(state.get("experience_retrain_count", 0))
+            self.retrain_count            = int(state.get("retrain_count", 0))
+            loaded_long  = float(state.get("threshold_long",  HARD_THRESHOLD_FLOOR_LONG))
+            loaded_short = float(state.get("threshold_short", HARD_THRESHOLD_FLOOR_SHORT))
+            # Threshold'lar sadece hard floor üzerindeyse yükle (güvenli)
+            if loaded_long  >= HARD_THRESHOLD_FLOOR_LONG:
+                self.threshold_long  = loaded_long
+            if loaded_short >= HARD_THRESHOLD_FLOOR_SHORT:
+                self.threshold_short = loaded_short
+            logger.info(
+                f"✅ retrain_state.json yüklendi | "
+                f"experience_retrain_count={self.experience_retrain_count} | "
+                f"retrain_count={self.retrain_count} | "
+                f"thr_long={self.threshold_long:.3f} | thr_short={self.threshold_short:.3f}"
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ retrain_state.json okunamadı ({e}), varsayılan değerler kullanılıyor.")
+
+    def _save_state(self) -> None:
+        """Mevcut retrain durumunu diske kaydeder."""
+        try:
+            state = {
+                "experience_retrain_count": self.experience_retrain_count,
+                "retrain_count":            self.retrain_count,
+                "threshold_long":           self.threshold_long,
+                "threshold_short":          self.threshold_short,
+                "saved_at":                 __import__('datetime').datetime.utcnow().isoformat(),
+            }
+            with open(self._state_file, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+            logger.debug(f"💾 retrain_state.json güncellendi (exp={self.experience_retrain_count})")
+        except Exception as e:
+            logger.warning(f"⚠️ retrain_state.json kaydedilemedi: {e}")
 
     @staticmethod
     def construct_r_multiple(trades: List[Dict]) -> pd.DataFrame:
@@ -360,7 +409,8 @@ class EnsemblePredictor:
         return thresholds
 
     def _evaluate_walk_forward(self, X, y, directions) -> ModelMetrics:
-        ics, maes, top_rs, bot_rs = [], [], [], []
+        aucs, maes, top_rs, bot_rs = [], [], [], []
+        top_wins, top_totals = 0, 0
         long_taken, short_taken = [], []
         thresholds_per_fold = []
 
@@ -386,13 +436,11 @@ class EnsemblePredictor:
                 logger.warning(f"Fold {fold} fit failed: {e}")
                 continue
                 
-            # KRİTİK DÜZELTME: Olasılık tahmini (pred_te) ile KAZANDI/KAYBETTİ durumunu (y_te_bin) kıyasla!
-            # Eski hatalı kod: spearmanr(pred_te, y_te) -> Olasılık ile gerçek dolar kazancını kıyaslıyordu.
-            ic, _ = spearmanr(pred_te, y_te_bin)
-            
-            if pd.isna(ic):
+            try:
+                auc = roc_auc_score(y_te_bin, pred_te)
+                aucs.append(auc)
+            except Exception:
                 continue
-            ics.append(ic)
             
             # MAE'yi de olasılık üzerinden hesaplıyoruz
             maes.append(mean_absolute_error(y_te_bin, pred_te))
@@ -403,6 +451,8 @@ class EnsemblePredictor:
             # Buralarda gerçek kazanç/kayıp (y_te) kullanmaya devam ediyoruz ki R-Multiple hesabı şaşmasın
             if top_mask.sum() > 0:
                 top_rs.append(y_te[top_mask].mean())
+                top_wins += (y_te[top_mask] > 0).sum()
+                top_totals += top_mask.sum()
             if bot_mask.sum() > 0:
                 bot_rs.append(y_te[bot_mask].mean())
                 
@@ -414,17 +464,32 @@ class EnsemblePredictor:
                     elif d == "SHORT":
                         short_taken.append(y_te[i])
 
-        if not ics:
+        if not aucs:
             logger.warning(
                 f"⚠️ Walk-forward hiç geçerli fold üretmedi (n={len(X)}). "
                 f"Model eğitildi ama CV metrikleri güvenilmez."
             )
             return ModelMetrics(n_train_samples=len(X))
 
-        ic_mean = float(np.mean(ics))
-        ic_std = float(np.std(ics, ddof=1)) if len(ics) > 1 else 0.0
-        ir = ic_mean / ic_std if ic_std > 1e-9 else 0.0
-        z_agg = ic_mean * np.sqrt(len(ics)) / ic_std if ic_std > 1e-9 else 0.0
+        # [MADDE 3.2] Fold AUC varyans monitör
+        if aucs:
+            logger.info(f"Fold AUC dağılımı: {[f'{auc:.3f}' for auc in aucs]}")
+            if max(aucs) - min(aucs) > 0.15:
+                logger.warning("⚠️ Fold AUC varyansı yüksek — rejim değişimi riski (Model kararsız olabilir)")
+
+        auc_mean = float(np.mean(aucs))
+        precision_top20 = float(top_wins / top_totals) if top_totals > 0 else 0.0
+
+        all_taken = long_taken + short_taken
+        expectancy = 0.0
+        if all_taken:
+            wins = [x for x in all_taken if x > 0]
+            losses = [x for x in all_taken if x <= 0]
+            win_rate = len(wins) / len(all_taken)
+            loss_rate = len(losses) / len(all_taken)
+            avg_win = float(np.mean(wins)) if wins else 0.0
+            avg_loss = abs(float(np.mean(losses))) if losses else 0.0
+            expectancy = float((win_rate * avg_win) - (loss_rate * avg_loss))
 
         avg_thr_long = float(np.median([t["LONG"] for t in thresholds_per_fold]))
         avg_thr_short = float(np.median([t["SHORT"] for t in thresholds_per_fold]))
@@ -434,21 +499,20 @@ class EnsemblePredictor:
         )
 
         return ModelMetrics(
-            spearman_ic=ic_mean, ic_std=ic_std, information_ratio=ir,
+            roc_auc=auc_mean, precision_top20=precision_top20, expectancy=expectancy,
             mae=float(np.mean(maes)),
             top_quintile_r=float(np.mean(top_rs)) if top_rs else 0.0,
             bottom_quintile_r=float(np.mean(bot_rs)) if bot_rs else 0.0,
             long_short_spread=(float(np.mean(top_rs)) - float(np.mean(bot_rs))
                                 if top_rs and bot_rs else 0.0),
-            n_folds=len(ics), n_train_samples=len(X), aggregated_z=float(z_agg),
+            n_folds=len(aucs), n_train_samples=len(X),
             long_taken_n=len(long_taken),
             long_taken_mean_r=float(np.mean(long_taken)) if long_taken else 0.0,
             short_taken_n=len(short_taken),
             short_taken_mean_r=float(np.mean(short_taken)) if short_taken else 0.0,
             threshold_long=avg_thr_long, threshold_short=avg_thr_short,
-            accuracy=float(np.clip(0.5 + ic_mean, 0, 1)),
-            auc_roc=float(np.clip(0.5 + ic_mean, 0, 1)),
-            f1=float(np.clip(0.5 + ic_mean, 0, 1)),
+            accuracy=precision_top20,
+            f1=0.0,
         )
 
     def train(self, X: pd.DataFrame, y, directions=None) -> ModelMetrics:
@@ -538,23 +602,25 @@ class EnsemblePredictor:
 
         self.last_metrics = metrics
         self._log_training_report(metrics)
+        self._save_state()         # [PERSIST] Disk'e kaydet
         return metrics
 
     def _log_training_report(self, m: ModelMetrics) -> None:
         logger.info("\n" + "=" * 60)
-        logger.info("📊 ENSEMBLE TRAINED — PROBABILITY-BASED CLASSIFICATION v3.3")
+        logger.info("📊 ENSEMBLE TRAINED — CLASSIFICATION ROC-AUC METRICS")
         logger.info("=" * 60)
         logger.info(f"Training samples : {m.n_train_samples}")
         logger.info(f"CV folds         : {m.n_folds}")
-        logger.info(f"Spearman IC      : {m.spearman_ic:+.4f} ± {m.ic_std:.4f}")
-        logger.info(f"Information Ratio: {m.information_ratio:+.2f}")
+        logger.info(f"ROC-AUC Score    : {m.roc_auc:.4f}")
+        logger.info(f"Precision@Top20  : %{m.precision_top20*100:.1f}")
+        logger.info(f"Expectancy       : {m.expectancy:+.3f}R")
         logger.info(f"Long-short spread: {m.long_short_spread:+.3f}R")
         logger.info(f"Calibrated Thresholds (Win Prob): LONG={m.threshold_long:.3f}, SHORT={m.threshold_short:.3f}")
         logger.info(f"OOS filtered: LONG n={m.long_taken_n} R={m.long_taken_mean_r:+.4f} | "
                     f"SHORT n={m.short_taken_n} R={m.short_taken_mean_r:+.4f}")
         logger.info("=" * 60)
 
-    def predict(self, feature_vector, ic_direction: Optional[str] = None) -> MLDecisionResult:
+    def predict(self, feature_vector, ic_direction: Optional[str] = None, recent_long_ratio: float = 0.5) -> MLDecisionResult:
         """
         [MADDE 1] Counterfactual dual-predict.
 
@@ -603,29 +669,60 @@ class EnsemblePredictor:
         is_weekend = now.weekday() >= 5  # 5=Saturday, 6=Sunday
         wknd_mult = WEEKEND_THRESHOLD_MULTIPLIER if is_weekend else 1.0
 
-        # [MADDE 8.C] Adaptive Thresholds (Regime Awareness)
-        # Piyasanin genel yonune gore LONG/SHORT esiklerini asimetrik ayarla
+        # [v2.2] Adaptive Thresholds — Global Regime Awareness
+        # Global piyasa rejimine (BTC bazlı) göre LONG/SHORT eşiklerini ayarla.
+        # Eski: sadece mkt_change_24h'e bakıyordu (lokal coin değişimi).
+        # Yeni: global_regime feature'ı varsa öncelikli kullan, yoksa fallback.
         regime_mult_long = 1.0
         regime_mult_short = 1.0
-        
+
+        # Global rejim feature'larını oku (feature_engineer'da eklendi)
+        def _feat(col, X):
+            return float(X[col].iloc[0]) if col in X.columns and not pd.isna(X[col].iloc[0]) else 0.0
+
+        is_global_bull     = _feat('mkt_global_bull', X_long) > 0.5
+        is_global_bear     = _feat('mkt_global_bear', X_long) > 0.5
+        is_global_volatile = _feat('mkt_global_volatile', X_long) > 0.5
+        is_global_crash    = _feat('mkt_global_crash', X_long) > 0.5
+
         change_24h = 0.0
         if 'mkt_change_24h' in X_long.columns and not pd.isna(X_long['mkt_change_24h'].iloc[0]):
             change_24h = float(X_long['mkt_change_24h'].iloc[0])
-            if change_24h > 3.0:    # Boga piyasasi (guclu yukselis)
-                regime_mult_long = 0.96   # LONG'u gevset (%4 daha kolay)
-                regime_mult_short = 1.05  # SHORT'u sikilastir (%5 daha zor)
-            elif change_24h < -3.0: # Ayi piyasasi (guclu dusus)
-                regime_mult_long = 1.05   # LONG'u sikilastir
-                regime_mult_short = 0.96  # SHORT'u gevset
+
+        if is_global_crash:
+            regime_mult_long  = 1.30  # LONG çok zorlaştır (crash → yükseliş bekleme)
+            regime_mult_short = 0.90  # SHORT kolaylaştır
+        elif is_global_bear:
+            regime_mult_long  = 1.10  # LONG zorlaştır
+            regime_mult_short = 0.94  # SHORT hafif kolaylaştır
+        elif is_global_bull:
+            regime_mult_long  = 0.94  # LONG kolaylaştır
+            regime_mult_short = 1.10  # SHORT zorlaştır
+        elif is_global_volatile:
+            regime_mult_long  = 1.08  # Her iki yönü zorlaştır
+            regime_mult_short = 1.08
+        else:
+            # Fallback: eski mkt_change_24h bazlı ayar
+            if change_24h > 3.0:
+                regime_mult_long = 0.96
+                regime_mult_short = 1.05
+            elif change_24h < -3.0:
+                regime_mult_long = 1.05
+                regime_mult_short = 0.96
+
+        # [MADDE 3.1] Sample-based Adaptive Threshold KALDIRILDI
+        # LONG/SHORT oranını suni olarak dengelemek yerine modelin doğal
+        # sinyallerine güvenmek daha sağlıklı (önceden düşük WR ile zayıf LONG'lar açıyordu).
+        sample_mult_long = 1.0
 
         thr_long  = min(0.70, max(HARD_THRESHOLD_FLOOR_LONG, self.threshold_long * wknd_mult * regime_mult_long))
         thr_short = min(0.70, max(HARD_THRESHOLD_FLOOR_SHORT, self.threshold_short * wknd_mult * regime_mult_short))
 
-        if is_weekend or regime_mult_long != 1.0:
+        if is_weekend or regime_mult_long != 1.0 or sample_mult_long != 1.0:
             logger.debug(
                 f"  Thresholds ayarlandi: LONG {self.threshold_long:.3f}->{thr_long:.3f}, "
                 f"SHORT {self.threshold_short:.3f}->{thr_short:.3f} "
-                f"(Weekend: {is_weekend}, 24h: {change_24h:+.1f}%)"
+                f"(Weekend: {is_weekend}, 24h: {change_24h:+.1f}%, long_ratio: {recent_long_ratio:.2f})"
             )
 
         # Karar: En yuksek olasilik esigi gecen yon secilir

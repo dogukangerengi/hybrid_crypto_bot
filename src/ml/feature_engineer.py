@@ -286,6 +286,8 @@ class FeatureEngineer:
             True → feature istatistiklerini logla (debug için faydalı)
         """
         self.verbose = verbose                 # Detaylı log mesajları açık/kapalı
+        self._cache = {}                       # In-memory feature cache
+        self._cache_clear_time = datetime.now(timezone.utc)
 
     # =========================================================================
     # ANA METOD: TÜM FEATURE'LARI BİRLEŞTİR
@@ -295,7 +297,8 @@ class FeatureEngineer:
         self,
         analysis: Any,                         # CoinAnalysisResult objesi (main.py'den)
         ohlcv_df: Optional[pd.DataFrame] = None,  # En iyi TF'nin OHLCV verisi
-        all_tf_analyses: Optional[List[Dict]] = None  # Tüm TF analizleri (_analyze_coin'den)
+        all_tf_analyses: Optional[List[Dict]] = None,  # Tüm TF analizleri (_analyze_coin'den)
+        use_cache: bool = True                 # False → eğitim çağrılarında cache'i atla
     ) -> MLFeatureVector:
         """
         Tek bir coin için tüm feature'ları hesapla ve birleştir.
@@ -316,6 +319,12 @@ class FeatureEngineer:
             Tüm timeframe analizlerinin listesi (cross-TF feature'lar için)
             Her dict: {'tf', 'composite', 'direction', 'sig_count', 'top_ic', ...}
             None ise cross-TF feature'lar ortalama değer alır
+
+        use_cache : bool, default True
+            True → canlı taramada aynı dakika/sembol için cache kullan (performans)
+            False → eğitim (initial_train, retrain) çağrılarında cache ATLANIYOR
+            ÖNEMLİ: initial_train aynı sembol ile yüzlerce farklı bar için çağrılır,
+            cache açık olursa tüm satırlar aynı feature vektörünü alır (BUG!).
             
         Returns:
         -------
@@ -327,6 +336,24 @@ class FeatureEngineer:
             coin=getattr(analysis, 'coin', ''),           # Kısa coin adı
             timestamp=datetime.now(timezone.utc).isoformat(),  # Feature oluşturma zamanı
         )
+
+        # ── IN-MEMORY FEATURE CACHE ──
+        # Aynı dakika içinde aynı sembol için tekrar hesaplama yapmamak için cache
+        # NOT: Eğitim çağrılarında (use_cache=False) tamamen atlanır.
+        #      initial_train aynı sembolle 162+ kez çağırır → cache açıksa hepsi aynı olur!
+        cache_key = None
+        if use_cache:
+            now = datetime.now(timezone.utc)
+            if (now - self._cache_clear_time).total_seconds() > 3600:
+                self._cache = {}
+                self._cache_clear_time = now
+                
+            cache_key = f"{vec.symbol}_{now.strftime('%Y-%m-%d %H:%M')}"
+            if cache_key in self._cache:
+                if self.verbose:
+                    logger.debug(f"  🧬 Feature: {vec.symbol} için cache'den kullanılıyor.")
+                import copy
+                return copy.deepcopy(self._cache[cache_key])
 
         # Her feature grubunu hesapla ve vektöre ekle
         vec.ic_features = self._build_ic_features(analysis)           # IC bazlı
@@ -351,6 +378,8 @@ class FeatureEngineer:
                 f"{n_nan} NaN | Coin: {vec.coin}"
             )
 
+        if use_cache and cache_key:
+            self._cache[cache_key] = vec
         return vec
 
     # =========================================================================
@@ -493,6 +522,23 @@ class FeatureEngineer:
         features['mkt_regime_volatile'] = (                  # 1.0 = aşırı volatil piyasa
             1.0 if regime == 'volatile' else 0.0
         )
+
+        # [v2.2] Global Piyasa Rejimi Feature'ları (BTC + ETH bazlı)
+        # Bu feature'lar tek coin'in lokal ADX'i yerine tüm piyasanın durumunu yansıtır.
+        # ML modeli "crash döneminde SHORT'lar daha karlı" gibi kalıpları öğrenebilir.
+        global_regime = getattr(analysis, 'global_regime', 'ranging') or 'ranging'
+
+        features['mkt_global_bull']     = 1.0 if global_regime == 'bull_trend'      else 0.0  # BTC yükseliş trendi
+        features['mkt_global_bear']     = 1.0 if global_regime == 'bear_trend'      else 0.0  # BTC düşüş trendi
+        features['mkt_global_ranging']  = 1.0 if global_regime == 'ranging'         else 0.0  # Yatay piyasa
+        features['mkt_global_volatile'] = 1.0 if global_regime == 'high_volatility' else 0.0  # Aşırı volatil
+        features['mkt_global_crash']    = 1.0 if global_regime == 'crash'           else 0.0  # Crash senaryosu
+
+        # Global rejim ile lokal rejim uyumu: Her ikisi de aynı yönde mi?
+        # local_trending=1, global_bull=1 → tam uyum (1.0) → güçlü sinyal
+        local_trend = 1.0 if regime in ('trending', 'trending_up', 'trending_down') else 0.0
+        global_trend = 1.0 if global_regime in ('bull_trend', 'bear_trend') else 0.0
+        features['mkt_regime_alignment'] = 1.0 if (local_trend == global_trend == 1.0) else 0.0
 
         return features
 

@@ -1,39 +1,33 @@
-venv/
-__pycache__/
-.DS_Store
-.env
-.env 
-logs/
-*.log
-.env
-.DS_Store
-__pycache__/
-venv/
-.env*
-
-# Güncelleme script yedekleri
-*.bak_*
-
-# Güncelleme scriptleri (tek seferlik)
-update_*.py
-
-# Temizlik scriptleri
-cleanup_*.py
-
-# Test scriptleri
-smoke_test_*.py
-main
-main
-
-# Hassas ve türetilmiş dosyalar
-config/secrets.yaml
-config/api_keys.yaml
-*.pkl
-*.pickle
-models/
-logs/
+# Python
 __pycache__/
 *.pyc
-.DS_Store
+*.pyo
 venv/
+
+# Secrets
 .env
+config/secrets.yaml
+config/api_keys.yaml
+
+# OS
+.DS_Store
+.mypy_cache/
+
+# Logs & Data
+logs/
+*.log
+
+# Models
+models/
+*.pkl
+*.pickle
+
+# IDE
+.vscode/
+.idea/
+
+# Tek seferlik scriptler
+update_*.py
+cleanup_*.py
+smoke_test_*.py
+*.bak_*

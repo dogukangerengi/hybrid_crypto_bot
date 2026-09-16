@@ -194,7 +194,7 @@ logger = logging.getLogger(__name__)
 # SABİTLER
 # =============================================================================
 
-VERSION                = "2.1.12"
+VERSION                = "2.1.18"
 MAX_COINS_PER_CYCLE    = 30
 DEFAULT_FWD_PERIOD     = 12  # [FWD WINDOW DÜZELTMESİ] 6 → 12 bar
 # Sebep: 6 bar çok kısa — TP/SL'ye ulaşan bar sayısı toplam verinin yalnızca %9'u.
@@ -210,7 +210,7 @@ ERROR_COOLDOWN_SECONDS = 300
 # Mantık: Sinyal edge'i bayatlamış, slot fırsat maliyeti artıyor.
 # Kâr ile kapanan TIMEOUT trade'leri model retrain'inde WIN olarak öğrenilir
 # (trade_memory pnl > 0 ise outcome=WIN atar, exit_reason'a bakmaz).
-MAX_TRADE_AGE_HOURS    = 24
+MAX_TRADE_AGE_HOURS    = 18
 
 DEFAULT_TIMEFRAMES = {
     '5m': 1500,
@@ -230,7 +230,7 @@ DEFAULT_TIMEFRAMES = {
 #   Bu nedenle threshold'ları 10/12 → 7/9'a indiriyoruz.
 #   Filtre GERÇEKTE sıkılaşıyor: cross-avg 7 = "tüm TF'lerin ortalaması ≥ 7"
 #   Bu, tek bir TF'nin 12 göstermesinden çok daha güçlü bir sinyal kalitesidir.
-IC_NO_TRADE = 7.0
+IC_NO_TRADE = 5.0
 IC_TRADE    = 9.0
 
 # [v2.1.12] Pure IC Bypass Mode
@@ -351,14 +351,16 @@ class MLTradingPipeline:
         self.fetcher      = BinanceFetcher()
         self.preprocessor = DataPreprocessor()
         self.calculator   = IndicatorCalculator()
-        self.selector     = IndicatorSelector(alpha=0.05)
+        _sel_alpha  = 0.15   # settings.yaml: analysis.selector.alpha
+        _sel_min_ic = 0.01   # settings.yaml: analysis.selector.min_ic
+        self.selector     = IndicatorSelector(alpha=_sel_alpha, min_ic_override=_sel_min_ic)
         self.risk_manager = RiskManager()
         self.executor     = BinanceExecutor(dry_run=dry_run)
         self.notifier     = TelegramNotifier()
         self.paper_trader = PaperTrader(initial_balance=1000.0)
 
         self.feature_eng  = FeatureEngineer()
-        self.lgbm_model   = LGBMSignalModel()
+        self.lgbm_model   = LGBMSignalModel(model_dir = str(_root_dir / "models"))
         self.validator    = SignalValidator()
         self.trade_memory = TradeMemory(log_dir = _root_dir / "logs")
 
@@ -375,9 +377,7 @@ class MLTradingPipeline:
         # Paper modda bu flag devreye girmez (dry_run=True ise engelleme yok).
         self._model_deployment_approved: bool = False
 
-        # [v2.1.14] Otomatik Bypass devre dışı — ML her zaman aktif.
-        # pure_ic_mode her zaman False; _evaluate_sanity_and_set_bypass sadece loglama yapıyor.
-        self.pure_ic_mode: bool = False
+        # pure_ic_mode tamamen silindi (Madde 1.2 isteği üzerine)
 
         # [v2.1.15] Walk-forward validation: retrain'de son %%20 trade ID'leri
         # burada saklanır. _validate_initial_model sadece bu set üzerine OOS IC ölçer.
@@ -393,6 +393,13 @@ class MLTradingPipeline:
         self._daily_realized_pnl: float           = 0.0    # Bugünkü gerçekleşen PnL
         self._daily_halt_until: Optional[datetime] = None  # Halt bitiş zamanı (UTC-aware datetime)
         self._startup_reconciliation_done: bool   = False  # Startup reconciliation bitti mi?
+
+        # ── GLOBAL MARKET REJİM STATE (v2.2) ───────────────────────────────────────────
+        # BTC + ETH bazlı global piyasa rejimi. Her döngüde _detect_global_regime() ile güncellenir.
+        # bull_trend / bear_trend / ranging / high_volatility / crash
+        self._global_regime: str            = "ranging"  # Mevcut global rejim
+        self._prev_global_regime: str       = "ranging"  # Önceki döngünün rejimi (geçiş tespiti için)
+        self._regime_shift_skip: bool       = False      # True → bu döngüde trade açma (geçiş koruyucu)
 
         self._restore_cooldowns()
 
@@ -781,50 +788,41 @@ class MLTradingPipeline:
         """
         Model deployment istatistiksel kapılarını kontrol eder.
 
-        [MADDE 9] Çoklu gate kontrolü:
-        1. IC >= 0.05   → minimum ekonomik anlam (Grinold-Kahn)
-        2. Z >= 1.65    → p < 0.05 istatistiksel anlamlılık (tek kuyruk)
-        3. |L-S| >= 0.05R → model yön ayırt edebiliyor
-
-        Onceki: IC > 0 ise onayla. Yeni: tum kapilar gecmeli.
+        Çoklu gate kontrolü (Classification tabanlı):
+        1. ROC-AUC >= 0.52   → Model rastgeleden iyi olmalı
+        2. Expectancy > 0.05R  → Pozitif dolar beklentisi yaratmalı
+        3. |L-S| >= 0.05R → Model yön ayırt edebiliyor
 
         Returns:
             True  → model onaylandı, canlıya geçilebilir
             False → model yetersiz, paper modda kalinmali
         """
-        n_folds = getattr(metrics, 'n_folds', 0)
-        ic_std  = getattr(metrics, 'ic_std', 1.0)
-        aggregated_z = (
-            metrics.spearman_ic * (n_folds ** 0.5) / ic_std
-            if ic_std > 1e-9 and n_folds > 0 else 0.0
-        )
-
         gates = {
-            "IC >= 0.05  (min. ekonomik anlam)": metrics.spearman_ic >= 0.05,
-            "Z >= 1.65    (p <= 0.05, tek kuyruk)": aggregated_z >= 1.65,
-            "|L-S| >= 0.05R  (yon ayirt gucu)": abs(metrics.long_short_spread) >= 0.05,
+            "ROC-AUC >= 0.52 (model ogrenebiliyor)": metrics.roc_auc >= 0.52,
+            "Expectancy > 0.05R (pozitif beklenti)": metrics.expectancy > 0.05,
+            "|L-S| >= 0.05R (yon ayirt gucu)": abs(metrics.long_short_spread) >= 0.05,
         }
 
-        # Hard block: IC negatif veya sifir
-        if metrics.spearman_ic < 0:
+        # Hard block: ROC-AUC 0.5'in altında
+        if metrics.roc_auc < 0.50:
             passed = False
             logger.warning(
-                f"  ⛔ GATE HARD-BLOCK: IC={metrics.spearman_ic:+.4f} NEGATIF — "
+                f"  ⛔ GATE HARD-BLOCK: ROC-AUC={metrics.roc_auc:.4f} < 0.50 — "
                 f"model rastgeleden KOTU tahmin yapiyor. Canli trade engellendi."
             )
-        elif metrics.spearman_ic == 0.0:
+        elif metrics.roc_auc == 0.0:
             passed = False
-            logger.warning("  ⛔ GATE HARD-BLOCK: IC=0.0 — model egitilmedi (cold start).")
+            logger.warning("  ⛔ GATE HARD-BLOCK: ROC-AUC=0.0 — model egitilmedi (cold start).")
         else:
-            passed = all(gates.values())  # [MADDE 9] Tum kapilar gecmeli
+            passed = all(gates.values())
 
         # Log
         logger.info(f"\n{'-'*60}")
-        logger.info("  MODEL DEPLOYMENT GATE KONTROLU [MADDE 9]")
+        logger.info("  MODEL DEPLOYMENT GATE KONTROLU (CLASSIFICATION)")
         logger.info(f"{'-'*60}")
-        logger.info(f"  Spearman IC    : {metrics.spearman_ic:+.4f}  (esik: >= 0.05)")
+        logger.info(f"  ROC-AUC        : {metrics.roc_auc:.4f}  (esik: >= 0.52)")
+        logger.info(f"  Expectancy     : {metrics.expectancy:+.3f}R (esik: > 0.05R)")
         logger.info(f"  L-S Spread     : {metrics.long_short_spread:+.3f}R  (esik: |>=0.05R)")
-        logger.info(f"  Aggregated Z   : {aggregated_z:+.2f}   (esik: >= 1.65, p<=0.05)")
         logger.info(f"{'-'*60}")
         for gate_name, gate_result in gates.items():
             icon = "OK" if gate_result else "FAIL"
@@ -849,7 +847,7 @@ class MLTradingPipeline:
                     self.notifier.send_message_sync(
                         f"DEPLOYMENT GATE BASARISIZ\n"
                         f"{safe_gate_lines}\n"
-                        f"Z={aggregated_z:.2f} | IC={metrics.spearman_ic:.4f}\n"
+                        f"ROC-AUC={metrics.roc_auc:.4f} | Expectancy={metrics.expectancy:+.3f}\n"
                         f"Canli trade DURDURULDU. Paper modda devam ediyor."
                     )
             except Exception:
@@ -886,6 +884,76 @@ class MLTradingPipeline:
             logger.warning(f"  ⚠️ Rejim tespiti hatası: {e}")
             return 'ranging'
 
+
+
+    def _detect_global_regime(self) -> str:
+        """
+        Global piyasa rejimini BTC + ETH verisiyle tespit eder.
+
+        Bireysel coin ADX'i yerine piyasanın genel durumunu ölçer:
+          bull_trend     → BTC güçlü yükseliş trendi
+          bear_trend     → BTC güçlü düşüş trendi
+          ranging        → Yatay piyasa, trend yok
+          high_volatility → ATR yüksek, piyasa kaotik
+          crash          → BTC 24h > -%5 ve volatil → tüm LONG'lar bloklanır
+
+        Returns:
+            str: global rejim etiketi
+        """
+        try:
+            df_btc = self.fetcher.fetch_ohlcv("BTC/USDT:USDT", "1h", limit=100)
+            if df_btc is None or len(df_btc) < 50:
+                return self._global_regime  # API hatası → önceki rejimi koru
+
+            df_btc = self.preprocessor.full_pipeline(df_btc)
+            df_btc = self.calculator.calculate_all(df_btc)
+
+            close    = df_btc["close"].dropna()
+            if len(close) < 30:
+                return self._global_regime
+
+            # ── Metrikler ──
+            change_24h = float((close.iloc[-1] / close.iloc[-25] - 1) * 100) if len(close) > 25 else 0.0
+            returns_20 = close.pct_change().tail(20).dropna()
+            vol_20     = float(returns_20.std()) if len(returns_20) > 5 else 0.03
+
+            # ADX
+            adx_col = next((c for c in df_btc.columns
+                            if c.upper().startswith("ADX") and "DMP" not in c.upper() and "DMN" not in c.upper()), None)
+            adx = float(df_btc[adx_col].dropna().iloc[-1]) if adx_col and not df_btc[adx_col].dropna().empty else 20.0
+
+            # EMA yönü (kısa/uzun EMA karşılaştırması)
+            ema20 = close.ewm(span=20, adjust=False).mean().iloc[-1]
+            ema50 = close.ewm(span=50, adjust=False).mean().iloc[-1]
+            price_now = float(close.iloc[-1])
+
+            # ── Kural tabanlı rejim ──
+            # 1. CRASH: Ani sert düşüş
+            if change_24h < -5.0 and vol_20 > 0.025:
+                regime = "crash"
+            # 2. HIGH_VOLATILITY: Yüksek volatilite
+            elif vol_20 > 0.030:
+                regime = "high_volatility"
+            # 3. BULL_TREND: BTC yükseliş trendinde
+            elif adx > 25 and ema20 > ema50 and price_now > ema20:
+                regime = "bull_trend"
+            # 4. BEAR_TREND: BTC düşüş trendinde
+            elif adx > 25 and ema20 < ema50 and price_now < ema20:
+                regime = "bear_trend"
+            # 5. RANGING: ADX düşük, net trend yok
+            else:
+                regime = "ranging"
+
+            logger.info(
+                f"🌐 Global Rejim: {regime.upper()} | "
+                f"BTC 24h={change_24h:+.1f}% | ADX={adx:.1f} | "
+                f"Vol20={vol_20:.3f} | EMA20>50={ema20>ema50}"
+            )
+            return regime
+
+        except Exception as e:
+            logger.warning(f"⚠️ Global rejim tespiti hatası: {e}")
+            return self._global_regime  # Hata durumunda önceki rejimi koru
 
     @staticmethod
     def _compute_category_tops(
@@ -1154,33 +1222,27 @@ class MLTradingPipeline:
 
             result.market_regime = self._detect_regime(indicator_data[best_tf])
 
-            # [HARD BLOCK: Regime Awareness]
-            if result.market_regime == 'ranging':
-                # Hard block yerine IC'yi %25 cezalandır, ML karar versin
-                result.ic_confidence *= 0.75
-                logger.info(
-                    f"[{symbol}] RANGING penaltı: IC {result.ic_confidence/0.75:.1f} → "
-                    f"{result.ic_confidence:.1f} (×0.75)"
-                )
-                # Ceza sonrası gate eşiğini geçemiyorsa zaten WAIT döner
+            # [REJİM BAZLI GATE KEEPER (Kullanıcı İsteği)]
+            # Ranging ve Volatile rejimlerde işlem sıklığını korumak ama kaliteyi artırmak için
+            # Gate Keeper (IC Confidence) skorunun kesin olarak > 9.5 olması istenir.
+            # (Not: v2.1.5 sonrası IC_TRADE=9.0'a düştüğü için 20.0 eşiği ulaşılamaz olmuştu.)
+            if result.market_regime in ['ranging', 'volatile']:
+                if result.ic_confidence <= 9.5:
+                    logger.info(
+                        f"[{symbol}] {result.market_regime.upper()} Rejimi: "
+                        f"IC Skoru ({result.ic_confidence:.1f}) <= 9.5, işlem reddedildi."
+                    )
+                    result.status = f"regime_blocked_{result.market_regime}"
+                    return result
 
-            # [REJİM ÇARPAN REVİZYONU] — Daha dengeli çarpanlar
-            # trending  → ×1.10 (trend sinyalini hafif güçlendir, model güvenilir)
-            # ranging   → ×1.00 (zaten yukarıda ×0.75 penaltı uygulandı, çift ceza önle)
-            # volatile  → ×0.50 (güçlü ceza — yüksek volatilite, model güvensiz)
-            #
-            # [ÇİFT CEZA DÜZELTMESİ v2.1.17]
-            # Eski: ranging ×0.75 (satır ~1127) + ×0.85 (bu dict) = ×0.6375 TOPLAM
-            # Sorun: IC=20 (full_trade eşiği) → 20×0.6375=12.75 → trade eşiği geçemiyor
-            #        Yani soft penalty aslında hard block kadar katıydı.
-            # Yeni: ranging ×0.75 (satır ~1127) + ×1.00 (bu dict) = ×0.75 TOPLAM
-            #       IC=27 olan bir ranging coin artık 27×0.75=20.25 → tam eşikte trade açabilir.
+            # [REJİM ÇARPAN REVİZYONU]
+            # Sıkı rejim kontrolü yukarıda yapıldığı için çarpanlar sadeleştirildi.
             REGIME_PENALTY = {
                 'trending':     1.10,
                 'trending_up':  1.10,
                 'trending_down': 1.10,
-                'ranging':      1.00,  # [v2.1.17] 0.85 → 1.00: yukarıdaki ×0.75 yeterli, çift ceza kaldırıldı
-                'volatile':     0.50,
+                'ranging':      1.00,
+                'volatile':     1.00,
                 'transitioning': 0.90,
                 'unknown':      0.85,
             }
@@ -1232,6 +1294,8 @@ class MLTradingPipeline:
             # SL mesafesi %40-50'ye çıkıyor ve risk yönetimi anlamsız kırpmalar yapıyor.
             # %20 eşiği: normal kripto hareketi %1-6, tehlikeli bölge >%8, aşırı >%20
             MAX_VOL_PCT = 20.0
+            MIN_ATR_PCT = 0.5
+            
             if result.atr_pct > MAX_VOL_PCT:
                 logger.info(
                     f"   🚫 {result.coin} VOL BLOK: ATR%={result.atr_pct:.1f}% > %{MAX_VOL_PCT:.0f} "
@@ -1239,38 +1303,42 @@ class MLTradingPipeline:
                 )
                 result.status = "vol_blocked"
                 return result
+                
+            if result.atr_pct < MIN_ATR_PCT:
+                logger.info(
+                    f"   🚫 {result.coin} VOL BLOK: ATR%={result.atr_pct:.2f}% < %{MIN_ATR_PCT:.1f} "
+                    f"(çok yatay, kâr komisyonu kurtarmaz)"
+                )
+                result.status = "vol_blocked"
+                return result
+
 
             if not self.lgbm_model.is_trained:
                 result.ml_skipped = True
                 result.status = "model_not_trained"
                 return result
 
-            # [v2.1.12] Pure IC Bypass — ML/Validator katmanını atla
-            # Sebep: Sanity check IC ≤ 0 dönerse model anti-edge öğrenmiş olabilir.
-            #   Bu durumda ML tahminleri gerçek IC sinyalini maskeleyebilir.
-            #   PURE_IC_MODE=True olduğunda yalnızca IC gate kararı kullanılır.
-            # Not: RiskManager (SL, TP, position size) her iki modda da aynen çalışır.
-            if self.pure_ic_mode:
-                if result.ic_direction in ('LONG', 'SHORT'):
-                    result.ml_skipped = True
-                    result.ml_result  = None
-                    result.val_result = None
-                    result.status     = "ready"
-                    logger.info(
-                        f"   [PURE_IC] {result.coin}: ic={result.ic_confidence:.1f} "
-                        f"dir={result.ic_direction} → ML bypass, trade onaylandı"
-                    )
-                else:
-                    result.status = "neutral_direction"
-                return result
+
+
+            # [v2.2] Global rejimi analysis objesine ekle → feature_engineer kullanabilsin
+            result.global_regime = getattr(self, '_global_regime', 'ranging')
 
             fv = self.feature_eng.build_features(
                 analysis   = result,
                 ohlcv_df   = df_best
             )
 
+            # [MADDE 3.1] Adaptive Thresholding - Geçmiş LONG oranını hesapla
+            recent_trades = getattr(self, 'trade_memory', None)
+            recent_long_ratio = 0.5
+            if recent_trades and hasattr(recent_trades, 'get_recent_closed'):
+                closed_records = recent_trades.get_recent_closed(n=30)
+                if closed_records:
+                    long_count = sum(1 for t in closed_records if getattr(t, 'direction', '') == 'LONG')
+                    recent_long_ratio = long_count / len(closed_records)
+
             ml_result = self.lgbm_model.predict(
-                fv, ic_direction=result.ic_direction
+                fv, ic_direction=result.ic_direction, recent_long_ratio=recent_long_ratio
             )
             result.ml_result = ml_result
 
@@ -1380,12 +1448,9 @@ class MLTradingPipeline:
         if result.status != "ready":
             return result
 
-        if self.pure_ic_mode and getattr(result, 'ml_skipped', False):
-            direction = result.ic_direction
-        else:
-            if result.ml_result is None:
-                return result
-            direction = result.ml_result.decision.value
+        if getattr(result, 'ml_result', None) is None:
+            return result
+        direction = result.ml_result.decision.value
 
         if direction == "WAIT" or not direction:
             return result
@@ -1438,6 +1503,12 @@ class MLTradingPipeline:
             )
 
             if self.dry_run:
+                current_open_symbols = {t.symbol for t in self.paper_trader.open_trades.values()}
+                if result.coin in current_open_symbols or result.full_symbol in current_open_symbols:
+                    result.status = "already_open"
+                    logger.info(f"   ⏭️  {result.coin} atlandı: Sanal borsada zaten açık pozisyon mevcut.")
+                    return result
+
                 self.paper_trader.open_trade(
                     symbol        = result.coin,
                     full_symbol   = result.full_symbol,
@@ -1568,7 +1639,6 @@ class MLTradingPipeline:
                             "AI Yön": _ml_dir,
                             "AI Güven": round(_ml_conf, 1),
                             "ML-IC": "✓" if _ml_dir == getattr(result, 'ic_direction', '') else "✗",
-                            "AI Karar": _ml_dir,   # Geriye dönük uyumluluk
                             "Durum": "open",
                             "Çıkış Nedeni": "",
                             "Süre (dk)": ""
@@ -1797,7 +1867,11 @@ class MLTradingPipeline:
                             try:
                                 matched = False
                                 for mem_id, mem_trade in list(self.trade_memory.open_trades.items()):
-                                    if mem_trade.symbol == trade.full_symbol or mem_trade.coin == trade.symbol:
+                                    # [DÜZELTME] Daha sağlam trade eşleştirme mantığı
+                                    clean_trade_symbol = str(trade.symbol).replace('USDT', '').replace('/', '').split(':')[0]
+                                    if (mem_trade.symbol == trade.full_symbol or 
+                                        mem_trade.coin == trade.symbol or 
+                                        mem_trade.coin == clean_trade_symbol):
                                         actual_pnl = trade.pnl_absolute if trade.pnl_absolute else 0.0
                                         self.trade_memory.close_trade(
                                             trade_id=mem_id,
@@ -2052,46 +2126,48 @@ class MLTradingPipeline:
                             logger.debug(f"   ⏳ {mem_coin} borsa onayı bekleniyor... (Kalan: {int(120-time_open_sec)}s)")
                             continue
 
-                        logger.info(f"   🔍 {mem_coin} pozisyonu kapalı bulundu → kapanış nedeni araştırılıyor...")
+                        logger.info(f"   🔍 {mem_coin} pozisyonu kapalı bulundu → Binance API'den gerçek kapanış fiyatı araştırılıyor...")
 
                         close_reason = "Manuel / API"
                         exit_price = mem_trade.entry_price
 
                         try:
-                            ohlcv = self.fetcher.fetch_ohlcv(mem_trade.symbol, timeframe="1m", limit=5)
-
-                            if ohlcv is not None and not ohlcv.empty:
-                                max_high = float(ohlcv['high'].max())
-                                min_low = float(ohlcv['low'].min())
-                                current_price = float(ohlcv['close'].iloc[-1])
-
-                                dist_tp = abs(current_price - float(mem_trade.tp_price))
-                                dist_sl = abs(current_price - float(mem_trade.sl_price))
-
-                                if mem_trade.direction == "LONG":
-                                    if min_low <= mem_trade.sl_price:
-                                        close_reason = "SL Hit"
-                                        exit_price = mem_trade.sl_price
-                                    elif max_high >= mem_trade.tp_price:
-                                        close_reason = "TP Hit"
-                                        exit_price = mem_trade.tp_price
-                                    else:
-                                        close_reason = "TP Hit" if dist_tp < dist_sl else "SL Hit"
-                                        exit_price = mem_trade.tp_price if dist_tp < dist_sl else mem_trade.sl_price
-
-                                elif mem_trade.direction == "SHORT":
-                                    if max_high >= mem_trade.sl_price:
-                                        close_reason = "SL Hit"
-                                        exit_price = mem_trade.sl_price
-                                    elif min_low <= mem_trade.tp_price:
-                                        close_reason = "TP Hit"
-                                        exit_price = mem_trade.tp_price
-                                    else:
-                                        close_reason = "TP Hit" if dist_tp < dist_sl else "SL Hit"
-                                        exit_price = mem_trade.tp_price if dist_tp < dist_sl else mem_trade.sl_price
-
-                        except Exception as ohlcv_err:
-                            logger.warning(f"   ⚠️ {mem_coin} OHLCV kontrol hatası: {ohlcv_err}")
+                            recent_trades = self.executor.fetch_my_trades(mem_trade.symbol, limit=20)
+                            
+                            mem_opened = datetime.fromisoformat(mem_trade.opened_at)
+                            if mem_opened.tzinfo is None:
+                                mem_opened = mem_opened.replace(tzinfo=timezone.utc)
+                                
+                            exit_trades = []
+                            expected_side = 'sell' if mem_trade.direction == 'LONG' else 'buy'
+                            
+                            for t in recent_trades:
+                                t_time = datetime.fromtimestamp(t['timestamp']/1000, tz=timezone.utc) if 'timestamp' in t and t['timestamp'] else datetime.now(timezone.utc)
+                                if t_time >= mem_opened and t.get('side') == expected_side:
+                                    exit_trades.append(t)
+                                    
+                            if exit_trades:
+                                total_qty = sum(float(t.get('amount', 0)) for t in exit_trades)
+                                if total_qty > 0:
+                                    exit_price = sum(float(t.get('price', 0)) * float(t.get('amount', 0)) for t in exit_trades) / total_qty
+                                else:
+                                    exit_price = float(exit_trades[-1].get('price', mem_trade.entry_price))
+                                
+                                dist_tp = abs(exit_price - mem_trade.tp_price)
+                                dist_sl = abs(exit_price - mem_trade.sl_price)
+                                close_reason = "TP Hit" if dist_tp < dist_sl else "SL Hit"
+                            else:
+                                # Fallback OHLCV
+                                logger.info(f"   ⚠️ {mem_coin} borsa işlem geçmişinde bulunamadı, OHLCV tahmini yapılıyor...")
+                                ohlcv = self.fetcher.fetch_ohlcv(mem_trade.symbol, timeframe="1m", limit=5)
+                                if ohlcv is not None and not ohlcv.empty:
+                                    current_price = float(ohlcv['close'].iloc[-1])
+                                    dist_tp = abs(current_price - float(mem_trade.tp_price))
+                                    dist_sl = abs(current_price - float(mem_trade.sl_price))
+                                    close_reason = "TP Hit" if dist_tp < dist_sl else "SL Hit"
+                                    exit_price = mem_trade.tp_price if dist_tp < dist_sl else mem_trade.sl_price
+                        except Exception as fetch_err:
+                            logger.warning(f"   ⚠️ {mem_coin} trade geçmişi çekilemedi: {fetch_err}")
 
                         safe_entry = float(mem_trade.entry_price or 0)
                         safe_exit = float(exit_price or safe_entry)
@@ -2262,6 +2338,25 @@ class MLTradingPipeline:
         # ── Günlük state sıfırlama (gün değişimi kontrolü) ──
         self._reset_daily_state_if_new_day()
 
+        # ── [v2.2] Global Rejim Güncelle ──────────────────────────────────────
+        # BTC/ETH bazlı global piyasa rejimini tespit et.
+        # Bu rejim tüm coin değerlendirme ve pozisyon kararlarını etkiler.
+        try:
+            self._prev_global_regime = self._global_regime
+            self._global_regime      = self._detect_global_regime()
+            # Rejim geçiş koruyucu: Rejim değiştiyse bu döngüde trade açma
+            if self._global_regime != self._prev_global_regime:
+                self._regime_shift_skip = True
+                logger.warning(
+                    f"⚠️ [REJİM GEÇİŞİ] {self._prev_global_regime.upper()} → {self._global_regime.upper()} "
+                    f"| Bu döngü trade atlanıyor (cooldown)."
+                )
+            else:
+                self._regime_shift_skip = False
+        except Exception as _re:
+            logger.warning(f"Global rejim güncellenemedi: {_re}")
+            self._regime_shift_skip = False
+
         # ── Kill switch (canlı bakiye refresh edilir) ──
         if self._check_kill_switch():
             report.status = CycleStatus.KILLED
@@ -2298,6 +2393,13 @@ class MLTradingPipeline:
 
             logger.info(f"\n🔬 ML analizi ({len(coins)} coin)...")
             results = []
+
+            # [v2.2] Rejim geçiş koruyucu: Rejim değiştiyse bu döngüde sadece analiz yap, trade açma
+            if self._regime_shift_skip:
+                logger.warning(
+                    f"🛡️ [REJİM GEÇİŞ COOLDOWN] {self._prev_global_regime.upper()} → {self._global_regime.upper()} "
+                    f"| Trade açılmayacak, analiz devam ediyor."
+                )
 
             if self.dry_run:
                 open_coins = [trade.symbol for trade in self.paper_trader.open_trades.values()]
@@ -2340,10 +2442,49 @@ class MLTradingPipeline:
                         logger.info("   🛑 Döngü ortasında günlük halt devreye girdi — kalan sinyaller iptal")
                         break
                     
+                    # Güncel open_coins al (Döngü içinde açılanları atlamak için)
+                    if self.dry_run:
+                        current_open_coins = [t.symbol for t in self.paper_trader.open_trades.values()]
+                    else:
+                        current_open_coins = [m.coin for m in self.trade_memory.open_trades.values()]
+                        
+                    if r.coin in current_open_coins:
+                        logger.info(f"   ⏭️ {r.coin} atlanıyor (Döngü içinde pozisyon açıldı)")
+                        continue
+
                     # [PORTFÖY KORELASYON KONTROLÜ]
-                    if self._check_portfolio_correlation(r.full_symbol, open_coins):
+                    if self._check_portfolio_correlation(r.full_symbol, current_open_coins):
                         r.status = "correlation_blocked"
                         continue
+
+                    # [v2.2] Rejim Geçiş Bloku: Rejim değiştiyse trade açma
+                    if self._regime_shift_skip:
+                        logger.info(f"   🛡️ {r.coin} atlanıyor (Rejim geçiş cooldown: {self._prev_global_regime}→{self._global_regime})")
+                        r.status = "regime_shift_cooldown"
+                        continue
+
+                    # [v2.2] CRASH Bloku: LONG pozisyon açma
+                    if self._global_regime == "crash" and getattr(r, 'ic_direction', '') == 'LONG':
+                        logger.warning(f"   💥 {r.coin} LONG BLOK: Global rejim CRASH — sadece SHORT kabul edilir")
+                        r.status = "crash_long_blocked"
+                        continue
+
+                    # [v2.2] Adaptif Pozisyon Büyüklüğü: Rejime göre risk çarpanı
+                    REGIME_RISK_MULT = {
+                        "bull_trend":      1.00,
+                        "bear_trend":      0.75,
+                        "ranging":         0.80,
+                        "high_volatility": 0.50,
+                        "crash":           0.25,
+                    }
+                    regime_risk_mult = REGIME_RISK_MULT.get(self._global_regime, 0.85)
+                    if regime_risk_mult < 1.0:
+                        orig_ps = getattr(r, "position_size", 0)
+                        r.position_size = r.position_size * regime_risk_mult if hasattr(r, "position_size") and r.position_size else r.position_size
+                        logger.info(
+                            f"   📉 {r.coin} Rejim riski: {self._global_regime} → ×{regime_risk_mult:.2f} "
+                            f"(pos: {orig_ps:.2f} → {getattr(r,'position_size',0):.2f})"
+                        )
 
                     r = self._execute_trade(r)
                     if r.trade_executed:
@@ -2354,11 +2495,16 @@ class MLTradingPipeline:
             report.balance      = self._balance
             report.daily_pnl    = self._daily_realized_pnl
 
-            pt_stats = self.paper_trader.get_summary()
-            total_closed = pt_stats.get("closed_trades", 0)
-            real_win_rate = pt_stats.get("win_rate_pct", 0.0)
+            if self.dry_run:
+                pt_stats = self.paper_trader.get_summary()
+                total_closed = pt_stats.get("closed_trades", 0)
+                real_win_rate = pt_stats.get("win_rate_pct", 0.0)
+            else:
+                tm_stats = self.trade_memory.get_stats()
+                total_closed = tm_stats.get("closed_trades", 0)
+                real_win_rate = tm_stats.get("win_rate", 0.0) * 100
 
-            retrain_threshold = 15  # [v2.1.17] 30 → 15: her 15 kapanan trade'de retrain
+            retrain_threshold = 30  # [v2.1.18] 15 -> 30: her 30 kapanan trade'de retrain
             # ── RETRAIN COUNTER AÇIKLAMASI ──────────────────────────────────
             # lgbm_model üzerinde iki ayrı sayaç yaşar:
             #   retrain_count            → train() her çağrıldığında +1 (initial_train dahil).
@@ -2384,6 +2530,7 @@ class MLTradingPipeline:
                     except Exception as e:
                         logger.error(f"Eğitim tetiklenemedi: {e}")
                     self.lgbm_model.experience_retrain_count = target_exp_count
+                    self.lgbm_model._save_state()  # [PERSIST] diske kaydet
             else:
                 logger.debug(
                     f"   ⏸️ Retrain donduruldu: {total_closed}/{RETRAIN_MIN_TRADES} trade "
@@ -2527,7 +2674,7 @@ class MLTradingPipeline:
             f"{'─'*60}\n"
             f"  USE_MODEL          → IC > +0.10 ve p < 0.05\n"
             f"  MARGINAL           → 0 < IC ≤ 0.10 (dikkatli kullan)\n"
-            f"  BYPASS_RECOMMENDED → IC ≤ 0 → PURE_IC_MODE = True önerilir\n"
+            f"  BYPASS_RECOMMENDED → IC ≤ 0 (Model başarısız ama ML devrede)\n"
             f"{'─'*60}"
         )
 
@@ -2542,7 +2689,7 @@ class MLTradingPipeline:
 
     def _evaluate_sanity_and_set_bypass(self):
         """[v2.1.14] Sanity check sadece LOGLAMA amaçlıdır, bypass AKTIF ETMEZ.
-        ML her zaman aktif kalır (pure_ic_mode=False sabit).
+        ML her zaman aktiftir.
         """
         try:
             if not self.lgbm_model.is_trained:
@@ -2553,17 +2700,15 @@ class MLTradingPipeline:
 
             import json as _json
             from pathlib import Path
-            sanity_path = Path("logs/sanity_check.json")
+            sanity_path = Path(__file__).resolve().parent.parent / "logs" / "sanity_check.json"
             sanity_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # pure_ic_mode HER ZAMAN False — değiştirilmiyor
             with open(sanity_path, "w", encoding="utf-8") as _f:
                 _json.dump({
                     **sanity,
                     "checked_at"         : _now_local().strftime("%Y-%m-%d %H:%M:%S"),
-                    "pure_ic_mode_current": False,
                     "action_required"    : False,
-                    "action"             : "ML her zaman aktif (v2.1.14)",
+                    "action"             : "ML her zaman aktif",
                 }, _f, ensure_ascii=False, indent=2)
 
             logger.info(f"📄 Sanity check sonucu kaydedildi: {sanity_path}")
@@ -2617,32 +2762,29 @@ class MLTradingPipeline:
                 # Yeni kod: exit/entry/sl fiyatlarından kontinü R değeri hesapla.
                 # Neden önemli: Binary etiket model'in "ne kadar?" sorusunu öğrenmesini
                 # engeller. Partial TP (+0.8R) ile tam TP (+1.5R) aynı görünüyordu.
-                if exit_reason in ("TP Hit", "SL Hit"):
-                    entry_p = float(t.get('entry_price', 0) or 0)
-                    exit_p  = float(t.get('exit_price',  0) or 0)
-                    sl_p    = float(t.get('sl_price',    0) or 0)
-                    sl_dist = abs(entry_p - sl_p)
+                # [v2.1.20] TÜM çıkış nedenlerinde aynı fiyat-bazlı hesap kullanılır.
+                # Eski: TIMEOUT → pnl/bakiye (bakiye değişince R değişir, tutarsız)
+                # Yeni: TIMEOUT → (exit-entry)/sl_dist (TP/SL ile aynı formül)
+                entry_p = float(t.get('entry_price', 0) or 0)
+                exit_p  = float(t.get('exit_price',  0) or 0)
+                sl_p    = float(t.get('sl_price',    0) or 0)
+                sl_dist = abs(entry_p - sl_p)
 
-                    if sl_dist > 0 and entry_p > 0 and exit_p > 0:
-                        # Yön bazlı fiyat hareketi / SL mesafesi = R-multiple
-                        if direction == "LONG":
-                            r_multiple = (exit_p - entry_p) / sl_dist
-                        else:  # SHORT
-                            r_multiple = (entry_p - exit_p) / sl_dist
-                        r_multiple = max(-2.5, min(2.5, r_multiple))
-                    else:
-                        # Fiyat verisi eksik → eski fallback değerler (veri kalitesi sorunu)
+                if sl_dist > 0 and entry_p > 0 and exit_p > 0:
+                    # Yön bazlı fiyat hareketi / SL mesafesi = R-multiple
+                    if direction == "LONG":
+                        r_multiple = (exit_p - entry_p) / sl_dist
+                    else:  # SHORT
+                        r_multiple = (entry_p - exit_p) / sl_dist
+                    r_multiple = max(-2.5, min(2.5, r_multiple))
+                else:
+                    # Fiyat verisi eksik → fallback değerler
+                    if exit_reason in ("TP Hit", "SL Hit"):
                         logger.debug(
                             f"   ⚠️ R-multiple hesaplanamadı ({t.get('coin','?')} "
                             f"entry={entry_p} sl={sl_p}) — fallback değer kullanılıyor"
                         )
                         r_multiple = 1.5 if exit_reason == "TP Hit" else -1.0
-                else:
-                    if pnl != 0:
-                        risk_est = self._balance * 0.02 if self._balance > 0 else 1.0
-                        r_multiple = pnl / risk_est if risk_est > 0 else 0.0  # [SORUN 1 FIX]
-
-                        r_multiple = max(-2.0, min(2.0, r_multiple))
                     else:
                         r_multiple = 0.0
                         
@@ -2758,32 +2900,46 @@ class MLTradingPipeline:
             try:
                 from pathlib import Path
 
-                report_dir = Path("logs/reports")
+                report_dir = Path(__file__).resolve().parent.parent / "logs" / "reports"
                 report_dir.mkdir(parents=True, exist_ok=True)
                 report_path = report_dir / "model_egitim_raporu.xlsx"
 
-                # [v2.1.18] n_folds==0 ise Excel'i üzerine YAZMA.
-                # Neden: startup retrain n_folds=0 ile bitiyor (n~80 < min_train=120).
-                # Bu retrain, initial_train'in iyi metriklerini (CV=3, IC=+0.26) sıfır ile
-                # üzerine yazıyordu → raporda Spearman IC, IR, Z-Skoru, L-S Spread hep 0.
-                # Düzeltme: n_folds==0 ise rapor atlanır, önceki Excel dosyası korunur.
+                # [v2.2] n_folds==0 durumunda da diagnostik rapor yaz.
+                # Eski: n_folds==0 → Excel atlanıyor → rapor tarihi güncellenmiyordu.
+                # Yeni: n_folds==0 → Diagnostik satır + önceki metriklerle rapor yazılır.
                 if metrics.n_folds == 0:
-                    logger.info(
-                        "ℹ️ Retrain raporu atlandı (n_folds=0 — önceki Excel raporu korunuyor)."
-                    )
+                    logger.info("ℹ️ n_folds=0 — CV fold üretilemedi. Diagnostik rapor yazılıyor.")
+                    try:
+                        with pd.ExcelWriter(report_path, engine='openpyxl') as _dw:
+                            prev_m = self.lgbm_model.last_metrics
+                            pd.DataFrame([{
+                                "Tarih": _now_local().strftime("%Y-%m-%d %H:%M:%S"),
+                                "Kaynak": "retrain_from_experience [n_folds=0]",
+                                "Eğitim Satır Sayısı": len(X_experience),
+                                "Kazanma Oranı (Win Rate)": f"{sum(1 for val in y_experience if float(val) > 0) / max(1, len(y_experience)) * 100:.1f}%",
+                                "ROC-AUC Skoru": round(prev_m.roc_auc, 4) if prev_m else "N/A",
+                                "Beklenen Değer (Expectancy)": round(prev_m.expectancy, 3) if prev_m else "N/A",
+                                "Top20 İsabet (%)": f"{prev_m.precision_top20 * 100:.1f}%" if prev_m else "N/A",
+                                "Long-Short Spread (R)": round(prev_m.long_short_spread, 3) if prev_m else "N/A",
+                                "MAE (Hata Payı)": round(prev_m.mae, 4) if prev_m else "N/A",
+                                "UYARI": "n_folds=0: CV çalışmadı. Metrikler önceki retrain'den. Model fitlendi.",
+                            }]).to_excel(_dw, sheet_name="1_Genel_Metrikler", index=False)
+                            pd.DataFrame({"Bilgi": ["n_folds=0 — Feature önem hesaplanamadı."]}).to_excel(
+                                _dw, sheet_name="2_Kolon_Onemleri", index=False)
+                        logger.info(f"📊 Diagnostik retrain raporu yazıldı: {report_path}")
+                    except Exception as _diag_ex:
+                        logger.warning(f"Diagnostik rapor yazılamadı: {_diag_ex}")
                 else:
                     with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
                         # --- 1. SAYFA: GENEL METRİKLER ---
-                        z_score = (metrics.spearman_ic * np.sqrt(metrics.n_train_samples - 3)) if metrics.n_train_samples > 3 else 0.0
-                        
                         df_metrics = pd.DataFrame([{
                             "Tarih": _now_local().strftime("%Y-%m-%d %H:%M:%S"),  # TR saati
                             "Kaynak": "retrain_from_experience",
                             "Eğitim Satır Sayısı": len(X_experience),
                             "Kazanma Oranı (Win Rate)": f"{sum(1 for val in y_experience if float(val) > 0) / max(1, len(y_experience)) * 100:.1f}%",
-                            "Spearman IC Skoru": round(metrics.spearman_ic, 4),
-                            "Bilgi Oranı (IR)": round(metrics.information_ratio, 2),
-                            "Z-Skoru": round(z_score, 2),
+                            "ROC-AUC Skoru": round(metrics.roc_auc, 4),
+                            "Beklenen Değer (Expectancy)": round(metrics.expectancy, 3),
+                            "Top20 İsabet (%)": f"{metrics.precision_top20 * 100:.1f}%",
                             "Long-Short Spread (R)": round(metrics.long_short_spread, 3),
                             "MAE (Hata Payı)": round(metrics.mae, 4)
                         }])
@@ -2838,7 +2994,11 @@ class MLTradingPipeline:
             # [MADDE 3] — Retrain sonrası deployment gate kontrolü
             # Her retrain sonrası modelin hâlâ yeterli istatistiksel güce sahip olup
             # olmadığını kontrol et. Gate başarısız → canlı trade bloklanır.
-            self._model_deployment_approved = self._check_deployment_gates(metrics)
+            if getattr(metrics, 'n_folds', 0) == 0 and self.lgbm_model.last_metrics is not None:
+                logger.info("   ℹ️ n_folds=0, önceki deployment gate onayı korunuyor.")
+            else:
+                self._model_deployment_approved = self._check_deployment_gates(metrics)
+                
             if not self._model_deployment_approved:
                 logger.warning(
                     "⚠️ Retrain sonrası deployment gate başarısız. "
@@ -2990,6 +3150,7 @@ class MLTradingPipeline:
                     fv = self.feature_eng.build_features(
                         analysis=stub,
                         ohlcv_df=df_slice,
+                        use_cache=False,  # Eğitim: her bar farklı feature üretmeli
                     )
                     if fv is None:
                         continue
@@ -3245,6 +3406,7 @@ class MLTradingPipeline:
                     fv = self.feature_eng.build_features(
                         analysis=analysis_stub,
                         ohlcv_df=df_slice,
+                        use_cache=False,  # Eğitim: her bar farklı feature üretmeli
                     )
                     rows_X.append(fv.to_dict())
                     rows_y.append(float(r_multiple))
@@ -3275,22 +3437,20 @@ class MLTradingPipeline:
             try:
                 from pathlib import Path
 
-                report_dir = Path("logs/reports")
+                report_dir = Path(__file__).resolve().parent.parent / "logs" / "reports"
                 report_dir.mkdir(parents=True, exist_ok=True)
                 report_path = report_dir / "model_egitim_raporu.xlsx"
 
                 with pd.ExcelWriter(report_path, engine='openpyxl') as writer:
                     # --- 1. SAYFA: GENEL METRİKLER ---
-                    z_score = (metrics.spearman_ic * np.sqrt(metrics.n_train_samples - 3)) if metrics.n_train_samples > 3 else 0.0
-                    
                     df_metrics = pd.DataFrame([{
                         "Tarih": _now_local().strftime("%Y-%m-%d %H:%M:%S"),  # TR saati
                         "Kaynak": "initial_train",
                         "Eğitim Satır Sayısı": len(X),
                         "Kazanma Oranı (Win Rate)": f"{sum(1 for val in y if float(val) > 0) / max(1, len(y)) * 100:.1f}%",
-                        "Spearman IC Skoru": round(metrics.spearman_ic, 4),
-                        "Bilgi Oranı (IR)": round(metrics.information_ratio, 2),
-                        "Z-Skoru": round(z_score, 2),
+                        "ROC-AUC Skoru": round(metrics.roc_auc, 4),
+                        "Beklenen Değer (Expectancy)": round(metrics.expectancy, 3),
+                        "Top20 İsabet (%)": f"{metrics.precision_top20 * 100:.1f}%",
                         "Long-Short Spread (R)": round(metrics.long_short_spread, 3),
                         "MAE (Hata Payı)": round(metrics.mae, 4)
                     }])
@@ -3340,7 +3500,7 @@ class MLTradingPipeline:
                 logger.error(f"⚠️ Excel raporu oluşturulurken hata (kritik değil): {ex}")
 
             gercek_win_rate = sum(1 for val in y if float(val) > 0) / max(1, len(y)) * 100
-            logger.info(f"✅ İlk eğitim tamamlandı | Gerçek Win Rate: %{gercek_win_rate:.1f} | IC Skoru: {metrics.spearman_ic:.4f}")
+            logger.info(f"✅ İlk eğitim tamamlandı | Gerçek Win Rate: %{gercek_win_rate:.1f} | ROC-AUC Skoru: {metrics.roc_auc:.4f}")
 
             # [MADDE 3] — İlk eğitim sonrası deployment gate kontrolü
             # Model istatistiksel olarak yeterli mi? Gate başarısız olursa
@@ -3457,7 +3617,6 @@ class MLTradingPipeline:
                 "Rejim": (14, None),
                 # [MADDE 11] ML/AI kolonları genişletildi
                 "AI Yön": (8, None), "AI Güven": (10, '0.0'), "ML-IC": (7, None),
-                "AI Karar": (10, None),  # Geriye dönük uyumluluk
                 "Durum": (10, None),
                 "Çıkış Nedeni": (14, None), "Süre (dk)": (10, '#,##0')
             }
@@ -3882,9 +4041,15 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 10) -> No
     try:
         closed_count = pipeline.trade_memory._count_closed()
         if closed_count >= RETRAIN_MIN_TRADES:
-            retrain_threshold = 15  # [v2.1.17] 30 → 15: her 15 trade'de bir retrain
+            retrain_threshold = 30  # [v2.1.18] 15 -> 30: her 30 trade'de bir retrain
             current_exp_count = getattr(pipeline.lgbm_model, 'experience_retrain_count', 0)
             target_exp_count  = closed_count // retrain_threshold
+            
+            if target_exp_count < current_exp_count:
+                logger.warning(f"⚠️ Trade memory temizlenmiş: current_exp_count ({current_exp_count}) > target_exp_count ({target_exp_count}). Sayaç sıfırlanıyor.")
+                current_exp_count = target_exp_count - 1 # Trigger retrain immediately
+                pipeline.lgbm_model.experience_retrain_count = current_exp_count
+
             if target_exp_count > current_exp_count:
                 logger.info(f"\n🧠 [STARTUP RETRAIN] {closed_count} kapalı trade bulundu — başlangıçta retrain tetikleniyor...")
                 try:
@@ -3892,9 +4057,10 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 10) -> No
                 except Exception as re:
                     logger.error(f"Startup retrain hatası: {re}")
                 pipeline.lgbm_model.experience_retrain_count = target_exp_count
+                pipeline.lgbm_model._save_state()  # [PERSIST] diske kaydet
                 logger.info("✅ Startup retrain tamamlandı.")
             else:
-                logger.info(f"ℹ️ Retrain zaten yapılmış (experience_count={current_exp_count}), atlanıyor.")
+                logger.info(f"ℹ️ Retrain zaten yapılmış (experience_count={current_exp_count}, disk'ten yüklendi), atlanıyor.")
         else:
             logger.info(
                 f"⏸️ Startup retrain donduruldu: {closed_count}/{RETRAIN_MIN_TRADES} trade. "

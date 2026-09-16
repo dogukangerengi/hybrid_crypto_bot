@@ -152,15 +152,16 @@ class IndicatorSelector:
     """
     
     # Minimum kabul edilebilir değerler
-    MIN_IC = 0.02               # Ekonomik anlamlılık eşiği (finans standardı)
+    MIN_IC = 0.01               # Ekonomik anlamlılık eşiği — gevşetildi (0.02 → 0.01)
     MIN_IC_IR = 0.3             # IC stability eşiği
     MIN_OBSERVATIONS = 100      # Minimum geçerli gözlem sayısı
     
     def __init__(
         self,
-        alpha: float = 0.05,
+        alpha: float = 0.15,
         correction_method: str = "fdr",
-        verbose: bool = True
+        verbose: bool = True,
+        min_ic_override: float = None,
     ):
         """
         IndicatorSelector başlatır.
@@ -169,7 +170,7 @@ class IndicatorSelector:
         ----------
         alpha : float
             Anlamlılık düzeyi (Type I error rate)
-            0.05 → %5 yanlış pozitif riski kabul
+            0.15 → %15 yanlış pozitif riski kabul (gevşetildi)
             
         correction_method : str
             Multiple testing correction yöntemi:
@@ -188,10 +189,15 @@ class IndicatorSelector:
                 
         verbose : bool
             Detaylı çıktı
+        
+        min_ic_override : float, optional
+            MIN_IC sınıf sabitini çalışma anında geçersiz kılar.
         """
         self.alpha = alpha
         self.correction_method = correction_method
         self.verbose = verbose
+        if min_ic_override is not None:
+            self.MIN_IC = min_ic_override
         
         warnings.filterwarnings('ignore', category=RuntimeWarning)
     
@@ -296,7 +302,7 @@ class IndicatorSelector:
         if indicator_col not in df.columns or target_col not in df.columns:
             return self._empty_score(indicator_col, category, 0)
         
-        indicator = df[indicator_col]
+        indicator = df[indicator_col].shift(1)
         forward_return = df[target_col]
         
         # NaN olmayan gözlem sayısı

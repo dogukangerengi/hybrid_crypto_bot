@@ -276,6 +276,19 @@ class BinanceExecutor:
             logger.error(f"Pozisyon çekme hatası: {e}")
             raise
 
+    def fetch_my_trades(self, symbol: str, limit: int = 10) -> List[Dict]:
+        """Son işlemleri (fill edilmiş) getirir. Gerçek exit_price tahmini için kullanılır."""
+        if self.dry_run:
+            return []
+            
+        exchange = self._get_exchange()
+        try:
+            trades = exchange.fetch_my_trades(symbol, limit=limit)
+            return trades
+        except Exception as e:
+            logger.error(f"Trade geçmişi çekme hatası ({symbol}): {e}")
+            return []
+
     # =========================================================================
     # KALDIRAC VE MARGİN
     # =========================================================================

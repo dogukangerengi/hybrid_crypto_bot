@@ -39,7 +39,7 @@ class CoinPerformanceTracker:
                                                 # (kullanıcı isteği: az örneklemde karar verme)
     WR_COOLDOWN_THRESHOLD = 0.25               # WR < %25 → cooldown tetikler
     COOLDOWN_HOURS = 72                        # 3 gün cooldown
-    STATE_FILE = "logs/coin_performance.json"  # Disk persistence
+    STATE_FILE = str(Path(__file__).resolve().parent.parent.parent / "logs" / "coin_performance.json")  # Disk persistence
 
     def __init__(self):
         # Her coin için son N trade outcome'u (1=win, 0=loss)
