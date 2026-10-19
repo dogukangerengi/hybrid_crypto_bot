@@ -248,11 +248,11 @@ IC_TRADE    = 9.0
 # Kapatma kriteri: Pure IC modda 50+ trade birikmesi ve _validate_initial_model()
 #   sonucu IC > 0 çıkması → PURE_IC_MODE = False, ML retrain planla.
 
-# [v2.1.14] Retrain eşiği — 200'den 30'a indirildi.
-# Sebep: Yeterli gerçek trade birikmediğinde bile model şu anki
-# canlı deneyimden (˜57 trade) hızla (öğrenmeli).
-# Her 30 kapanan trade'de bir retrain tetiklenir.
-RETRAIN_MIN_TRADES = 30
+# [GÜNCELLEME] Retrain eşiği — 50 trade'e yükseltildi.
+# Sebep: 30 trade ile yapılan retrain çok erken bakış açısı veriyor;
+# 50 trade ile model daha sağlıklı bir istatistiksel temel üzerine eğitilir.
+# RETRAIN_INTERVAL da 50'ye çekildi (trade_memory.py) → tutarlılık.
+RETRAIN_MIN_TRADES = 50
 
 # =============================================================================
 # ENUM'LAR
@@ -1422,7 +1422,56 @@ class MLTradingPipeline:
             )
             return result
 
-        # UTC cooldown kontrolü
+        # ── [DÜZELTME #2+#3] PER-COİN WIN RATE BAZLI COOLDOWN ──────────────────
+        # ≥ 4 kapanış trade ve WR < %35 ise bu coin 36 saat cooldown'a alınır.
+        # Bu kontrol SL-bazlı cooldown'dan BAĞIMSIZ çalışır:
+        # SL olmasa bile kronik düşük performanslı coinler engellenir (SNXX vb.)
+        _COIN_CD_MIN_TRADES = 4      # Minimum geçmiş trade eşiği
+        _COIN_CD_MAX_WR     = 0.35   # Bu altında WR → cooldown
+        _COIN_CD_HOURS      = 36     # Cooldown süresi (saat)
+        if hasattr(self, 'trade_memory') and hasattr(self, 'cooldowns'):
+            _cd_coin_key = result.coin
+            if _cd_coin_key not in self.cooldowns:
+                try:
+                    from ml.trade_memory import TradeStatus, TradeOutcome
+                    _coin_records = [
+                        r for r in self.trade_memory._records.values()
+                        if (str(r.coin).replace('USDT', '').split('/')[0].split(':')[0] == _cd_coin_key
+                            or r.coin == _cd_coin_key)
+                        and r.status == TradeStatus.CLOSED
+                        and r.outcome in (TradeOutcome.WIN, TradeOutcome.LOSS)
+                    ]
+                    if len(_coin_records) >= _COIN_CD_MIN_TRADES:
+                        _wins = sum(1 for r in _coin_records if r.outcome == TradeOutcome.WIN)
+                        _coin_wr = _wins / len(_coin_records)
+                        if _coin_wr < _COIN_CD_MAX_WR:
+                            _cd_until = now + timedelta(hours=_COIN_CD_HOURS)
+                            self.cooldowns[result.coin] = _cd_until
+                            if result.full_symbol:
+                                self.cooldowns[result.full_symbol] = _cd_until
+                            logger.info(
+                                f"   ❄️ [WR COOLDOWN] {result.coin} engellendi: "
+                                f"{len(_coin_records)} trade, WR=%{_coin_wr*100:.0f} < %35 → "
+                                f"{_COIN_CD_HOURS}h cooldown"
+                            )
+                            if self.notifier.is_configured():
+                                try:
+                                    self.notifier.send_message_sync(
+                                        f"❄️ <b>WR Cooldown: {result.coin}</b>\n"
+                                        f"━━━━━━━━━━━━━━━━━━━━━\n"
+                                        f"📊 <b>Trade:</b> {len(_coin_records)} | WR: %{_coin_wr*100:.0f}\n"
+                                        f"⏳ <b>Cooldown:</b> {_COIN_CD_HOURS} saat\n"
+                                        f"⚠️ Bu coin {_COIN_CD_HOURS} saat işlem görmeyecek."
+                                    )
+                                except Exception:
+                                    pass
+                            result.status = "cooldown"
+                            return result
+                except Exception as _wr_cd_err:
+                    logger.debug(f"   WR cooldown hesaplama hatası: {_wr_cd_err}")
+        # ──────────────────────────────────────────────────────────────────────
+
+        # UTC cooldown kontrolü (SL-bazlı)
         if hasattr(self, 'cooldowns'):
             if result.coin in self.cooldowns or result.full_symbol in self.cooldowns:
                 cooldown_key = result.coin if result.coin in self.cooldowns else result.full_symbol
@@ -2126,6 +2175,74 @@ class MLTradingPipeline:
                             logger.debug(f"   ⏳ {mem_coin} borsa onayı bekleniyor... (Kalan: {int(120-time_open_sec)}s)")
                             continue
 
+                        # ── [DÜZELTME #1] HAYALET POZİSYON TIMEOUT ────────────────────────
+                        # Binance'te artık görünmeyen ama memory'de OPEN kalan pozisyonlar.
+                        # Bunlar:
+                        #   a) Gerçekten kapanmış (SL/TP) ve fiyat sonra aranacak
+                        #   b) Yâ da geçmiş MAX_TRADE_AGE_HOURS'u aşarak öldü
+                        # Eğer yaş >= MAX_TRADE_AGE_HOURS ise API'den kapatılmış gibi
+                        # işle → normal reconciliation'a düş.
+                        # Eğer yaş < MAX_TRADE_AGE_HOURS ise normal reconciliation akar.
+                        if age_hours >= MAX_TRADE_AGE_HOURS:
+                            logger.info(
+                                f"   ⏰ HAYАLET TIMEOUT: {mem_coin} Binance'te görünmüyor "
+                                f"+ yaş={age_hours:.1f}h ≥ {MAX_TRADE_AGE_HOURS}h. "
+                                f"Memory'den TIMEOUT_ORPHAN olarak kapatılıyor."
+                            )
+                            # En son bilinen fiyat: entry_price fallback (API çekemedik)
+                            ghost_exit_price = float(mem_trade.entry_price or 0)
+                            try:
+                                ghost_ticker = self.executor._get_exchange().fetch_ticker(mem_trade.symbol)
+                                ghost_exit_price = float(ghost_ticker.get('last') or ghost_exit_price)
+                            except Exception as ghost_price_err:
+                                logger.warning(f"   ⚠️ {mem_coin} hayalet fiyat çekilemedi, entry kullanılıyor: {ghost_price_err}")
+
+                            safe_entry = float(mem_trade.entry_price or 0)
+                            safe_size = float(mem_trade.position_size or 0)
+                            safe_leverage = int(mem_trade.leverage or 1)
+
+                            if mem_trade.direction == "LONG":
+                                ghost_pnl = (ghost_exit_price - safe_entry) * safe_size
+                            else:
+                                ghost_pnl = (safe_entry - ghost_exit_price) * safe_size
+
+                            ghost_fee = (safe_entry * safe_size * 0.0004) + (ghost_exit_price * safe_size * 0.0004)
+                            ghost_net_pnl = ghost_pnl - ghost_fee
+
+                            try:
+                                self.trade_memory.close_trade(
+                                    trade_id    = mem_id,
+                                    exit_price  = ghost_exit_price,
+                                    pnl         = ghost_pnl,
+                                    exit_reason = "TIMEOUT_ORPHAN",
+                                )
+                                self._daily_realized_pnl += ghost_net_pnl
+                                self.portfolio_tracker.record_trade(mem_coin, ghost_net_pnl)
+                                logger.info(
+                                    f"   🧠 Memory güncellendi (TIMEOUT_ORPHAN): {mem_coin} "
+                                    f"| PnL: ${ghost_pnl:+.2f} | Çıkış: ${ghost_exit_price:.4f}"
+                                )
+                            except Exception as ghost_mem_err:
+                                logger.error(f"   ❌ {mem_coin} hayalet memory kapatılamıyor: {ghost_mem_err}")
+
+                            if self.notifier.is_configured():
+                                try:
+                                    pnl_emoji = "✅ KÂR" if ghost_pnl > 0 else "❌ ZARAR"
+                                    ghost_pct = (ghost_pnl / (safe_entry * safe_size)) * 100 * safe_leverage \
+                                                if (safe_entry * safe_size) > 0 else 0.0
+                                    self.notifier.send_message_sync(
+                                        f"⏰ <b>HAYALET TIMEOUT ({pnl_emoji})</b>\n"
+                                        f"━━━━━━━━━━━━━━━━━━━━━\n"
+                                        f"🪙 <b>Coin:</b> {mem_coin}\n"
+                                        f"⏱️ <b>Yaş:</b> {age_hours:.1f}h (hayalet)\n"
+                                        f"💲 <b>Çıkış:</b> ${ghost_exit_price:,.4f}\n"
+                                        f"💰 <b>PnL:</b> ${ghost_pnl:+.2f} ({ghost_pct:+.2f}%)"
+                                    )
+                                except Exception:
+                                    pass
+                            continue  # Bu trade işlendi, diğer reconciliation atlansın
+                        # ─────────────────────────────────────────────────────────────
+
                         logger.info(f"   🔍 {mem_coin} pozisyonu kapalı bulundu → Binance API'den gerçek kapanış fiyatı araştırılıyor...")
 
                         close_reason = "Manuel / API"
@@ -2435,8 +2552,17 @@ class MLTradingPipeline:
                     report.total_above_gate += 1
 
             logger.info("\n💹 Execution...")
+            MAX_TRADES_PER_CYCLE = 2
+            trades_opened_this_cycle = 0
+
             for r in results:
                 if r.status == "ready":
+                    # ── Döngü başı limit kontrolü ──
+                    if trades_opened_this_cycle >= MAX_TRADES_PER_CYCLE:
+                        logger.info(f"   🛑 {r.coin} atlanıyor (Döngü limitine ({MAX_TRADES_PER_CYCLE}) ulaşıldı)")
+                        r.status = "cycle_limit_reached"
+                        continue
+
                     # ── Her execute öncesi tekrar halt kontrolü (güvenlik) ──
                     if self._daily_halt_until and datetime.now(timezone.utc) < self._daily_halt_until:
                         logger.info("   🛑 Döngü ortasında günlük halt devreye girdi — kalan sinyaller iptal")
@@ -2489,6 +2615,7 @@ class MLTradingPipeline:
                     r = self._execute_trade(r)
                     if r.trade_executed:
                         report.total_traded += 1
+                        trades_opened_this_cycle += 1
 
             report.coins        = results
             report.paper_balance= self.paper_trader.balance
@@ -2504,7 +2631,7 @@ class MLTradingPipeline:
                 total_closed = tm_stats.get("closed_trades", 0)
                 real_win_rate = tm_stats.get("win_rate", 0.0) * 100
 
-            retrain_threshold = 30  # [v2.1.18] 15 -> 30: her 30 kapanan trade'de retrain
+            retrain_threshold = RETRAIN_MIN_TRADES  # [GÜNCELLEME] 30 → RETRAIN_MIN_TRADES=50 ile eşleştirildi
             # ── RETRAIN COUNTER AÇIKLAMASI ──────────────────────────────────
             # lgbm_model üzerinde iki ayrı sayaç yaşar:
             #   retrain_count            → train() her çağrıldığında +1 (initial_train dahil).
@@ -4041,7 +4168,7 @@ def run_scheduler(pipeline: MLTradingPipeline, interval_minutes: int = 10) -> No
     try:
         closed_count = pipeline.trade_memory._count_closed()
         if closed_count >= RETRAIN_MIN_TRADES:
-            retrain_threshold = 30  # [v2.1.18] 15 -> 30: her 30 trade'de bir retrain
+            retrain_threshold = RETRAIN_MIN_TRADES  # [GÜNCELLEME] 30 → RETRAIN_MIN_TRADES=50
             current_exp_count = getattr(pipeline.lgbm_model, 'experience_retrain_count', 0)
             target_exp_count  = closed_count // retrain_threshold
             

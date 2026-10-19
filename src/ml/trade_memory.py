@@ -43,11 +43,11 @@ logger = logging.getLogger(__name__)           # Bu modüle özel logger
 # =============================================================================
 
 MIN_TRADES_FOR_RETRAIN = 30                    # İlk retrain için minimum kapalı trade sayısı
-RETRAIN_INTERVAL = 15                          # [MADDE 14] Her X yeni kapanan trade'de retrain yap
-                                               # Eski: 10. 225 trade'de 22 retrain çok fazlaydı.
-                                               # 340 satırlık veriyle her retrain model parametrelerini
-                                               # ciddi değiştiriyor, fold-arası IC varyansı artıyor.
-                                               # 30'a çekmek stabilitiyi artırır → IR yükselir.
+RETRAIN_INTERVAL = 50                          # [GÜNCELLEME] Her 50 yeni kapanan trade'de retrain yap
+                                               # Eski: 15. Her 15 trade'de retrain çok sık → model
+                                               # her küçük dalgalanmaya aşırı uyum sağlıyordu.
+                                               # 50'ye çekmek stabilitiyi artırır → IR yükselir,
+                                               # overfitting azalır, sinyal tutarlılığı iyileşir.
 MEMORY_FILE_NAME = "ml_trade_memory.json"      # Kalıcı hafıza dosyası adı
 MAX_MEMORY_SIZE = 2000                         # RAM'de max trade sayısı (eski olanlar silinir)
 

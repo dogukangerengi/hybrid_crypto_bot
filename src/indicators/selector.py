@@ -624,66 +624,113 @@ class IndicatorSelector:
         scores: List[IndicatorScore],
         max_per_category: int = 2,
         min_ic: float = None,
-        only_significant: bool = True
+        only_significant: bool = True,
+        top_k_fallback: int = 6,
     ) -> Dict[str, List[IndicatorScore]]:
         """
         Her kategoriden en iyi indikatörleri seçer.
-        
+
         Neden kategori başına limit?
         - Aynı kategorideki indikatörler YÜKsEK korelasyonlu (multicollinearity)
         - Örn: RSI_7 ve RSI_14 neredeyse aynı bilgiyi taşır
         - Kategori başına 2 seçmek → 4 kategori × 2 = 8 çeşitli indikatör
         - Sinyal çeşitliliği artar, redundancy azalır
-        
+
+        [TOP-K FALLBACK]
+        FDR / anlamlılık testi sıfır indikatör seçerse (yüksek volatilite, düşük veri gibi
+        durumlarda olabilir), sistem top_k_fallback adet indikatörü sadece |IC| büyüklüğüne
+        göre seçer. Bu sayede 0/100 anımlayan indikatör problemi ortadan kalkar.
+
         Parameters:
         ----------
         scores : List[IndicatorScore]
             evaluate_all_indicators'dan gelen skorlar (sıralı)
-            
+
         max_per_category : int
             Kategori başına maksimum indikatör sayısı (varsayılan: 2)
-            
+
         min_ic : float, optional
             Minimum |IC| eşiği (varsayılan: 0.02)
-            
+
         only_significant : bool
             True → sadece FDR-significant olanları seç
             False → min_ic üstündeki tüm indikatörleri seç
-            
+
+        top_k_fallback : int
+            FDR sıfır sonuç verirse tüm kategorilerden toplam kaç indikatör seçileceği.
+            Varsayılan: 6 (4 kategori × yaklaşık 1-2).
+
         Returns:
         -------
         Dict[str, List[IndicatorScore]]
             Kategori → seçilen indikatörler listesi
             Örn: {'trend': [ADX, Supertrend], 'momentum': [RSI, MACD]}
         """
-        
+
         if min_ic is None:
             min_ic = self.MIN_IC
-        
+
         selected: Dict[str, List[IndicatorScore]] = {}
-        
+
         for score in scores:
             # Geçersiz IC'yi atla
             if np.isnan(score.ic_mean):
                 continue
-            
+
             # Minimum IC filtresi
             if abs(score.ic_mean) < min_ic:
                 continue
-            
+
             # Anlamlılık filtresi (opsiyonel)
             if only_significant and not score.is_significant:
                 continue
-            
+
             # Kategoriye ekle (max limit kontrolü)
             if score.category not in selected:
                 selected[score.category] = []
-            
+
             if len(selected[score.category]) < max_per_category:
                 selected[score.category].append(score)
-        
-        if self.verbose:
+
+        total_selected = sum(len(v) for v in selected.values())
+
+        # ── [TOP-K FALLBACK] ──────────────────────────────────────────────────
+        # FDR/anlamlılık filtresi hiç indikatör seçemediyse (yüksek volatilite,
+        # kısa veri pencereleri gibi senaryolarda bu oluyor) → en iyi |IC| ile seç.
+        if total_selected == 0:
+            logger.warning(
+                f"  ⚠️ FDR filtresinden hiç indikatör geçemedi! "
+                f"Top-{top_k_fallback} |IC| fallback devreye giriyor..."
+            )
+            valid_scores = [
+                s for s in scores
+                if not np.isnan(s.ic_mean) and abs(s.ic_mean) >= min_ic
+            ]
+            # |IC|'ye göre sıralı (zaten sıralı gelir ama garantiye alıyoruz)
+            valid_scores.sort(
+                key=lambda x: abs(x.ic_mean), reverse=True
+            )
+            # Kategori başına max_per_category olacak şekilde seç
+            fallback_selected: Dict[str, List[IndicatorScore]] = {}
+            picked = 0
+            for score in valid_scores:
+                if picked >= top_k_fallback:
+                    break
+                cat = score.category
+                if cat not in fallback_selected:
+                    fallback_selected[cat] = []
+                if len(fallback_selected[cat]) < max_per_category:
+                    fallback_selected[cat].append(score)
+                    picked += 1
+
+            selected = fallback_selected
             total_selected = sum(len(v) for v in selected.values())
+            logger.info(
+                f"  🌟 TOP-K fallback sonucu: {total_selected} indikatör seçildi "
+                f"(FDR bypass, sadece |IC| kriteri)"
+            )
+
+        if self.verbose:
             logger.info(f"  Seçilen: {total_selected} indikatör ({len(selected)} kategori)")
             for cat, inds in selected.items():
                 for ind in inds:
@@ -692,7 +739,7 @@ class IndicatorSelector:
                         f"    {sig} {cat}: {ind.name:<25} "
                         f"IC={ind.ic_mean:+.4f} p={ind.p_value_adjusted:.4f}"
                     )
-        
+
         return selected
     
     # =========================================================================
